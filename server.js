@@ -1,7 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // SENTIX PRO - BACKEND SERVER
 // ═══════════════════════════════════════════════════════════════════════════════
-
 require('dotenv').config();
 
 const express = require('express');
@@ -12,9 +11,11 @@ const { createClient } = require('@supabase/supabase-js');
 const { SilentTelegramBot, setupTelegramCommands } = require('./telegramBot');
 const { fetchMetalsPricesSafe } = require('./metalsAPI');
 const { generateSignalWithRealData } = require('./technicalAnalysis');
-const app = express();  // ← ESTA LÍNEA ES CRÍTICA
+
+const app = express();
 const PORT = process.env.PORT || 3001;
-const { generateSignalWithRealData } = require('./technicalAnalysis');
+
+
 
 // ─── MIDDLEWARE ────────────────────────────────────────────────────────────────
 // app.use(cors());
@@ -216,56 +217,15 @@ async function updateMarketData() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// TECHNICAL INDICATORS CALCULATION
+// TECHNICAL INDICATORS - imported from lib/indicators.js
 // ═══════════════════════════════════════════════════════════════════════════════
-
-function calculateRSI(prices, period = 14) {
-  if (prices.length < period + 1) return 50;
-  
-  let gains = 0;
-  let losses = 0;
-  
-  for (let i = prices.length - period; i < prices.length; i++) {
-    const diff = prices[i] - prices[i - 1];
-    if (diff > 0) gains += diff;
-    else losses += Math.abs(diff);
-  }
-  
-  const avgGain = gains / period;
-  const avgLoss = losses / period;
-  
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - (100 / (1 + rs));
-}
-
-function calculateMACD(prices) {
-  const calcEMA = (data, period) => {
-    const k = 2 / (period + 1);
-    let ema = data[0];
-    for (let i = 1; i < data.length; i++) {
-      ema = data[i] * k + ema * (1 - k);
-    }
-    return ema;
-  };
-
-  const ema12 = calcEMA(prices, 12);
-  const ema26 = calcEMA(prices, 26);
-  const macd = ema12 - ema26;
-  const signal = calcEMA([...prices.slice(-9), macd], 9);
-  
-  return {
-    macd,
-    signal,
-    histogram: macd - signal,
-  };
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SIGNAL GENERATION ENGINE
 // ═══════════════════════════════════════════════════════════════════════════════
 async function generateSignals() {
   const signals = [];
+<<<<<<< HEAD
   
   if (!cachedMarketData || !cachedMarketData.crypto) return signals;
   
@@ -289,6 +249,21 @@ async function generateSignals() {
   return signals.sort((a, b) => b.confidence - a.confidence);
 }
 
+=======
+
+  for (const [coinId, data] of Object.entries(marketCache.crypto)) {
+    const historicalPrices = generateMockHistory(data.price, 30);
+    const signal = computeSignalFromData(coinId, data, marketCache.macro || {}, historicalPrices);
+
+    if (signal.confidence >= 70) {
+      signals.push(signal);
+    }
+  }
+
+  return signals.sort((a, b) => b.confidence - a.confidence);
+}
+
+>>>>>>> 43f045df7fef8c243ff200d1d68dfa58567d8ba4
 // ═══════════════════════════════════════════════════════════════════════════════
 // ALERT SYSTEM
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -342,10 +317,7 @@ async function processAlerts() {
   console.log('🔔 Processing alerts...');
   
   const signals = await generateSignals();
-  const criticalSignals = signals.filter(s => 
-    (s.action === 'BUY' && s.confidence >= 75 && s.score >= 70) ||
-    (s.action === 'SELL' && s.confidence >= 75 && s.score <= 30)
-  );
+  const criticalSignals = filterCriticalSignals(signals);
   
   if (criticalSignals.length === 0) {
     console.log('No critical signals detected');
@@ -509,22 +481,25 @@ cron.schedule('*/5 * * * *', async () => {
 // SERVER START
 // ═══════════════════════════════════════════════════════════════════════════════
 
-app.listen(PORT, async () => {
-  console.log(`
+// Only start the server when run directly (not when required by tests)
+if (require.main === module) {
+  app.listen(PORT, async () => {
+    console.log(`
 ╔═══════════════════════════════════════════════════════════════════╗
 ║                    🚀 ORACLE PRO BACKEND                          ║
 ║                      Server Started                               ║
 ╠═══════════════════════════════════════════════════════════════════╣
-║  Port: ${PORT}                                                      
-║  Environment: ${process.env.NODE_ENV || 'development'}             
-║  Telegram Bot: ${TELEGRAM_BOT_TOKEN ? 'Active ✅' : 'Inactive ❌'}  
-║  Database: ${SUPABASE_URL ? 'Connected ✅' : 'Not configured ❌'}   
+║  Port: ${PORT}
+║  Environment: ${process.env.NODE_ENV || 'development'}
+║  Telegram Bot: ${TELEGRAM_BOT_TOKEN ? 'Active ✅' : 'Inactive ❌'}
+║  Database: ${SUPABASE_URL ? 'Connected ✅' : 'Not configured ❌'}
 ╚═══════════════════════════════════════════════════════════════════╝
-  `);
-  
-  // Initial data load
-  await updateMarketData();
-  console.log('✅ Initial market data loaded');
-});
+    `);
+
+    // Initial data load
+    await updateMarketData();
+    console.log('✅ Initial market data loaded');
+  });
+}
 
 module.exports = app;
