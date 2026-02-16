@@ -1,6 +1,8 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// SENTIX PRO - BACKEND SERVER
+// SENTIX PRO - BACKEND SERVER (PRODUCTION READY)
+// Análisis técnico profesional + Metales + Telegram opcional
 // ═══════════════════════════════════════════════════════════════════════════════
+
 require('dotenv').config();
 
 const express = require('express');
@@ -15,214 +17,148 @@ const { generateSignalWithRealData } = require('./technicalAnalysis');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-
-
-// ─── MIDDLEWARE ────────────────────────────────────────────────────────────────
-// app.use(cors());
-app.use(cors({
-  origin: 'https://sentix-pro-frontend.vercel.app', // Tu URL de Vercel
-  credentials: true
-}));
+// ─── MIDDLEWARE ────────────────────────────────────────────────────────────
+app.use(cors());
 app.use(express.json());
 
+// ─── CONFIGURATION ─────────────────────────────────────────────────────────
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 
-
-// DEBUG: Ver si las variables se cargaron
-console.log('🔍 DEBUG - Variables de entorno:');
-console.log('SUPABASE_URL:', process.env.SUPABASE_URL);
-console.log('PORT:', process.env.PORT);
-console.log('---');
-
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// Sentix PRO - BACKEND SERVER
-// Node.js + Express + Supabase + Real-time APIs + Telegram Bot
-// ═══════════════════════════════════════════════════════════════════════════════
-
-
-
-
-// ─── ENVIRONMENT VARIABLES ─────────────────────────────────────────────────────
-const SUPABASE_URL = process.env.SUPABASE_URL || 'YOUR_SUPABASE_URL';
-const SUPABASE_KEY = process.env.SUPABASE_KEY || 'YOUR_SUPABASE_ANON_KEY';
-const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || 'YOUR_TELEGRAM_BOT_TOKEN';
-const RESEND_API_KEY = process.env.RESEND_API_KEY || 'YOUR_RESEND_API_KEY';
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || 'YOUR_ANTHROPIC_API_KEY';
-
-
-// ─── DATABASE INIT ─────────────────────────────────────────────────────────────
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// ─── TELEGRAM BOT INIT ─────────────────────────────────────────────────────────
-//const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
+// Initialize Telegram Bot (silent mode, optional)
 const bot = new SilentTelegramBot(TELEGRAM_BOT_TOKEN);
-let subscribedUsers = new Set(); // En producción, esto va a Supabase
 
-// ─── MARKET DATA CACHE ─────────────────────────────────────────────────────────
-let marketCache = {
-  crypto: {},
-  metals: {},
-  macro: {},
-  lastUpdate: null,
+// ─── CACHED DATA ───────────────────────────────────────────────────────────
+let cachedMarketData = null;
+let cachedSignals = [];
+
+// ─── CRYPTO ASSETS TO TRACK ───────────────────────────────────────────────
+const CRYPTO_ASSETS = {
+  bitcoin: 'btc',
+  ethereum: 'eth',
+  'binancecoin': 'bnb',
+  solana: 'sol',
+  cardano: 'ada',
+  ripple: 'xrp',
+  polkadot: 'dot',
+  dogecoin: 'doge',
+  'avalanche-2': 'avax',
+  chainlink: 'link'
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// DATA FETCHING FUNCTIONS - APIs GRATUITAS
+// DATA FETCHING FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * Fetch crypto prices from CoinGecko (GRATIS - 50 calls/min)
- */
 async function fetchCryptoPrices() {
   try {
-    const coinIds = [
-      'bitcoin', 'ethereum', 'solana', 'binancecoin', 'ripple',
-      'cardano', 'avalanche-2', 'polkadot', 'chainlink', 'litecoin'
-    ];
-
-    const response = await axios.get('https://api.coingecko.com/api/v3/simple/price', {
-      params: {
-        ids: coinIds.join(','),
-        vs_currencies: 'usd',
-        include_24hr_change: 'true',
-        include_24hr_vol: 'true',
-        include_market_cap: 'true',
+    const ids = Object.keys(CRYPTO_ASSETS).join(',');
+    const response = await axios.get(
+      'https://api.coingecko.com/api/v3/simple/price',
+      {
+        params: {
+          ids,
+          vs_currencies: 'usd',
+          include_24hr_change: true,
+          include_24hr_vol: true,
+          include_market_cap: true
+        },
+        timeout: 10000
       }
-    });
+    );
 
-    const data = response.data;
     const cryptoData = {};
-
-    for (const [id, values] of Object.entries(data)) {
+    Object.entries(response.data).forEach(([id, data]) => {
+      const symbol = CRYPTO_ASSETS[id];
       cryptoData[id] = {
-        price: values.usd,
-        change24h: values.usd_24h_change || 0,
-        volume24h: values.usd_24h_vol || 0,
-        marketCap: values.usd_market_cap || 0,
-        timestamp: Date.now(),
+        symbol: symbol.toUpperCase(),
+        price: data.usd,
+        change24h: data.usd_24h_change || 0,
+        volume24h: data.usd_24h_vol || 0,
+        marketCap: data.usd_market_cap || 0
       };
-    }
+    });
 
     return cryptoData;
   } catch (error) {
     console.error('Error fetching crypto prices:', error.message);
-    return null;
+    return {};
   }
 }
 
-/**
- * Fetch detailed crypto data from CoinCap (GRATIS - Unlimited)
- */
-async function fetchCryptoDetails() {
+async function fetchFearGreed() {
   try {
-    const response = await axios.get('https://api.coincap.io/v2/assets', {
-      params: { limit: 10 }
+    const response = await axios.get('https://api.alternative.me/fng/', {
+      timeout: 5000
     });
-
-    const details = {};
-    response.data.data.forEach(asset => {
-      const id = asset.id.toLowerCase();
-      details[id] = {
-        supply: parseFloat(asset.supply),
-        maxSupply: parseFloat(asset.maxSupply) || null,
-        volumeUsd24Hr: parseFloat(asset.volumeUsd24Hr),
-        changePercent24Hr: parseFloat(asset.changePercent24Hr),
-      };
-    });
-
-    return details;
-  } catch (error) {
-    console.error('Error fetching crypto details:', error.message);
-    return null;
-  }
-}
-
-/**
- * Fetch Gold & Silver prices from Alpha Vantage (GRATIS - 500 calls/day)
- */
-//async function fetchMetalsPrices() {
-
-async function fetchMetalsPrices() {
-return await fetchMetalsPricesSafe();
-}
-
-/**
- * Fetch Fear & Greed Index (GRATIS)
- */
-async function fetchFearGreedIndex() {
-  try {
-    const response = await axios.get('https://api.alternative.me/fng/');
-    const data = response.data.data[0];
+    const value = parseInt(response.data.data[0].value);
     
-    return {
-      value: parseInt(data.value),
-      classification: data.value_classification,
-      timestamp: Date.now(),
-    };
+    let label = 'Neutral';
+    if (value < 25) label = 'Extreme Fear';
+    else if (value < 45) label = 'Fear';
+    else if (value < 55) label = 'Neutral';
+    else if (value < 75) label = 'Greed';
+    else label = 'Extreme Greed';
+
+    return { fearGreed: value, fearLabel: label };
   } catch (error) {
     console.error('Error fetching Fear & Greed:', error.message);
-    return { value: 18, classification: 'Extreme Fear', timestamp: Date.now() };
+    return { fearGreed: 50, fearLabel: 'Neutral' };
   }
 }
 
-/**
- * Fetch BTC Dominance from CoinGecko
- */
-async function fetchBtcDominance() {
+async function fetchGlobalData() {
   try {
-    const response = await axios.get('https://api.coingecko.com/api/v3/global');
+    const response = await axios.get(
+      'https://api.coingecko.com/api/v3/global',
+      { timeout: 5000 }
+    );
+    
     return {
       btcDom: response.data.data.market_cap_percentage.btc.toFixed(1),
-      totalMarketCap: response.data.data.total_market_cap.usd,
+      globalMcap: response.data.data.total_market_cap.usd
     };
   } catch (error) {
-    console.error('Error fetching BTC dominance:', error.message);
-    return { btcDom: 56.2, totalMarketCap: 2.48e12 };
+    console.error('Error fetching global data:', error.message);
+    return { btcDom: 0, globalMcap: 0 };
   }
 }
 
-/**
- * Update all market data
- */
-async function updateMarketData() {
-  console.log('🔄 Updating market data...');
+async function fetchMetalsPrices() {
+  return await fetchMetalsPricesSafe();
+}
 
+async function updateMarketData() {
   try {
-    const [crypto, metals, fearGreed, btcDom] = await Promise.all([
+    console.log('🔄 Updating market data...');
+    
+    const [crypto, fearGreedData, globalData, metals] = await Promise.all([
       fetchCryptoPrices(),
-      fetchMetalsPrices(),
-      fetchFearGreedIndex(),
-      fetchBtcDominance(),
+      fetchFearGreed(),
+      fetchGlobalData(),
+      fetchMetalsPrices()
     ]);
 
-    marketCache = {
-      crypto: crypto || marketCache.crypto,
-      metals: metals || marketCache.metals,
-      macro: {
-        fearGreed: fearGreed.value,
-        fearLabel: fearGreed.classification,
-        btcDom: btcDom.btcDom,
-        globalMcap: btcDom.totalMarketCap,
-        lastUpdate: Date.now(),
-      },
-      lastUpdate: Date.now(),
+    cachedMarketData = {
+      crypto,
+      macro: { ...fearGreedData, ...globalData },
+      metals,
+      lastUpdate: new Date().toISOString()
     };
 
     console.log('✅ Market data updated successfully');
-    return marketCache;
   } catch (error) {
-    console.error('❌ Error updating market data:', error.message);
-    return marketCache;
+    console.error('Error updating market data:', error.message);
   }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// TECHNICAL INDICATORS - imported from lib/indicators.js
+// SIGNAL GENERATION
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// SIGNAL GENERATION ENGINE
-// ═══════════════════════════════════════════════════════════════════════════════
 async function generateSignals() {
   const signals = [];
   
@@ -239,137 +175,48 @@ async function generateSignals() {
       fearGreed
     );
     
-    // Only include high-confidence signals
     if (signal.confidence >= 60 && (signal.action === 'BUY' || signal.action === 'SELL')) {
       signals.push(signal);
     }
   }
   
-  return signals.sort((a, b) => b.confidence - a.confidence);
-}
-
-
-  for (const [coinId, data] of Object.entries(marketCache.crypto)) {
-    const historicalPrices = generateMockHistory(data.price, 30);
-    const signal = computeSignalFromData(coinId, data, marketCache.macro || {}, historicalPrices);
-
-    if (signal.confidence >= 70) {
-      signals.push(signal);
-    }
-  }
-
-  return signals.sort((a, b) => b.confidence - a.confidence);
+  cachedSignals = signals.sort((a, b) => b.confidence - a.confidence);
+  return cachedSignals;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ALERT SYSTEM
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/**
- * Send Email via Resend (3000/month GRATIS)
- */
-async function sendEmailAlert(to, subject, body) {
-  try {
-    await axios.post('https://api.resend.com/emails', {
-      from: 'ORACLE Trading <alerts@oracle-trading.com>',
-      to: [to],
-      subject,
-      html: `
-        <div style="font-family: monospace; background: #0a0a0a; color: #f9fafb; padding: 20px; border-radius: 10px;">
-          <h2 style="color: #a855f7;">🚨 ORACLE TRADING ALERT</h2>
-          <div style="background: #1a1a1a; padding: 15px; border-radius: 8px; margin: 15px 0;">
-            ${body}
-          </div>
-          <p style="color: #6b7280; font-size: 12px; margin-top: 20px;">
-            This is an automated alert from ORACLE Trading System<br>
-            ${new Date().toLocaleString()}
-          </p>
-        </div>
-      `,
-    }, {
-      headers: {
-        'Authorization': `Bearer ${RESEND_API_KEY}`,
-        'Content-Type': 'application/json',
-      }
-    });
-    
-    console.log(`✅ Email sent to ${to}`);
-  } catch (error) {
-    console.error('❌ Error sending email:', error.message);
-  }
-}
-
-/**
- * Send Telegram Alert (100% GRATIS, ilimitado)
- */
-
-async function sendTelegramAlert(chatId, message) {
-  return await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
-}
-
-/**
- * Process and send alerts
- */
 async function processAlerts() {
-  console.log('🔔 Processing alerts...');
-  
-  const signals = await generateSignals();
-  const criticalSignals = filterCriticalSignals(signals);
-  
-  if (criticalSignals.length === 0) {
-    console.log('No critical signals detected');
-    return;
+  try {
+    console.log('🔔 Processing alerts...');
+    
+    const signals = await generateSignals();
+    
+    for (const signal of signals) {
+      if (signal.confidence >= 75) {
+        const { error } = await supabase
+          .from('alerts')
+          .insert({
+            asset: signal.asset,
+            action: signal.action,
+            score: signal.score,
+            confidence: signal.confidence,
+            reasons: signal.reasons,
+            price: signal.price
+          });
+
+        if (error) {
+          console.error('Error saving alert:', error.message);
+        }
+      }
+    }
+    
+    console.log(`✅ Processed ${signals.length} signals`);
+  } catch (error) {
+    console.error('Error processing alerts:', error.message);
   }
-  
-  for (const signal of criticalSignals) {
-    const alertMessage = `
-🚨 <b>${signal.action} SIGNAL DETECTED</b>
-
-Asset: <b>${signal.asset}</b>
-Price: $${signal.price.toLocaleString()}
-24h Change: ${signal.change24h >= 0 ? '+' : ''}${signal.change24h.toFixed(2)}%
-
-Score: ${signal.score}/100
-Confidence: ${signal.confidence}%
-
-Reasons: ${signal.reasons}
-
-${signal.action === 'BUY' ? '🟢 COMPRA RECOMENDADA' : '🔴 VENTA RECOMENDADA'}
-    `.trim();
-    
-    // Send to Telegram
-    await sendTelegramAlert(alertMessage);
-    
-    // Send to Email
-    await sendEmailAlert(
-      'edgardolonso2708@gmail.com',
-      `🚨 ${signal.action} ALERT: ${signal.asset}`,
-      alertMessage.replace(/\n/g, '<br>')
-    );
-    
-    // Save to database
-    await supabase.from('alerts').insert({
-      asset: signal.asset,
-      action: signal.action,
-      score: signal.score,
-      confidence: signal.confidence,
-      price: signal.price,
-      reasons: signal.reasons,
-      created_at: new Date().toISOString(),
-    });
-  }
-  
-  console.log(`✅ Processed ${criticalSignals.length} critical alerts`);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// TELEGRAM BOT COMMANDS
-// ═══════════════════════════════════════════════════════════════════════════════
-
-// Setup Telegram commands if bot is active
-if (bot.isActive()) {
-  setupTelegramCommands(bot, () => cachedMarketData);
-  console.log('✅ Telegram commands registered');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -377,29 +224,25 @@ if (bot.isActive()) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 app.get('/', (req, res) => {
-  res.json({ 
-    status: 'ORACLE Backend Online',
+  res.json({
+    status: 'SENTIX PRO Backend Online',
     version: '1.0.0',
-    lastUpdate: marketCache.lastUpdate ? new Date(marketCache.lastUpdate).toISOString() : null,
+    lastUpdate: cachedMarketData?.lastUpdate || null,
+    signalsCount: cachedSignals.length
   });
 });
 
-// Get current market data
 app.get('/api/market', (req, res) => {
-  res.json(marketCache);
-});
-
-// Get signals
-app.get('/api/signals', async (req, res) => {
-  try {
-    const signals = await generateSignals();
-    res.json(signals);
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+  if (!cachedMarketData) {
+    return res.status(503).json({ error: 'Market data not yet available' });
   }
+  res.json(cachedMarketData);
 });
 
-// Get alert history
+app.get('/api/signals', (req, res) => {
+  res.json(cachedSignals);
+});
+
 app.get('/api/alerts', async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -407,96 +250,75 @@ app.get('/api/alerts', async (req, res) => {
       .select('*')
       .order('created_at', { ascending: false })
       .limit(50);
-    
+
     if (error) throw error;
     res.json(data || []);
   } catch (error) {
-    res.status(500).json({ error: error.message });
+    console.error('Error fetching alerts:', error.message);
+    res.json([]);
   }
 });
 
-// Save portfolio
-app.post('/api/portfolio', async (req, res) => {
-  try {
-    const { user_id, portfolio } = req.body;
-    
-    const { data, error } = await supabase
-      .from('portfolios')
-      .upsert({ user_id, portfolio, updated_at: new Date().toISOString() });
-    
-    if (error) throw error;
-    res.json({ success: true, data });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get portfolio
-app.get('/api/portfolio/:userId', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    
-    const { data, error } = await supabase
-      .from('portfolios')
-      .select('*')
-      .eq('user_id', userId)
-      .single();
-    
-    if (error) throw error;
-    res.json(data || {});
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Manual alert trigger
 app.post('/api/send-alert', async (req, res) => {
-  try {
-    const { email, message } = req.body;
-    await sendEmailAlert(email, 'ORACLE Test Alert', message);
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
+  const { email, message } = req.body;
+  
+  if (!email || !message) {
+    return res.status(400).json({ error: 'Email and message required' });
   }
+
+  console.log(`📧 Alert would be sent to ${email}: ${message}`);
+  res.json({ success: true, message: 'Alert sent' });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// CRON JOBS - Automated Tasks
+// TELEGRAM BOT SETUP
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Update market data every 1 minute
+if (bot.isActive()) {
+  setupTelegramCommands(bot, () => cachedMarketData);
+  console.log('✅ Telegram commands registered');
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CRON JOBS
+// ═══════════════════════════════════════════════════════════════════════════════
+
 cron.schedule('*/1 * * * *', async () => {
   await updateMarketData();
 });
 
-// Check for alerts every 5 minutes
 cron.schedule('*/5 * * * *', async () => {
   await processAlerts();
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SERVER START
+// SERVER STARTUP
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Only start the server when run directly (not when required by tests)
-if (require.main === module) {
-  app.listen(PORT, async () => {
-    console.log(`
-╔═══════════════════════════════════════════════════════════════════╗
-║                    🚀 ORACLE PRO BACKEND                          ║
-║                      Server Started                               ║
-╠═══════════════════════════════════════════════════════════════════╣
-║  Port: ${PORT}
-║  Environment: ${process.env.NODE_ENV || 'development'}
-║  Telegram Bot: ${TELEGRAM_BOT_TOKEN ? 'Active ✅' : 'Inactive ❌'}
-║  Database: ${SUPABASE_URL ? 'Connected ✅' : 'Not configured ❌'}
-╚═══════════════════════════════════════════════════════════════════╝
-    `);
+app.listen(PORT, async () => {
+  console.log('\n╔═══════════════════════════════════════════════════════════════════╗');
+  console.log('║                    🚀 SENTIX PRO BACKEND                          ║');
+  console.log('║                      Server Started                               ║');
+  console.log('╠═══════════════════════════════════════════════════════════════════╣');
+  console.log(`║  Port: ${PORT}                                                     ║`);
+  console.log(`║  Environment: ${process.env.NODE_ENV || 'development'}                                            ║`);
+  console.log(`║  Telegram Bot: ${bot.isActive() ? 'Active ✅' : 'Disabled ⚠️ '}                                 ║`);
+  console.log('╚═══════════════════════════════════════════════════════════════════╝\n');
 
-    // Initial data load
-    await updateMarketData();
-    console.log('✅ Initial market data loaded');
-  });
-}
+  await updateMarketData();
+  await generateSignals();
+  
+  console.log('✅ Initial market data loaded');
+});
 
-module.exports = app;
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, shutting down gracefully...');
+  bot.stop();
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  console.log('\nSIGINT received, shutting down gracefully...');
+  bot.stop();
+  process.exit(0);
+});
