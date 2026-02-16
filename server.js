@@ -10,9 +10,9 @@ const cron = require('node-cron');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 const TelegramBot = require('node-telegram-bot-api');
-
 const app = express();  // ← ESTA LÍNEA ES CRÍTICA
 const PORT = process.env.PORT || 3001;
+const { generateSignalWithRealData } = require('./technicalAnalysis');
 
 // ─── MIDDLEWARE ────────────────────────────────────────────────────────────────
 // app.use(cors());
@@ -45,6 +45,7 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY || 'YOUR_SUPABASE_ANON_KEY';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || 'YOUR_TELEGRAM_BOT_TOKEN';
 const RESEND_API_KEY = process.env.RESEND_API_KEY || 'YOUR_RESEND_API_KEY';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || 'YOUR_ANTHROPIC_API_KEY';
+
 
 // ─── DATABASE INIT ─────────────────────────────────────────────────────────────
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -302,96 +303,29 @@ function calculateMACD(prices) {
 // ═══════════════════════════════════════════════════════════════════════════════
 // SIGNAL GENERATION ENGINE
 // ═══════════════════════════════════════════════════════════════════════════════
-
 async function generateSignals() {
   const signals = [];
   
-  // Para cada crypto, generar señal
-  for (const [coinId, data] of Object.entries(marketCache.crypto)) {
-    // Simular datos históricos (en producción, esto viene de la DB)
-    const historicalPrices = generateMockHistory(data.price, 30);
+  if (!cachedMarketData || !cachedMarketData.crypto) return signals;
+  
+  const fearGreed = cachedMarketData.macro?.fearGreed || 50;
+  
+  for (const [assetId, data] of Object.entries(cachedMarketData.crypto)) {
+    const signal = await generateSignalWithRealData(
+      assetId,
+      data.price,
+      data.change24h,
+      data.volume24h,
+      fearGreed
+    );
     
-    const rsi = calculateRSI(historicalPrices);
-    const macd = calculateMACD(historicalPrices);
-    
-    let score = 50;
-    let confidence = 0;
-    const signalReasons = [];
-    
-    // RSI Analysis
-    if (rsi < 30) {
-      score += 15;
-      confidence += 20;
-      signalReasons.push('RSI oversold');
-    } else if (rsi > 70) {
-      score -= 15;
-      confidence += 20;
-      signalReasons.push('RSI overbought');
-    }
-    
-    // MACD Analysis
-    if (macd.histogram > 0) {
-      score += 12;
-      confidence += 15;
-      signalReasons.push('MACD bullish');
-    } else {
-      score -= 12;
-      confidence += 15;
-      signalReasons.push('MACD bearish');
-    }
-    
-    // 24h change
-    if (data.change24h > 5) {
-      score += 8;
-      confidence += 10;
-      signalReasons.push('Strong 24h momentum');
-    } else if (data.change24h < -5) {
-      score -= 8;
-      confidence += 10;
-      signalReasons.push('Weak 24h momentum');
-    }
-    
-    // Fear & Greed bonus
-    if (marketCache.macro.fearGreed < 25 && score > 50) {
-      score += 5;
-      confidence += 8;
-      signalReasons.push('Extreme fear = opportunity');
-    }
-    
-    score = Math.max(0, Math.min(100, score));
-    confidence = Math.min(100, confidence);
-    
-    const action = score >= 65 ? 'BUY' : score >= 45 ? 'HOLD' : 'SELL';
-    
-    if (confidence >= 70) {
-      signals.push({
-        asset: coinId.toUpperCase(),
-        action,
-        score,
-        confidence,
-        price: data.price,
-        change24h: data.change24h,
-        reasons: signalReasons.join(' · '),
-        timestamp: Date.now(),
-      });
+    // Only include high-confidence signals
+    if (signal.confidence >= 60 && (signal.action === 'BUY' || signal.action === 'SELL')) {
+      signals.push(signal);
     }
   }
   
   return signals.sort((a, b) => b.confidence - a.confidence);
-}
-
-function generateMockHistory(currentPrice, days) {
-  const prices = [];
-  let price = currentPrice * 0.9;
-  
-  for (let i = 0; i < days; i++) {
-    const change = (Math.random() - 0.48) * 0.03;
-    price = price * (1 + change);
-    prices.push(price);
-  }
-  
-  prices.push(currentPrice);
-  return prices;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

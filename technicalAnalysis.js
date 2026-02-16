@@ -1,0 +1,387 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// SENTIX PRO - TECHNICAL ANALYSIS ENGINE (PROFESSIONAL)
+// Implementación correcta de indicadores técnicos sin look-ahead bias
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const axios = require('axios');
+
+/**
+ * Fetch historical OHLCV data from CoinGecko (real data, no mocks)
+ * @param {string} coinId - CoinGecko coin ID (e.g., 'bitcoin')
+ * @param {number} days - Number of days of history (max 365 for free tier)
+ * @returns {Promise<Array>} Array of {timestamp, price, volume}
+ */
+async function fetchHistoricalData(coinId, days = 30) {
+  try {
+    const response = await axios.get(
+      `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart`,
+      {
+        params: {
+          vs_currency: 'usd',
+          days: days,
+          interval: 'daily'
+        }
+      }
+    );
+
+    const prices = response.data.prices || [];
+    const volumes = response.data.total_volumes || [];
+
+    // Combine prices and volumes into OHLCV-like structure
+    return prices.map((priceData, i) => ({
+      timestamp: priceData[0],
+      price: priceData[1],
+      volume: volumes[i] ? volumes[i][1] : 0
+    }));
+  } catch (error) {
+    console.error(`Error fetching historical data for ${coinId}:`, error.message);
+    return [];
+  }
+}
+
+/**
+ * Calculate Simple Moving Average (SMA)
+ * @param {Array<number>} data - Price array
+ * @param {number} period - Period length
+ * @returns {Array<number>} SMA values
+ */
+function calculateSMA(data, period) {
+  if (data.length < period) return [];
+  
+  const sma = [];
+  for (let i = period - 1; i < data.length; i++) {
+    const sum = data.slice(i - period + 1, i + 1).reduce((a, b) => a + b, 0);
+    sma.push(sum / period);
+  }
+  return sma;
+}
+
+/**
+ * Calculate Exponential Moving Average (EMA)
+ * @param {Array<number>} data - Price array
+ * @param {number} period - Period length
+ * @returns {Array<number>} EMA values
+ */
+function calculateEMA(data, period) {
+  if (data.length < period) return [];
+  
+  const k = 2 / (period + 1);
+  const ema = [];
+  
+  // First EMA is SMA
+  const firstSMA = data.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  ema.push(firstSMA);
+  
+  // Calculate subsequent EMAs
+  for (let i = period; i < data.length; i++) {
+    const value = data[i] * k + ema[ema.length - 1] * (1 - k);
+    ema.push(value);
+  }
+  
+  return ema;
+}
+
+/**
+ * Calculate RSI (Relative Strength Index) - CORRECT IMPLEMENTATION
+ * @param {Array<number>} prices - Price array
+ * @param {number} period - Period length (default 14)
+ * @returns {number} Current RSI value (0-100)
+ */
+function calculateRSI(prices, period = 14) {
+  if (prices.length < period + 1) return 50; // Neutral if not enough data
+  
+  const changes = [];
+  for (let i = 1; i < prices.length; i++) {
+    changes.push(prices[i] - prices[i - 1]);
+  }
+  
+  const gains = changes.map(c => c > 0 ? c : 0);
+  const losses = changes.map(c => c < 0 ? Math.abs(c) : 0);
+  
+  // Calculate average gain and loss
+  let avgGain = gains.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  let avgLoss = losses.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  
+  // Smooth with Wilder's smoothing method
+  for (let i = period; i < changes.length; i++) {
+    avgGain = (avgGain * (period - 1) + gains[i]) / period;
+    avgLoss = (avgLoss * (period - 1) + losses[i]) / period;
+  }
+  
+  if (avgLoss === 0) return 100;
+  
+  const rs = avgGain / avgLoss;
+  const rsi = 100 - (100 / (1 + rs));
+  
+  return rsi;
+}
+
+/**
+ * Calculate MACD (Moving Average Convergence Divergence) - CORRECT IMPLEMENTATION
+ * @param {Array<number>} prices - Price array
+ * @param {number} fastPeriod - Fast EMA period (default 12)
+ * @param {number} slowPeriod - Slow EMA period (default 26)
+ * @param {number} signalPeriod - Signal line EMA period (default 9)
+ * @returns {Object} {macd, signal, histogram}
+ */
+function calculateMACD(prices, fastPeriod = 12, slowPeriod = 26, signalPeriod = 9) {
+  if (prices.length < slowPeriod) {
+    return { macd: 0, signal: 0, histogram: 0 };
+  }
+  
+  // Calculate fast and slow EMAs
+  const fastEMA = calculateEMA(prices, fastPeriod);
+  const slowEMA = calculateEMA(prices, slowPeriod);
+  
+  // MACD line = Fast EMA - Slow EMA
+  // Align arrays (slow EMA starts later)
+  const macdLine = [];
+  const offset = slowPeriod - fastPeriod;
+  
+  for (let i = 0; i < slowEMA.length; i++) {
+    macdLine.push(fastEMA[i + offset] - slowEMA[i]);
+  }
+  
+  // Signal line = EMA of MACD line
+  const signalLine = calculateEMA(macdLine, signalPeriod);
+  
+  // Get current values
+  const currentMACD = macdLine[macdLine.length - 1] || 0;
+  const currentSignal = signalLine[signalLine.length - 1] || 0;
+  const histogram = currentMACD - currentSignal;
+  
+  return {
+    macd: currentMACD,
+    signal: currentSignal,
+    histogram: histogram
+  };
+}
+
+/**
+ * Calculate Bollinger Bands - CORRECT IMPLEMENTATION
+ * @param {Array<number>} prices - Price array
+ * @param {number} period - Period length (default 20)
+ * @param {number} stdDev - Standard deviation multiplier (default 2)
+ * @returns {Object} {upper, middle, lower, bandwidth}
+ */
+function calculateBollingerBands(prices, period = 20, stdDev = 2) {
+  if (prices.length < period) {
+    const price = prices[prices.length - 1] || 0;
+    return { upper: price, middle: price, lower: price, bandwidth: 0 };
+  }
+  
+  const sma = calculateSMA(prices, period);
+  const currentSMA = sma[sma.length - 1];
+  
+  // Calculate standard deviation of last 'period' prices
+  const recentPrices = prices.slice(-period);
+  const variance = recentPrices.reduce((sum, price) => {
+    return sum + Math.pow(price - currentSMA, 2);
+  }, 0) / period;
+  
+  const standardDeviation = Math.sqrt(variance);
+  
+  const upper = currentSMA + (stdDev * standardDeviation);
+  const lower = currentSMA - (stdDev * standardDeviation);
+  const bandwidth = ((upper - lower) / currentSMA) * 100;
+  
+  return {
+    upper,
+    middle: currentSMA,
+    lower,
+    bandwidth
+  };
+}
+
+/**
+ * Calculate support and resistance levels using pivot points
+ * @param {Array<Object>} historicalData - Array of {price} objects
+ * @returns {Object} {support, resistance}
+ */
+function calculateSupportResistance(historicalData) {
+  if (historicalData.length < 3) {
+    const price = historicalData[historicalData.length - 1]?.price || 0;
+    return { support: price * 0.95, resistance: price * 1.05 };
+  }
+  
+  const prices = historicalData.map(d => d.price);
+  const high = Math.max(...prices);
+  const low = Math.min(...prices);
+  const close = prices[prices.length - 1];
+  
+  // Pivot point
+  const pivot = (high + low + close) / 3;
+  
+  // Support and resistance levels
+  const resistance1 = (2 * pivot) - low;
+  const support1 = (2 * pivot) - high;
+  
+  return {
+    support: support1,
+    resistance: resistance1,
+    pivot
+  };
+}
+
+/**
+ * Generate trading signals based on real technical analysis
+ * @param {string} asset - Asset ID
+ * @param {number} currentPrice - Current price
+ * @param {number} change24h - 24h change percentage
+ * @param {number} volume - Current volume
+ * @param {number} fearGreed - Fear & Greed index
+ * @returns {Promise<Object>} Trading signal with score and confidence
+ */
+async function generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed) {
+  try {
+    // Fetch 30 days of historical data
+    const historicalData = await fetchHistoricalData(asset, 30);
+    
+    if (historicalData.length < 14) {
+      // Not enough data, return neutral signal
+      return {
+        asset: asset.toUpperCase(),
+        action: 'HOLD',
+        score: 50,
+        confidence: 30,
+        price: currentPrice,
+        change24h,
+        reasons: 'Insufficient historical data for technical analysis',
+        timestamp: new Date().toISOString()
+      };
+    }
+    
+    const prices = historicalData.map(d => d.price);
+    
+    // Calculate technical indicators with REAL data
+    const rsi = calculateRSI(prices, 14);
+    const macd = calculateMACD(prices, 12, 26, 9);
+    const bollinger = calculateBollingerBands(prices, 20, 2);
+    const supportResistance = calculateSupportResistance(historicalData);
+    
+    // Initialize scoring
+    let score = 50; // Neutral base
+    let signals = [];
+    let confidence = 50;
+    
+    // ─── RSI ANALYSIS ────────────────────────────────────────────────
+    if (rsi < 30) {
+      score += 15;
+      signals.push(`RSI oversold (${rsi.toFixed(1)})`);
+      confidence += 10;
+    } else if (rsi > 70) {
+      score -= 15;
+      signals.push(`RSI overbought (${rsi.toFixed(1)})`);
+      confidence += 10;
+    } else if (rsi >= 40 && rsi <= 60) {
+      signals.push('RSI neutral');
+    }
+    
+    // ─── MACD ANALYSIS ───────────────────────────────────────────────
+    if (macd.histogram > 0 && macd.macd > macd.signal) {
+      score += 12;
+      signals.push('MACD bullish crossover');
+      confidence += 8;
+    } else if (macd.histogram < 0 && macd.macd < macd.signal) {
+      score -= 12;
+      signals.push('MACD bearish crossover');
+      confidence += 8;
+    }
+    
+    // ─── BOLLINGER BANDS ANALYSIS ────────────────────────────────────
+    if (currentPrice <= bollinger.lower) {
+      score += 10;
+      signals.push('Price at lower Bollinger Band');
+      confidence += 7;
+    } else if (currentPrice >= bollinger.upper) {
+      score -= 10;
+      signals.push('Price at upper Bollinger Band');
+      confidence += 7;
+    }
+    
+    // ─── SUPPORT/RESISTANCE ANALYSIS ─────────────────────────────────
+    if (currentPrice <= supportResistance.support * 1.02) {
+      score += 8;
+      signals.push('Near support level');
+      confidence += 5;
+    } else if (currentPrice >= supportResistance.resistance * 0.98) {
+      score -= 8;
+      signals.push('Near resistance level');
+      confidence += 5;
+    }
+    
+    // ─── MOMENTUM ANALYSIS ───────────────────────────────────────────
+    if (change24h > 5) {
+      score += 8;
+      signals.push(`Strong upward momentum (+${change24h.toFixed(1)}%)`);
+    } else if (change24h < -5) {
+      score -= 8;
+      signals.push(`Strong downward momentum (${change24h.toFixed(1)}%)`);
+    }
+    
+    // ─── VOLUME ANALYSIS ─────────────────────────────────────────────
+    const avgVolume = historicalData.slice(-7).reduce((sum, d) => sum + d.volume, 0) / 7;
+    if (volume > avgVolume * 1.5) {
+      score += 5;
+      signals.push('High volume confirmation');
+      confidence += 5;
+    }
+    
+    // ─── FEAR & GREED BONUS ──────────────────────────────────────────
+    if (fearGreed < 25) {
+      score += 5;
+      signals.push('Extreme fear (contrarian buy)');
+    } else if (fearGreed > 75) {
+      score -= 5;
+      signals.push('Extreme greed (caution)');
+    }
+    
+    // ─── DETERMINE ACTION ────────────────────────────────────────────
+    let action = 'HOLD';
+    if (score >= 70) action = 'BUY';
+    else if (score <= 30) action = 'SELL';
+    
+    // Cap confidence at 95%
+    confidence = Math.min(confidence, 95);
+    
+    return {
+      asset: asset.toUpperCase(),
+      action,
+      score: Math.round(score),
+      confidence: Math.round(confidence),
+      price: currentPrice,
+      change24h,
+      reasons: signals.join(' • '),
+      indicators: {
+        rsi: rsi.toFixed(1),
+        macd: macd.histogram.toFixed(4),
+        bollinger: {
+          position: currentPrice > bollinger.upper ? 'above' : currentPrice < bollinger.lower ? 'below' : 'within'
+        }
+      },
+      timestamp: new Date().toISOString()
+    };
+    
+  } catch (error) {
+    console.error(`Error generating signal for ${asset}:`, error.message);
+    return {
+      asset: asset.toUpperCase(),
+      action: 'HOLD',
+      score: 50,
+      confidence: 20,
+      price: currentPrice,
+      change24h,
+      reasons: 'Error in technical analysis',
+      timestamp: new Date().toISOString()
+    };
+  }
+}
+
+module.exports = {
+  fetchHistoricalData,
+  calculateRSI,
+  calculateMACD,
+  calculateBollingerBands,
+  calculateSupportResistance,
+  generateSignalWithRealData
+};
