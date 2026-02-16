@@ -5,38 +5,108 @@
 
 const axios = require('axios');
 
+// Reusable HTTP client with proper headers
+const apiClient = axios.create({
+  headers: {
+    'User-Agent': 'SentixPro/2.1 (Trading Dashboard)',
+    'Accept': 'application/json'
+  }
+});
+
+// In-memory cache for historical data (avoids repeated API calls)
+const historicalCache = new Map();
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+// CoinCap ID mapping for fallback
+const COINCAP_HISTORY_IDS = {
+  bitcoin: 'bitcoin', ethereum: 'ethereum', binancecoin: 'binance-coin',
+  solana: 'solana', cardano: 'cardano', ripple: 'xrp',
+  polkadot: 'polkadot', dogecoin: 'dogecoin', 'avalanche-2': 'avalanche',
+  chainlink: 'chainlink'
+};
+
 /**
- * Fetch historical OHLCV data from CoinGecko (real data, no mocks)
+ * Fetch historical OHLCV data with retry + fallback
+ * Primary: CoinGecko, Fallback: CoinCap
  * @param {string} coinId - CoinGecko coin ID (e.g., 'bitcoin')
  * @param {number} days - Number of days of history (max 365 for free tier)
  * @returns {Promise<Array>} Array of {timestamp, price, volume}
  */
 async function fetchHistoricalData(coinId, days = 30) {
+  // Check cache first
+  const cacheKey = `${coinId}-${days}`;
+  const cached = historicalCache.get(cacheKey);
+  if (cached && (Date.now() - cached.ts) < CACHE_TTL) {
+    return cached.data;
+  }
+
+  let result = [];
+
+  // Primary: CoinGecko
   try {
-    const response = await axios.get(
+    const response = await apiClient.get(
       `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart`,
       {
-        params: {
-          vs_currency: 'usd',
-          days: days,
-          interval: 'daily'
-        }
+        params: { vs_currency: 'usd', days, interval: 'daily' },
+        timeout: 12000
       }
     );
 
     const prices = response.data.prices || [];
     const volumes = response.data.total_volumes || [];
 
-    // Combine prices and volumes into OHLCV-like structure
-    return prices.map((priceData, i) => ({
+    result = prices.map((priceData, i) => ({
       timestamp: priceData[0],
       price: priceData[1],
       volume: volumes[i] ? volumes[i][1] : 0
     }));
   } catch (error) {
-    console.error(`Error fetching historical data for ${coinId}:`, error.message);
-    return [];
+    const isRateLimit = error.response?.status === 429;
+    console.warn(`⚠️ CoinGecko historical ${coinId}: ${error.message}${isRateLimit ? ' (rate limited)' : ''}`);
   }
+
+  // Fallback: CoinCap if CoinGecko failed
+  if (result.length === 0) {
+    try {
+      const coincapId = COINCAP_HISTORY_IDS[coinId] || coinId;
+      const end = Date.now();
+      const start = end - (days * 24 * 60 * 60 * 1000);
+      const interval = days <= 7 ? 'h1' : 'd1';
+
+      const response = await apiClient.get(
+        `https://api.coincap.io/v2/assets/${coincapId}/history`,
+        {
+          params: { interval, start, end },
+          timeout: 10000
+        }
+      );
+
+      result = (response.data.data || []).map(d => ({
+        timestamp: d.time,
+        price: parseFloat(d.priceUsd) || 0,
+        volume: 0 // CoinCap history doesn't include volume
+      }));
+
+      if (result.length > 0) {
+        console.log(`✅ CoinCap fallback for ${coinId}: ${result.length} data points`);
+      }
+    } catch (fallbackError) {
+      console.warn(`⚠️ CoinCap fallback ${coinId}: ${fallbackError.message}`);
+    }
+  }
+
+  // Cache successful results
+  if (result.length > 0) {
+    historicalCache.set(cacheKey, { data: result, ts: Date.now() });
+  } else {
+    // Return cached data if available (even if stale)
+    if (cached) {
+      console.log(`⚠️ Using stale cache for ${coinId} historical data`);
+      return cached.data;
+    }
+  }
+
+  return result;
 }
 
 /**

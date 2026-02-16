@@ -66,7 +66,7 @@ describe('GET /', () => {
     const res = await request(app).get('/');
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty('status', 'SENTIX PRO Backend Online');
-    expect(res.body).toHaveProperty('version', '2.0.0');
+    expect(res.body).toHaveProperty('version', '2.1.0');
     expect(res.body).toHaveProperty('lastUpdate');
   });
 });
