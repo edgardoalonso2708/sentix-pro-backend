@@ -22,7 +22,7 @@ export default function SentixProFrontend() {
   
   // Alert config
   const [alertConfig, setAlertConfig] = useState({
-    email: "edgardolonso2708@gmail.com",
+    email: "edgardoalonso2708@gmail.com",
     telegramEnabled: false,
     minConfidence: 75,
   });
@@ -873,7 +873,7 @@ export default function SentixProFrontend() {
 
           <div style={{ marginBottom: 16 }}>
             <label style={{ fontSize: 11, color: muted, display: "block", marginBottom: 6 }}>
-              EMAIL (para referencia)
+              EMAIL PARA ALERTAS
             </label>
             <input
               type="email"
@@ -927,18 +927,23 @@ export default function SentixProFrontend() {
           {testResult && (
             <div style={{
               marginTop: 12,
-              padding: "10px 14px",
+              padding: "12px 14px",
               background: bg3,
               borderRadius: 6,
               fontSize: 12,
-              color: testResult.success ? green : red,
-              lineHeight: 1.6
+              lineHeight: 1.8
             }}>
-              {testResult.success ? 'Test enviado' : 'Error'}
+              <div style={{ color: testResult.success ? green : red, fontWeight: 700, marginBottom: 6 }}>
+                {testResult.success ? '✅ Test procesado' : '❌ Error'}
+              </div>
               {testResult.delivery && (
-                <div style={{ marginTop: 6, color: muted, fontSize: 11 }}>
-                  Telegram: {testResult.delivery.telegram}<br />
-                  Email: {testResult.delivery.email}
+                <div style={{ color: text, fontSize: 11 }}>
+                  📧 Email: <span style={{ color: testResult.delivery.email === 'sent' ? green : amber }}>
+                    {testResult.delivery.email === 'sent' ? '✅ Enviado' : testResult.delivery.email}
+                  </span><br />
+                  📱 Telegram: <span style={{ color: testResult.delivery.telegram === 'sent' ? green : amber }}>
+                    {testResult.delivery.telegram === 'sent' ? '✅ Enviado' : testResult.delivery.telegram}
+                  </span>
                 </div>
               )}
             </div>

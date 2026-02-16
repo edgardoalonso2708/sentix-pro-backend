@@ -28,7 +28,8 @@
     "express-rate-limit": "^8.2.1",
     "multer": "^2.0.2",
     "node-cron": "^3.0.3",
-    "node-telegram-bot-api": "^0.64.0"
+    "node-telegram-bot-api": "^0.64.0",
+    "resend": "^6.9.2"
   },
   "devDependencies": {
     "jest": "^30.2.0",

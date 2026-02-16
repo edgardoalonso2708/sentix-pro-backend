@@ -11,8 +11,13 @@ class SilentTelegramBot {
     this.bot = null;
     this.subscribedChatIds = new Set();
 
-    // Solo inicializar si hay un token válido
-    if (token && token.length > 20 && !token.includes('YOUR_')) {
+    // Validate token format: must be like "123456789:ABCdef..."
+    const isValidToken = token &&
+      token.length > 20 &&
+      !token.includes('YOUR_') &&
+      /^\d+:[A-Za-z0-9_-]+$/.test(token);
+
+    if (isValidToken) {
       try {
         this.bot = new TelegramBot(token, {
           polling: {
@@ -24,20 +29,36 @@ class SilentTelegramBot {
           }
         });
 
-        // Suprimir errores de polling
-        this.bot.on('polling_error', () => {
-          // Silent - no spam
+        // Track polling errors but don't spam
+        let errorCount = 0;
+        this.bot.on('polling_error', (error) => {
+          errorCount++;
+          if (errorCount <= 3) {
+            console.warn(`⚠️ Telegram polling error #${errorCount}: ${error.message}`);
+          }
+          if (errorCount === 3) {
+            console.warn('⚠️ Telegram: suppressing further polling errors');
+          }
+          // If persistent auth errors, mark as disabled
+          if (error.response?.statusCode === 401) {
+            console.error('❌ Telegram Bot token is INVALID (401 Unauthorized). Bot disabled.');
+            this.enabled = false;
+          }
         });
 
         this.enabled = true;
-        console.log('✅ Telegram Bot initialized successfully');
+        console.log('✅ Telegram Bot initialized (token format valid)');
 
       } catch (error) {
         console.log('⚠️  Telegram Bot disabled (invalid token or network issue)');
         this.enabled = false;
       }
     } else {
-      console.log('ℹ️  Telegram Bot not configured (optional)');
+      if (token && token.length > 5) {
+        console.log('⚠️  Telegram Bot token format invalid (expected: 123456789:ABCdef...)');
+      } else {
+        console.log('ℹ️  Telegram Bot not configured (set TELEGRAM_BOT_TOKEN)');
+      }
     }
   }
 

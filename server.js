@@ -20,12 +20,13 @@ const {
   getPortfolio, 
   calculatePortfolioMetrics 
 } = require('./portfolioManager');
-const { 
-  validateEnvironment, 
-  createRateLimiter, 
-  sanitizeInput, 
-  isValidUserId 
+const {
+  validateEnvironment,
+  createRateLimiter,
+  sanitizeInput,
+  isValidUserId
 } = require('./security');
+const { Resend } = require('resend');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -38,8 +39,19 @@ app.use(express.json());
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const ALERT_EMAIL = process.env.ALERT_EMAIL || 'edgardoalonso2708@gmail.com';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// Initialize Resend email client (optional)
+let resend = null;
+if (RESEND_API_KEY && RESEND_API_KEY.startsWith('re_') && RESEND_API_KEY.length > 10) {
+  resend = new Resend(RESEND_API_KEY);
+  console.log('✅ Resend email client initialized');
+} else {
+  console.log('ℹ️  Email alerts not configured (set RESEND_API_KEY)');
+}
 
 // Initialize Telegram Bot (silent mode, optional)
 const bot = new SilentTelegramBot(TELEGRAM_BOT_TOKEN);
@@ -358,7 +370,95 @@ async function generateSignals() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ALERT SYSTEM
+// EMAIL ALERT SYSTEM (Resend)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Send an email alert via Resend
+ * @param {string} to - Recipient email address
+ * @param {string} subject - Email subject
+ * @param {string} htmlBody - HTML email body
+ * @returns {Object} { success, id?, error? }
+ */
+async function sendEmailAlert(to, subject, htmlBody) {
+  if (!resend) {
+    return { success: false, error: 'Email not configured (RESEND_API_KEY missing)' };
+  }
+
+  try {
+    const { data, error } = await resend.emails.send({
+      from: 'SENTIX PRO <onboarding@resend.dev>',
+      to: [to],
+      subject,
+      html: htmlBody
+    });
+
+    if (error) {
+      console.error('📧 Email send error:', error);
+      return { success: false, error: error.message || 'Email send failed' };
+    }
+
+    console.log(`📧 Email sent successfully to ${to} (id: ${data?.id})`);
+    return { success: true, id: data?.id };
+  } catch (error) {
+    console.error('📧 Email exception:', error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+/**
+ * Build HTML email for a trading signal alert
+ */
+function buildSignalEmailHTML(signal) {
+  const actionColor = signal.action === 'BUY' ? '#22c55e' : signal.action === 'SELL' ? '#ef4444' : '#6b7280';
+  const actionEmoji = signal.action === 'BUY' ? '🟢' : signal.action === 'SELL' ? '🔴' : '⚪';
+  const priceFormatted = Number(signal.price).toLocaleString('en-US', { style: 'currency', currency: 'USD' });
+  const timeFormatted = new Date().toLocaleString('es-ES', { timeZone: 'America/Mexico_City' });
+
+  return `
+    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 600px; margin: 0 auto; background: #0f172a; color: #e2e8f0; border-radius: 12px; overflow: hidden;">
+      <div style="background: linear-gradient(135deg, #1e293b, #334155); padding: 24px; text-align: center;">
+        <h1 style="margin: 0; font-size: 24px; color: #f8fafc;">📊 SENTIX PRO</h1>
+        <p style="margin: 4px 0 0; color: #94a3b8; font-size: 14px;">Alerta de Trading</p>
+      </div>
+      <div style="padding: 24px;">
+        <div style="background: #1e293b; border-radius: 8px; padding: 20px; margin-bottom: 16px; border-left: 4px solid ${actionColor};">
+          <h2 style="margin: 0 0 8px; font-size: 28px; color: ${actionColor};">
+            ${actionEmoji} ${signal.action}
+          </h2>
+          <p style="margin: 0; font-size: 20px; color: #f8fafc; font-weight: bold;">${signal.asset}</p>
+          <p style="margin: 8px 0 0; font-size: 18px; color: #94a3b8;">${priceFormatted}</p>
+        </div>
+        <table style="width: 100%; border-collapse: collapse; margin-bottom: 16px;">
+          <tr>
+            <td style="padding: 8px 0; color: #94a3b8; border-bottom: 1px solid #334155;">Score</td>
+            <td style="padding: 8px 0; text-align: right; color: #f8fafc; font-weight: bold; border-bottom: 1px solid #334155;">${signal.score}/100</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px 0; color: #94a3b8; border-bottom: 1px solid #334155;">Confianza</td>
+            <td style="padding: 8px 0; text-align: right; color: #f8fafc; font-weight: bold; border-bottom: 1px solid #334155;">${signal.confidence}%</td>
+          </tr>
+          <tr>
+            <td style="padding: 8px 0; color: #94a3b8;">Cambio 24h</td>
+            <td style="padding: 8px 0; text-align: right; color: ${signal.change24h >= 0 ? '#22c55e' : '#ef4444'}; font-weight: bold;">
+              ${signal.change24h >= 0 ? '+' : ''}${Number(signal.change24h).toFixed(2)}%
+            </td>
+          </tr>
+        </table>
+        <div style="background: #1e293b; border-radius: 8px; padding: 16px;">
+          <p style="margin: 0 0 8px; color: #94a3b8; font-size: 12px; text-transform: uppercase;">Análisis</p>
+          <p style="margin: 0; color: #e2e8f0; font-size: 14px; line-height: 1.5;">${signal.reasons}</p>
+        </div>
+      </div>
+      <div style="padding: 16px 24px; background: #1e293b; text-align: center; border-top: 1px solid #334155;">
+        <p style="margin: 0; color: #64748b; font-size: 12px;">${timeFormatted} · SENTIX PRO v2.1</p>
+      </div>
+    </div>
+  `;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALERT PROCESSING SYSTEM
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Track recently sent alerts to avoid duplicate delivery
@@ -370,7 +470,8 @@ async function processAlerts() {
 
     const signals = await generateSignals();
     let savedCount = 0;
-    let sentCount = 0;
+    let telegramCount = 0;
+    let emailCount = 0;
 
     for (const signal of signals) {
       if (signal.confidence >= 70) {
@@ -400,9 +501,19 @@ async function processAlerts() {
         if (bot.isActive() && (signal.action === 'BUY' || signal.action === 'SELL')) {
           const result = await bot.broadcastAlert(signal);
           if (result.sent > 0) {
-            sentCount += result.sent;
+            telegramCount += result.sent;
             console.log(`📱 Telegram alert sent for ${signal.asset} ${signal.action} to ${result.sent}/${result.total} subscribers`);
           }
+        }
+
+        // Send via email for high-confidence BUY/SELL signals
+        if (resend && (signal.action === 'BUY' || signal.action === 'SELL')) {
+          const emailResult = await sendEmailAlert(
+            ALERT_EMAIL,
+            `${signal.action === 'BUY' ? '🟢' : '🔴'} SENTIX PRO: ${signal.action} ${signal.asset} (${signal.confidence}%)`,
+            buildSignalEmailHTML(signal)
+          );
+          if (emailResult.success) emailCount++;
         }
 
         // Mark as recently sent (clear after 30 minutes)
@@ -411,7 +522,7 @@ async function processAlerts() {
       }
     }
 
-    console.log(`✅ Processed ${signals.length} signals, saved ${savedCount} alerts, sent ${sentCount} Telegram notifications`);
+    console.log(`✅ Processed ${signals.length} signals: saved=${savedCount}, telegram=${telegramCount}, email=${emailCount}`);
   } catch (error) {
     console.error('Error processing alerts:', error.message);
   }
@@ -426,7 +537,12 @@ app.get('/', (req, res) => {
     status: 'SENTIX PRO Backend Online',
     version: '2.1.0',
     lastUpdate: cachedMarketData?.lastUpdate || null,
-    signalsCount: cachedSignals.length
+    signalsCount: cachedSignals.length,
+    services: {
+      telegram: bot.isActive() ? `active (${bot.getSubscribers().length} subscribers)` : 'not configured',
+      email: resend ? 'active' : 'not configured',
+      database: SUPABASE_URL ? 'connected' : 'not configured'
+    }
   });
 });
 
@@ -464,31 +580,55 @@ app.post('/api/send-alert', async (req, res) => {
     return res.status(400).json({ error: 'Email and message required' });
   }
 
-  const results = { email: false, telegram: false };
+  const results = { email: null, telegram: null };
+
+  // Send test alert via Email
+  const emailResult = await sendEmailAlert(
+    email,
+    '🧪 SENTIX PRO - Test Alert',
+    `
+    <div style="font-family: -apple-system, sans-serif; max-width: 600px; margin: 0 auto; background: #0f172a; color: #e2e8f0; border-radius: 12px; overflow: hidden;">
+      <div style="background: linear-gradient(135deg, #1e293b, #334155); padding: 24px; text-align: center;">
+        <h1 style="margin: 0; font-size: 24px; color: #f8fafc;">🧪 Test Alert</h1>
+        <p style="margin: 4px 0 0; color: #94a3b8; font-size: 14px;">SENTIX PRO</p>
+      </div>
+      <div style="padding: 24px;">
+        <p style="color: #e2e8f0; font-size: 16px; line-height: 1.6;">${message}</p>
+        <p style="color: #64748b; font-size: 13px; margin-top: 16px;">Si recibes este email, tus alertas están configuradas correctamente. Recibirás notificaciones automáticas cuando se detecten señales BUY/SELL con alta confianza.</p>
+      </div>
+      <div style="padding: 16px 24px; background: #1e293b; text-align: center;">
+        <p style="margin: 0; color: #64748b; font-size: 12px;">SENTIX PRO v2.1 · ${new Date().toLocaleString('es-ES')}</p>
+      </div>
+    </div>
+    `
+  );
+  results.email = emailResult.success ? 'sent' : emailResult.error;
 
   // Send test alert via Telegram to all subscribers
   if (bot.isActive()) {
     const subscribers = bot.getSubscribers();
-    for (const chatId of subscribers) {
-      const result = await bot.sendMessage(
-        chatId,
-        `🧪 *Test Alert*\n\n${message}\n\n📧 Configurado para: ${email}`,
-        { parse_mode: 'Markdown' }
-      );
-      if (result.success) results.telegram = true;
+    if (subscribers.length > 0) {
+      for (const chatId of subscribers) {
+        const result = await bot.sendMessage(
+          chatId,
+          `🧪 *Test Alert*\n\n${message}\n\n📧 Email: ${email}`,
+          { parse_mode: 'Markdown' }
+        );
+        if (result.success) results.telegram = 'sent';
+      }
+    } else {
+      results.telegram = 'no subscribers - send /start to the bot first';
     }
+  } else {
+    results.telegram = 'bot not configured (set TELEGRAM_BOT_TOKEN)';
   }
 
-  // Log for monitoring
-  console.log(`📧 Test alert requested by ${email}: Telegram=${results.telegram}`);
+  console.log(`📧 Test alert: email=${results.email}, telegram=${results.telegram}`);
 
   res.json({
     success: true,
     message: 'Test alert processed',
-    delivery: {
-      telegram: results.telegram ? 'sent' : (bot.isActive() ? 'no subscribers - send /start to the bot first' : 'bot not configured'),
-      email: 'not configured (use Telegram for alerts)'
-    }
+    delivery: results
   });
 });
 
