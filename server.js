@@ -10,6 +10,8 @@ const cron = require('node-cron');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 const TelegramBot = require('node-telegram-bot-api');
+const { calculateRSI, calculateMACD } = require('./lib/indicators');
+const { computeSignalFromData, generateMockHistory, filterCriticalSignals } = require('./lib/signals');
 
 const app = express();  // ← ESTA LÍNEA ES CRÍTICA
 const PORT = process.env.PORT || 3001;
@@ -254,50 +256,8 @@ async function updateMarketData() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// TECHNICAL INDICATORS CALCULATION
+// TECHNICAL INDICATORS - imported from lib/indicators.js
 // ═══════════════════════════════════════════════════════════════════════════════
-
-function calculateRSI(prices, period = 14) {
-  if (prices.length < period + 1) return 50;
-  
-  let gains = 0;
-  let losses = 0;
-  
-  for (let i = prices.length - period; i < prices.length; i++) {
-    const diff = prices[i] - prices[i - 1];
-    if (diff > 0) gains += diff;
-    else losses += Math.abs(diff);
-  }
-  
-  const avgGain = gains / period;
-  const avgLoss = losses / period;
-  
-  if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return 100 - (100 / (1 + rs));
-}
-
-function calculateMACD(prices) {
-  const calcEMA = (data, period) => {
-    const k = 2 / (period + 1);
-    let ema = data[0];
-    for (let i = 1; i < data.length; i++) {
-      ema = data[i] * k + ema * (1 - k);
-    }
-    return ema;
-  };
-
-  const ema12 = calcEMA(prices, 12);
-  const ema26 = calcEMA(prices, 26);
-  const macd = ema12 - ema26;
-  const signal = calcEMA([...prices.slice(-9), macd], 9);
-  
-  return {
-    macd,
-    signal,
-    histogram: macd - signal,
-  };
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SIGNAL GENERATION ENGINE
@@ -305,93 +265,17 @@ function calculateMACD(prices) {
 
 async function generateSignals() {
   const signals = [];
-  
-  // Para cada crypto, generar señal
-  for (const [coinId, data] of Object.entries(marketCache.crypto)) {
-    // Simular datos históricos (en producción, esto viene de la DB)
-    const historicalPrices = generateMockHistory(data.price, 30);
-    
-    const rsi = calculateRSI(historicalPrices);
-    const macd = calculateMACD(historicalPrices);
-    
-    let score = 50;
-    let confidence = 0;
-    const signalReasons = [];
-    
-    // RSI Analysis
-    if (rsi < 30) {
-      score += 15;
-      confidence += 20;
-      signalReasons.push('RSI oversold');
-    } else if (rsi > 70) {
-      score -= 15;
-      confidence += 20;
-      signalReasons.push('RSI overbought');
-    }
-    
-    // MACD Analysis
-    if (macd.histogram > 0) {
-      score += 12;
-      confidence += 15;
-      signalReasons.push('MACD bullish');
-    } else {
-      score -= 12;
-      confidence += 15;
-      signalReasons.push('MACD bearish');
-    }
-    
-    // 24h change
-    if (data.change24h > 5) {
-      score += 8;
-      confidence += 10;
-      signalReasons.push('Strong 24h momentum');
-    } else if (data.change24h < -5) {
-      score -= 8;
-      confidence += 10;
-      signalReasons.push('Weak 24h momentum');
-    }
-    
-    // Fear & Greed bonus
-    if (marketCache.macro.fearGreed < 25 && score > 50) {
-      score += 5;
-      confidence += 8;
-      signalReasons.push('Extreme fear = opportunity');
-    }
-    
-    score = Math.max(0, Math.min(100, score));
-    confidence = Math.min(100, confidence);
-    
-    const action = score >= 65 ? 'BUY' : score >= 45 ? 'HOLD' : 'SELL';
-    
-    if (confidence >= 70) {
-      signals.push({
-        asset: coinId.toUpperCase(),
-        action,
-        score,
-        confidence,
-        price: data.price,
-        change24h: data.change24h,
-        reasons: signalReasons.join(' · '),
-        timestamp: Date.now(),
-      });
-    }
-  }
-  
-  return signals.sort((a, b) => b.confidence - a.confidence);
-}
 
-function generateMockHistory(currentPrice, days) {
-  const prices = [];
-  let price = currentPrice * 0.9;
-  
-  for (let i = 0; i < days; i++) {
-    const change = (Math.random() - 0.48) * 0.03;
-    price = price * (1 + change);
-    prices.push(price);
+  for (const [coinId, data] of Object.entries(marketCache.crypto)) {
+    const historicalPrices = generateMockHistory(data.price, 30);
+    const signal = computeSignalFromData(coinId, data, marketCache.macro || {}, historicalPrices);
+
+    if (signal.confidence >= 70) {
+      signals.push(signal);
+    }
   }
-  
-  prices.push(currentPrice);
-  return prices;
+
+  return signals.sort((a, b) => b.confidence - a.confidence);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -453,10 +337,7 @@ async function processAlerts() {
   console.log('🔔 Processing alerts...');
   
   const signals = await generateSignals();
-  const criticalSignals = signals.filter(s => 
-    (s.action === 'BUY' && s.confidence >= 75 && s.score >= 70) ||
-    (s.action === 'SELL' && s.confidence >= 75 && s.score <= 30)
-  );
+  const criticalSignals = filterCriticalSignals(signals);
   
   if (criticalSignals.length === 0) {
     console.log('No critical signals detected');
@@ -701,22 +582,25 @@ cron.schedule('*/5 * * * *', async () => {
 // SERVER START
 // ═══════════════════════════════════════════════════════════════════════════════
 
-app.listen(PORT, async () => {
-  console.log(`
+// Only start the server when run directly (not when required by tests)
+if (require.main === module) {
+  app.listen(PORT, async () => {
+    console.log(`
 ╔═══════════════════════════════════════════════════════════════════╗
 ║                    🚀 ORACLE PRO BACKEND                          ║
 ║                      Server Started                               ║
 ╠═══════════════════════════════════════════════════════════════════╣
-║  Port: ${PORT}                                                      
-║  Environment: ${process.env.NODE_ENV || 'development'}             
-║  Telegram Bot: ${TELEGRAM_BOT_TOKEN ? 'Active ✅' : 'Inactive ❌'}  
-║  Database: ${SUPABASE_URL ? 'Connected ✅' : 'Not configured ❌'}   
+║  Port: ${PORT}
+║  Environment: ${process.env.NODE_ENV || 'development'}
+║  Telegram Bot: ${TELEGRAM_BOT_TOKEN ? 'Active ✅' : 'Inactive ❌'}
+║  Database: ${SUPABASE_URL ? 'Connected ✅' : 'Not configured ❌'}
 ╚═══════════════════════════════════════════════════════════════════╝
-  `);
-  
-  // Initial data load
-  await updateMarketData();
-  console.log('✅ Initial market data loaded');
-});
+    `);
+
+    // Initial data load
+    await updateMarketData();
+    console.log('✅ Initial market data loaded');
+  });
+}
 
 module.exports = app;
