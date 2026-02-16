@@ -7,10 +7,17 @@ const multer = require('multer');
 const csv = require('csv-parser');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+
+// Cross-platform upload directory
+const uploadDir = path.join(os.tmpdir(), 'sentix-uploads');
+if (!fs.existsSync(uploadDir)) {
+  fs.mkdirSync(uploadDir, { recursive: true });
+}
 
 // Configure multer for file uploads
 const upload = multer({
-  dest: '/tmp/uploads/',
+  dest: uploadDir,
   limits: {
     fileSize: 5 * 1024 * 1024, // 5MB max
   },
