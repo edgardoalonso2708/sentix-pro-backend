@@ -9,7 +9,9 @@ const cors = require('cors');
 const cron = require('node-cron');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
-const TelegramBot = require('node-telegram-bot-api');
+const { SilentTelegramBot, setupTelegramCommands } = require('./telegramBot');
+const { fetchMetalsPricesSafe } = require('./metalsAPI');
+const { generateSignalWithRealData } = require('./technicalAnalysis');
 const app = express();  // ← ESTA LÍNEA ES CRÍTICA
 const PORT = process.env.PORT || 3001;
 const { generateSignalWithRealData } = require('./technicalAnalysis');
@@ -51,7 +53,8 @@ const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || 'YOUR_ANTHROPIC_API_K
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 // ─── TELEGRAM BOT INIT ─────────────────────────────────────────────────────────
-const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
+//const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { polling: true });
+const bot = new SilentTelegramBot(TELEGRAM_BOT_TOKEN);
 let subscribedUsers = new Set(); // En producción, esto va a Supabase
 
 // ─── MARKET DATA CACHE ─────────────────────────────────────────────────────────
@@ -136,52 +139,10 @@ async function fetchCryptoDetails() {
 /**
  * Fetch Gold & Silver prices from Alpha Vantage (GRATIS - 500 calls/day)
  */
+//async function fetchMetalsPrices() {
+
 async function fetchMetalsPrices() {
-  try {
-    // Alpha Vantage free API key (get yours at alphavantage.co)
-    const apiKey = process.env.ALPHA_VANTAGE_KEY || 'demo';
-
-    // Gold
-    const goldResponse = await axios.get('https://www.alphavantage.co/query', {
-      params: {
-        function: 'CURRENCY_EXCHANGE_RATE',
-        from_currency: 'XAU',
-        to_currency: 'USD',
-        apikey: apiKey,
-      }
-    });
-
-    // Silver
-    const silverResponse = await axios.get('https://www.alphavantage.co/query', {
-      params: {
-        function: 'CURRENCY_EXCHANGE_RATE',
-        from_currency: 'XAG',
-        to_currency: 'USD',
-        apikey: apiKey,
-      }
-    });
-
-    const gold = goldResponse.data['Realtime Currency Exchange Rate'];
-    const silver = silverResponse.data['Realtime Currency Exchange Rate'];
-
-    return {
-      gold: {
-        price: parseFloat(gold['5. Exchange Rate']) || 2089,
-        timestamp: Date.now(),
-      },
-      silver: {
-        price: parseFloat(silver['5. Exchange Rate']) || 24.18,
-        timestamp: Date.now(),
-      }
-    };
-  } catch (error) {
-    console.error('Error fetching metals prices:', error.message);
-    // Fallback to manual prices if API fails
-    return {
-      gold: { price: 2089, timestamp: Date.now() },
-      silver: { price: 24.18, timestamp: Date.now() }
-    };
-  }
+return await fetchMetalsPricesSafe();
 }
 
 /**
@@ -369,15 +330,9 @@ async function sendEmailAlert(to, subject, body) {
 /**
  * Send Telegram Alert (100% GRATIS, ilimitado)
  */
-async function sendTelegramAlert(message) {
-  try {
-    for (const chatId of subscribedUsers) {
-      await bot.sendMessage(chatId, message, { parse_mode: 'HTML' });
-    }
-    console.log(`✅ Telegram alerts sent to ${subscribedUsers.size} users`);
-  } catch (error) {
-    console.error('❌ Error sending Telegram alert:', error.message);
-  }
+
+async function sendTelegramAlert(chatId, message) {
+  return await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
 }
 
 /**
@@ -442,92 +397,11 @@ ${signal.action === 'BUY' ? '🟢 COMPRA RECOMENDADA' : '🔴 VENTA RECOMENDADA'
 // TELEGRAM BOT COMMANDS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-bot.onText(/\/start/, (msg) => {
-  const chatId = msg.chat.id;
-  subscribedUsers.add(chatId);
-  
-  bot.sendMessage(chatId, `
-🤖 <b>Bienvenido a ORACLE Trading Bot!</b>
-
-Comandos disponibles:
-/precio [ASSET] - Ver precio actual
-/señales - Ver señales activas
-/mercado - Resumen del mercado
-/alertas - Suscribirte a alertas
-/stop - Desuscribirse
-
-Ejemplo: /precio BTC
-  `, { parse_mode: 'HTML' });
-});
-
-bot.onText(/\/precio (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const asset = match[1].toLowerCase();
-  
-  const data = marketCache.crypto[asset];
-  if (!data) {
-    bot.sendMessage(chatId, '❌ Asset no encontrado. Intenta con: BTC, ETH, SOL, etc.');
-    return;
-  }
-  
-  const message = `
-💰 <b>${asset.toUpperCase()}</b>
-
-Precio: $${data.price.toLocaleString()}
-24h: ${data.change24h >= 0 ? '+' : ''}${data.change24h.toFixed(2)}%
-Volumen: $${(data.volume24h / 1e9).toFixed(2)}B
-MCap: $${(data.marketCap / 1e9).toFixed(2)}B
-
-Actualizado: ${new Date().toLocaleTimeString()}
-  `.trim();
-  
-  bot.sendMessage(chatId, message, { parse_mode: 'HTML' });
-});
-
-bot.onText(/\/señales/, async (msg) => {
-  const chatId = msg.chat.id;
-  const signals = await generateSignals();
-  
-  if (signals.length === 0) {
-    bot.sendMessage(chatId, 'No hay señales de alta confianza en este momento.');
-    return;
-  }
-  
-  let message = '🎯 <b>SEÑALES ACTIVAS</b>\n\n';
-  signals.slice(0, 5).forEach(s => {
-    message += `${s.action === 'BUY' ? '🟢' : '🔴'} <b>${s.asset}</b> - ${s.action}\n`;
-    message += `Score: ${s.score}/100 | Conf: ${s.confidence}%\n`;
-    message += `${s.reasons}\n\n`;
-  });
-  
-  bot.sendMessage(chatId, message, { parse_mode: 'HTML' });
-});
-
-bot.onText(/\/mercado/, async (msg) => {
-  const chatId = msg.chat.id;
-  const macro = marketCache.macro;
-  
-  const message = `
-📊 <b>RESUMEN DE MERCADO</b>
-
-Fear & Greed: ${macro.fearGreed}/100 (${macro.fearLabel})
-BTC Dominancia: ${macro.btcDom}%
-Market Cap Total: $${(macro.globalMcap / 1e12).toFixed(2)}T
-
-Oro: $${marketCache.metals.gold?.price || 'N/A'}
-Plata: $${marketCache.metals.silver?.price || 'N/A'}
-
-Actualizado: ${new Date(macro.lastUpdate).toLocaleTimeString()}
-  `.trim();
-  
-  bot.sendMessage(chatId, message, { parse_mode: 'HTML' });
-});
-
-bot.onText(/\/stop/, (msg) => {
-  const chatId = msg.chat.id;
-  subscribedUsers.delete(chatId);
-  bot.sendMessage(chatId, '✅ Te has desuscrito de las alertas.');
-});
+// Setup Telegram commands if bot is active
+if (bot.isActive()) {
+  setupTelegramCommands(bot, () => cachedMarketData);
+  console.log('✅ Telegram commands registered');
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // API ROUTES
