@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// SENTIX PRO - BACKEND SERVER (PRODUCTION READY)
-// Análisis técnico profesional + Metales + Telegram opcional
+// SENTIX PRO - BACKEND SERVER V2.0
+// Portfolio Batch Upload + Security + Technical Analysis Profesional
 // ═══════════════════════════════════════════════════════════════════════════════
 
 require('dotenv').config();
@@ -13,6 +13,19 @@ const { createClient } = require('@supabase/supabase-js');
 const { SilentTelegramBot, setupTelegramCommands } = require('./telegramBot');
 const { fetchMetalsPricesSafe } = require('./metalsAPI');
 const { generateSignalWithRealData } = require('./technicalAnalysis');
+const { 
+  upload, 
+  parsePortfolioCSV, 
+  savePortfolio, 
+  getPortfolio, 
+  calculatePortfolioMetrics 
+} = require('./portfolioManager');
+const { 
+  validateEnvironment, 
+  createRateLimiter, 
+  sanitizeInput, 
+  isValidUserId 
+} = require('./security');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -226,7 +239,7 @@ async function processAlerts() {
 app.get('/', (req, res) => {
   res.json({
     status: 'SENTIX PRO Backend Online',
-    version: '1.0.0',
+    version: '2.0.0',
     lastUpdate: cachedMarketData?.lastUpdate || null,
     signalsCount: cachedSignals.length
   });
@@ -271,6 +284,113 @@ app.post('/api/send-alert', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// PORTFOLIO ROUTES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+app.get('/api/portfolio/template', (req, res) => {
+  const csvContent = `Asset,Amount,Buy Price,Purchase Date,Notes
+bitcoin,0.5,42000,2024-01-15,Initial purchase
+ethereum,5.0,2500,2024-01-20,DCA entry
+solana,100,85,2024-02-01,Swing trade
+cardano,5000,0.45,2024-02-10,Long term hold`;
+  
+  res.setHeader('Content-Type', 'text/csv');
+  res.setHeader('Content-Disposition', 'attachment; filename=portfolio-template.csv');
+  res.send(csvContent);
+});
+
+app.post('/api/portfolio/upload', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file uploaded' });
+    }
+    
+    const userId = sanitizeInput(req.body.userId || 'default-user');
+    
+    if (!isValidUserId(userId)) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+    
+    const positions = await parsePortfolioCSV(req.file.path);
+    const result = await savePortfolio(supabase, userId, positions);
+    
+    res.json({
+      success: true,
+      message: `Successfully uploaded ${result.count} positions`,
+      positions: positions.length
+    });
+    
+  } catch (error) {
+    console.error('Portfolio upload error:', error);
+    
+    if (error.type === 'validation') {
+      return res.status(400).json({
+        error: 'Validation failed',
+        details: error.errors
+      });
+    }
+    
+    res.status(500).json({ 
+      error: 'Failed to upload portfolio',
+      message: error.message 
+    });
+  }
+});
+
+app.get('/api/portfolio/:userId', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    
+    if (!isValidUserId(userId)) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+    
+    const positions = await getPortfolio(supabase, userId);
+    const metrics = calculatePortfolioMetrics(positions, cachedMarketData);
+    
+    res.json({
+      userId,
+      positions: metrics.positions,
+      summary: {
+        totalValue: metrics.totalValue,
+        totalInvested: metrics.totalInvested,
+        totalPnL: metrics.totalPnL,
+        totalPnLPercent: metrics.totalPnLPercent
+      }
+    });
+    
+  } catch (error) {
+    console.error('Portfolio fetch error:', error);
+    res.status(500).json({ error: 'Failed to fetch portfolio' });
+  }
+});
+
+app.delete('/api/portfolio/:userId/:positionId', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    const positionId = parseInt(req.params.positionId);
+    
+    if (!isValidUserId(userId)) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+    
+    const { error } = await supabase
+      .from('portfolios')
+      .delete()
+      .eq('id', positionId)
+      .eq('user_id', userId);
+    
+    if (error) throw error;
+    
+    res.json({ success: true, message: 'Position deleted' });
+    
+  } catch (error) {
+    console.error('Portfolio delete error:', error);
+    res.status(500).json({ error: 'Failed to delete position' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // TELEGRAM BOT SETUP
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -295,9 +415,15 @@ cron.schedule('*/5 * * * *', async () => {
 // SERVER STARTUP
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Validate environment on startup
+validateEnvironment();
+
+// Apply rate limiting to API routes
+app.use('/api/', createRateLimiter(60000, 100));
+
 app.listen(PORT, async () => {
   console.log('\n╔═══════════════════════════════════════════════════════════════════╗');
-  console.log('║                    🚀 SENTIX PRO BACKEND                          ║');
+  console.log('║                    🚀 SENTIX PRO BACKEND V2.0                     ║');
   console.log('║                      Server Started                               ║');
   console.log('╠═══════════════════════════════════════════════════════════════════╣');
   console.log(`║  Port: ${PORT}                                                     ║`);
