@@ -225,7 +225,6 @@ async function updateMarketData() {
 // ═══════════════════════════════════════════════════════════════════════════════
 async function generateSignals() {
   const signals = [];
-<<<<<<< HEAD
   
   if (!cachedMarketData || !cachedMarketData.crypto) return signals;
   
@@ -249,7 +248,6 @@ async function generateSignals() {
   return signals.sort((a, b) => b.confidence - a.confidence);
 }
 
-=======
 
   for (const [coinId, data] of Object.entries(marketCache.crypto)) {
     const historicalPrices = generateMockHistory(data.price, 30);
@@ -263,7 +261,6 @@ async function generateSignals() {
   return signals.sort((a, b) => b.confidence - a.confidence);
 }
 
->>>>>>> 43f045df7fef8c243ff200d1d68dfa58567d8ba4
 // ═══════════════════════════════════════════════════════════════════════════════
 // ALERT SYSTEM
 // ═══════════════════════════════════════════════════════════════════════════════
