@@ -10,11 +10,17 @@ jest.mock('@supabase/supabase-js', () => ({
           limit: jest.fn(() => Promise.resolve({ data: [], error: null })),
         })),
         eq: jest.fn(() => ({
+          order: jest.fn(() => Promise.resolve({ data: [], error: null })),
           single: jest.fn(() => Promise.resolve({ data: { user_id: 'test', portfolio: [] }, error: null })),
         })),
       })),
-      insert: jest.fn(() => Promise.resolve({ data: null, error: null })),
+      insert: jest.fn(() => ({
+        select: jest.fn(() => Promise.resolve({ data: [], error: null })),
+      })),
       upsert: jest.fn(() => Promise.resolve({ data: null, error: null })),
+      delete: jest.fn(() => ({
+        eq: jest.fn(() => Promise.resolve({ data: null, error: null })),
+      })),
     })),
   })),
 }));
@@ -23,6 +29,8 @@ jest.mock('node-telegram-bot-api', () => {
   return jest.fn().mockImplementation(() => ({
     onText: jest.fn(),
     sendMessage: jest.fn().mockResolvedValue(true),
+    on: jest.fn(),
+    stopPolling: jest.fn(),
   }));
 });
 
@@ -57,8 +65,8 @@ describe('GET /', () => {
   test('returns status and version', async () => {
     const res = await request(app).get('/');
     expect(res.status).toBe(200);
-    expect(res.body).toHaveProperty('status', 'ORACLE Backend Online');
-    expect(res.body).toHaveProperty('version', '1.0.0');
+    expect(res.body).toHaveProperty('status', 'SENTIX PRO Backend Online');
+    expect(res.body).toHaveProperty('version', '2.0.0');
     expect(res.body).toHaveProperty('lastUpdate');
   });
 });
@@ -68,12 +76,10 @@ describe('GET /', () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe('GET /api/market', () => {
-  test('returns market cache object', async () => {
+  test('returns 503 when cache is empty', async () => {
     const res = await request(app).get('/api/market');
-    expect(res.status).toBe(200);
-    expect(res.body).toHaveProperty('crypto');
-    expect(res.body).toHaveProperty('metals');
-    expect(res.body).toHaveProperty('lastUpdate');
+    expect(res.status).toBe(503);
+    expect(res.body).toHaveProperty('error');
   });
 });
 
@@ -102,38 +108,54 @@ describe('GET /api/alerts', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Portfolio Routes
-// ═══════════════════════════════════════════════════════════════════════════════
-
-describe('POST /api/portfolio', () => {
-  test('saves portfolio and returns success', async () => {
-    const res = await request(app)
-      .post('/api/portfolio')
-      .send({ user_id: 'test-user', portfolio: [{ asset: 'bitcoin', amount: 1 }] });
-    expect(res.status).toBe(200);
-    expect(res.body).toHaveProperty('success', true);
-  });
-});
-
-describe('GET /api/portfolio/:userId', () => {
-  test('returns portfolio for user', async () => {
-    const res = await request(app).get('/api/portfolio/test-user');
-    expect(res.status).toBe(200);
-    expect(res.body).toHaveProperty('user_id');
-  });
-});
-
-// ═══════════════════════════════════════════════════════════════════════════════
 // Send Alert Route
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe('POST /api/send-alert', () => {
   test('sends alert and returns success', async () => {
-    axios.post.mockResolvedValueOnce({ data: {} });
     const res = await request(app)
       .post('/api/send-alert')
       .send({ email: 'test@example.com', message: 'Test alert' });
     expect(res.status).toBe(200);
     expect(res.body).toHaveProperty('success', true);
+  });
+
+  test('returns 400 when email missing', async () => {
+    const res = await request(app)
+      .post('/api/send-alert')
+      .send({ message: 'Test alert' });
+    expect(res.status).toBe(400);
+  });
+
+  test('returns 400 when message missing', async () => {
+    const res = await request(app)
+      .post('/api/send-alert')
+      .send({ email: 'test@example.com' });
+    expect(res.status).toBe(400);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Portfolio Routes
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('GET /api/portfolio/:userId', () => {
+  test('returns portfolio for valid user', async () => {
+    const res = await request(app).get('/api/portfolio/default-user');
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty('userId');
+  });
+
+  test('returns 400 for invalid user ID', async () => {
+    const res = await request(app).get('/api/portfolio/a');
+    expect(res.status).toBe(400);
+  });
+});
+
+describe('GET /api/portfolio/template', () => {
+  test('returns CSV template', async () => {
+    const res = await request(app).get('/api/portfolio/template');
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toContain('text/csv');
   });
 });

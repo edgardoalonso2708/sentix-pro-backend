@@ -177,11 +177,12 @@ function sanitizeInput(input) {
  * Validate user ID format
  */
 function isValidUserId(userId) {
-  // UUID v4 format or email
+  // UUID v4 format, email, or safe alphanumeric identifier (e.g. "default-user")
   const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
   const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  
-  return uuidPattern.test(userId) || emailPattern.test(userId);
+  const safeIdPattern = /^[a-zA-Z0-9][a-zA-Z0-9_-]{2,63}$/;
+
+  return uuidPattern.test(userId) || emailPattern.test(userId) || safeIdPattern.test(userId);
 }
 
 module.exports = {

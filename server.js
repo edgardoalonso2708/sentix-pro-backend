@@ -174,26 +174,38 @@ async function updateMarketData() {
 
 async function generateSignals() {
   const signals = [];
-  
+
   if (!cachedMarketData || !cachedMarketData.crypto) return signals;
-  
+
   const fearGreed = cachedMarketData.macro?.fearGreed || 50;
-  
-  for (const [assetId, data] of Object.entries(cachedMarketData.crypto)) {
-    const signal = await generateSignalWithRealData(
-      assetId,
-      data.price,
-      data.change24h,
-      data.volume24h,
-      fearGreed
-    );
-    
-    if (signal.confidence >= 60 && (signal.action === 'BUY' || signal.action === 'SELL')) {
-      signals.push(signal);
+  const assets = Object.entries(cachedMarketData.crypto);
+
+  for (const [assetId, data] of assets) {
+    try {
+      const signal = await generateSignalWithRealData(
+        assetId,
+        data.price,
+        data.change24h,
+        data.volume24h,
+        fearGreed
+      );
+
+      // Include BUY/SELL with confidence >= 55, HOLD with confidence >= 70
+      if (signal.confidence >= 55 && (signal.action === 'BUY' || signal.action === 'SELL')) {
+        signals.push(signal);
+      } else if (signal.confidence >= 70 && signal.action === 'HOLD') {
+        signals.push(signal);
+      }
+
+      // Small delay between API calls to respect CoinGecko rate limits
+      await new Promise(resolve => setTimeout(resolve, 1200));
+    } catch (error) {
+      console.error(`Signal generation failed for ${assetId}:`, error.message);
     }
   }
-  
+
   cachedSignals = signals.sort((a, b) => b.confidence - a.confidence);
+  console.log(`📊 Generated ${cachedSignals.length} actionable signals from ${assets.length} assets`);
   return cachedSignals;
 }
 
@@ -201,14 +213,24 @@ async function generateSignals() {
 // ALERT SYSTEM
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Track recently sent alerts to avoid duplicate delivery
+const recentAlertKeys = new Set();
+
 async function processAlerts() {
   try {
     console.log('🔔 Processing alerts...');
-    
+
     const signals = await generateSignals();
-    
+    let savedCount = 0;
+    let sentCount = 0;
+
     for (const signal of signals) {
-      if (signal.confidence >= 75) {
+      if (signal.confidence >= 70) {
+        // Deduplicate: only alert once per asset+action per cycle
+        const alertKey = `${signal.asset}-${signal.action}`;
+        if (recentAlertKeys.has(alertKey)) continue;
+
+        // Save to database
         const { error } = await supabase
           .from('alerts')
           .insert({
@@ -222,11 +244,26 @@ async function processAlerts() {
 
         if (error) {
           console.error('Error saving alert:', error.message);
+        } else {
+          savedCount++;
         }
+
+        // Send via Telegram to all subscribers
+        if (bot.isActive() && (signal.action === 'BUY' || signal.action === 'SELL')) {
+          const result = await bot.broadcastAlert(signal);
+          if (result.sent > 0) {
+            sentCount += result.sent;
+            console.log(`📱 Telegram alert sent for ${signal.asset} ${signal.action} to ${result.sent}/${result.total} subscribers`);
+          }
+        }
+
+        // Mark as recently sent (clear after 30 minutes)
+        recentAlertKeys.add(alertKey);
+        setTimeout(() => recentAlertKeys.delete(alertKey), 30 * 60 * 1000);
       }
     }
-    
-    console.log(`✅ Processed ${signals.length} signals`);
+
+    console.log(`✅ Processed ${signals.length} signals, saved ${savedCount} alerts, sent ${sentCount} Telegram notifications`);
   } catch (error) {
     console.error('Error processing alerts:', error.message);
   }
@@ -274,13 +311,37 @@ app.get('/api/alerts', async (req, res) => {
 
 app.post('/api/send-alert', async (req, res) => {
   const { email, message } = req.body;
-  
+
   if (!email || !message) {
     return res.status(400).json({ error: 'Email and message required' });
   }
 
-  console.log(`📧 Alert would be sent to ${email}: ${message}`);
-  res.json({ success: true, message: 'Alert sent' });
+  const results = { email: false, telegram: false };
+
+  // Send test alert via Telegram to all subscribers
+  if (bot.isActive()) {
+    const subscribers = bot.getSubscribers();
+    for (const chatId of subscribers) {
+      const result = await bot.sendMessage(
+        chatId,
+        `🧪 *Test Alert*\n\n${message}\n\n📧 Configurado para: ${email}`,
+        { parse_mode: 'Markdown' }
+      );
+      if (result.success) results.telegram = true;
+    }
+  }
+
+  // Log for monitoring
+  console.log(`📧 Test alert requested by ${email}: Telegram=${results.telegram}`);
+
+  res.json({
+    success: true,
+    message: 'Test alert processed',
+    delivery: {
+      telegram: results.telegram ? 'sent' : (bot.isActive() ? 'no subscribers - send /start to the bot first' : 'bot not configured'),
+      email: 'not configured (use Telegram for alerts)'
+    }
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -395,7 +456,7 @@ app.delete('/api/portfolio/:userId/:positionId', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 if (bot.isActive()) {
-  setupTelegramCommands(bot, () => cachedMarketData);
+  setupTelegramCommands(bot, () => cachedMarketData, () => cachedSignals);
   console.log('✅ Telegram commands registered');
 }
 
@@ -421,21 +482,26 @@ validateEnvironment();
 // Apply rate limiting to API routes
 app.use('/api/', createRateLimiter(60000, 100));
 
-app.listen(PORT, async () => {
-  console.log('\n╔═══════════════════════════════════════════════════════════════════╗');
-  console.log('║                    🚀 SENTIX PRO BACKEND V2.0                     ║');
-  console.log('║                      Server Started                               ║');
-  console.log('╠═══════════════════════════════════════════════════════════════════╣');
-  console.log(`║  Port: ${PORT}                                                     ║`);
-  console.log(`║  Environment: ${process.env.NODE_ENV || 'development'}                                            ║`);
-  console.log(`║  Telegram Bot: ${bot.isActive() ? 'Active ✅' : 'Disabled ⚠️ '}                                 ║`);
-  console.log('╚═══════════════════════════════════════════════════════════════════╝\n');
+// Export app for testing, only listen when run directly
+if (require.main === module) {
+  app.listen(PORT, async () => {
+    console.log('\n╔═══════════════════════════════════════════════════════════════════╗');
+    console.log('║                    🚀 SENTIX PRO BACKEND V2.0                     ║');
+    console.log('║                      Server Started                               ║');
+    console.log('╠═══════════════════════════════════════════════════════════════════╣');
+    console.log(`║  Port: ${PORT}                                                     ║`);
+    console.log(`║  Environment: ${process.env.NODE_ENV || 'development'}                                            ║`);
+    console.log(`║  Telegram Bot: ${bot.isActive() ? 'Active ✅' : 'Disabled ⚠️ '}                                 ║`);
+    console.log('╚═══════════════════════════════════════════════════════════════════╝\n');
 
-  await updateMarketData();
-  await generateSignals();
-  
-  console.log('✅ Initial market data loaded');
-});
+    await updateMarketData();
+    await generateSignals();
+
+    console.log('✅ Initial market data loaded');
+  });
+}
+
+module.exports = app;
 
 process.on('SIGTERM', () => {
   console.log('SIGTERM received, shutting down gracefully...');

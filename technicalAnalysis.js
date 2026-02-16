@@ -264,19 +264,36 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
     let signals = [];
     let confidence = 50;
     
-    // ─── RSI ANALYSIS ────────────────────────────────────────────────
-    if (rsi < 30) {
-      score += 15;
+    // ─── RSI ANALYSIS (graduated scoring) ────────────────────────────
+    if (rsi < 20) {
+      score += 18;
+      signals.push(`RSI deeply oversold (${rsi.toFixed(1)})`);
+      confidence += 12;
+    } else if (rsi < 30) {
+      score += 14;
       signals.push(`RSI oversold (${rsi.toFixed(1)})`);
       confidence += 10;
+    } else if (rsi < 40) {
+      score += 6;
+      signals.push(`RSI leaning bullish (${rsi.toFixed(1)})`);
+      confidence += 5;
+    } else if (rsi > 80) {
+      score -= 18;
+      signals.push(`RSI deeply overbought (${rsi.toFixed(1)})`);
+      confidence += 12;
     } else if (rsi > 70) {
-      score -= 15;
+      score -= 14;
       signals.push(`RSI overbought (${rsi.toFixed(1)})`);
       confidence += 10;
-    } else if (rsi >= 40 && rsi <= 60) {
-      signals.push('RSI neutral');
+    } else if (rsi > 60) {
+      score -= 6;
+      signals.push(`RSI leaning bearish (${rsi.toFixed(1)})`);
+      confidence += 5;
+    } else {
+      signals.push(`RSI neutral (${rsi.toFixed(1)})`);
+      confidence += 3;
     }
-    
+
     // ─── MACD ANALYSIS ───────────────────────────────────────────────
     if (macd.histogram > 0 && macd.macd > macd.signal) {
       score += 12;
@@ -286,8 +303,16 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
       score -= 12;
       signals.push('MACD bearish crossover');
       confidence += 8;
+    } else if (macd.histogram > 0) {
+      score += 5;
+      signals.push('MACD positive histogram');
+      confidence += 4;
+    } else if (macd.histogram < 0) {
+      score -= 5;
+      signals.push('MACD negative histogram');
+      confidence += 4;
     }
-    
+
     // ─── BOLLINGER BANDS ANALYSIS ────────────────────────────────────
     if (currentPrice <= bollinger.lower) {
       score += 10;
@@ -297,8 +322,20 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
       score -= 10;
       signals.push('Price at upper Bollinger Band');
       confidence += 7;
+    } else if (bollinger.bandwidth > 0) {
+      // Price position within bands (more granular)
+      const bandPosition = (currentPrice - bollinger.lower) / (bollinger.upper - bollinger.lower);
+      if (bandPosition < 0.3) {
+        score += 5;
+        signals.push('Price near lower Bollinger range');
+        confidence += 3;
+      } else if (bandPosition > 0.7) {
+        score -= 5;
+        signals.push('Price near upper Bollinger range');
+        confidence += 3;
+      }
     }
-    
+
     // ─── SUPPORT/RESISTANCE ANALYSIS ─────────────────────────────────
     if (currentPrice <= supportResistance.support * 1.02) {
       score += 8;
@@ -309,38 +346,85 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
       signals.push('Near resistance level');
       confidence += 5;
     }
-    
-    // ─── MOMENTUM ANALYSIS ───────────────────────────────────────────
-    if (change24h > 5) {
-      score += 8;
-      signals.push(`Strong upward momentum (+${change24h.toFixed(1)}%)`);
-    } else if (change24h < -5) {
-      score -= 8;
-      signals.push(`Strong downward momentum (${change24h.toFixed(1)}%)`);
-    }
-    
-    // ─── VOLUME ANALYSIS ─────────────────────────────────────────────
-    const avgVolume = historicalData.slice(-7).reduce((sum, d) => sum + d.volume, 0) / 7;
-    if (volume > avgVolume * 1.5) {
-      score += 5;
-      signals.push('High volume confirmation');
+
+    // ─── MOMENTUM ANALYSIS (graduated) ───────────────────────────────
+    if (change24h > 8) {
+      score += 10;
+      signals.push(`Very strong upward momentum (+${change24h.toFixed(1)}%)`);
       confidence += 5;
+    } else if (change24h > 3) {
+      score += 6;
+      signals.push(`Upward momentum (+${change24h.toFixed(1)}%)`);
+      confidence += 3;
+    } else if (change24h < -8) {
+      score -= 10;
+      signals.push(`Very strong downward momentum (${change24h.toFixed(1)}%)`);
+      confidence += 5;
+    } else if (change24h < -3) {
+      score -= 6;
+      signals.push(`Downward momentum (${change24h.toFixed(1)}%)`);
+      confidence += 3;
     }
-    
-    // ─── FEAR & GREED BONUS ──────────────────────────────────────────
-    if (fearGreed < 25) {
-      score += 5;
-      signals.push('Extreme fear (contrarian buy)');
-    } else if (fearGreed > 75) {
-      score -= 5;
-      signals.push('Extreme greed (caution)');
+
+    // ─── VOLUME ANALYSIS ─────────────────────────────────────────────
+    const recentVolumes = historicalData.slice(-7);
+    if (recentVolumes.length >= 3) {
+      const avgVolume = recentVolumes.reduce((sum, d) => sum + d.volume, 0) / recentVolumes.length;
+      if (avgVolume > 0 && volume > avgVolume * 1.5) {
+        score += 5;
+        signals.push('High volume confirmation');
+        confidence += 5;
+      } else if (avgVolume > 0 && volume > avgVolume * 1.2) {
+        score += 2;
+        signals.push('Above-average volume');
+        confidence += 2;
+      }
     }
-    
+
+    // ─── FEAR & GREED ANALYSIS (graduated) ───────────────────────────
+    if (fearGreed < 15) {
+      score += 8;
+      signals.push('Extreme fear (strong contrarian buy)');
+      confidence += 5;
+    } else if (fearGreed < 30) {
+      score += 4;
+      signals.push('Fear zone (contrarian buy)');
+      confidence += 3;
+    } else if (fearGreed > 85) {
+      score -= 8;
+      signals.push('Extreme greed (strong caution)');
+      confidence += 5;
+    } else if (fearGreed > 70) {
+      score -= 4;
+      signals.push('Greed zone (caution)');
+      confidence += 3;
+    }
+
+    // ─── TREND CONSISTENCY BONUS ─────────────────────────────────────
+    // If multiple indicators agree, boost confidence
+    const bullishIndicators = signals.filter(s =>
+      s.includes('oversold') || s.includes('bullish') || s.includes('support') ||
+      s.includes('lower Bollinger') || s.includes('upward')
+    ).length;
+    const bearishIndicators = signals.filter(s =>
+      s.includes('overbought') || s.includes('bearish') || s.includes('resistance') ||
+      s.includes('upper Bollinger') || s.includes('downward')
+    ).length;
+
+    if (bullishIndicators >= 3) {
+      confidence += 8;
+      signals.push('Multiple bullish confirmations');
+    } else if (bearishIndicators >= 3) {
+      confidence += 8;
+      signals.push('Multiple bearish confirmations');
+    }
+
     // ─── DETERMINE ACTION ────────────────────────────────────────────
+    // Adjusted thresholds: BUY >= 62, SELL <= 38 (was 70/30 - too restrictive)
     let action = 'HOLD';
-    if (score >= 70) action = 'BUY';
-    else if (score <= 30) action = 'SELL';
-    
+    if (score >= 62) action = 'BUY';
+    else if (score <= 38) action = 'SELL';
+
     // Cap confidence at 95%
     confidence = Math.min(confidence, 95);
     

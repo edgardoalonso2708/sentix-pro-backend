@@ -128,22 +128,7 @@ export default function SentixProFrontend() {
     return { pnl, percentage };
   };
 
-  // ─── SEND TEST ALERT ───────────────────────────────────────────────────────
-  const sendTestAlert = async () => {
-    try {
-      await fetch(`${API_URL}/api/send-alert`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: alertConfig.email,
-          message: '🧪 Test alert from SENTIX Pro - System working correctly!'
-        })
-      });
-      alert('✅ Test alert sent! Check your email.');
-    } catch (error) {
-      alert('❌ Error sending alert: ' + error.message);
-    }
-  };
+  // Test alert is now handled directly in AlertsTab
 
   // ─── STYLES ────────────────────────────────────────────────────────────────
   const bg = "#0a0a0a";
@@ -453,6 +438,9 @@ export default function SentixProFrontend() {
 
   const PortfolioTab = () => {
     const [showAddForm, setShowAddForm] = useState(false);
+    const [showBatchUpload, setShowBatchUpload] = useState(false);
+    const [uploadStatus, setUploadStatus] = useState(null);
+    const [uploading, setUploading] = useState(false);
     const [newPosition, setNewPosition] = useState({
       asset: 'bitcoin',
       amount: '',
@@ -468,6 +456,63 @@ export default function SentixProFrontend() {
         setNewPosition({ asset: 'bitcoin', amount: '', buyPrice: '' });
         setShowAddForm(false);
       }
+    };
+
+    const handleFileUpload = async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      setUploading(true);
+      setUploadStatus(null);
+
+      try {
+        const formData = new FormData();
+        formData.append('file', file);
+        formData.append('userId', 'default-user');
+
+        const response = await fetch(`${API_URL}/api/portfolio/upload`, {
+          method: 'POST',
+          body: formData,
+        });
+
+        const result = await response.json();
+
+        if (response.ok) {
+          setUploadStatus({ type: 'success', message: result.message });
+          // Refresh portfolio data from server
+          try {
+            const portfolioRes = await fetch(`${API_URL}/api/portfolio/default-user`);
+            const portfolioData = await portfolioRes.json();
+            if (portfolioData.positions) {
+              const mapped = portfolioData.positions.map(p => ({
+                id: p.id,
+                asset: p.asset,
+                amount: p.amount,
+                buyPrice: p.buy_price || p.buyPrice,
+                date: p.purchase_date,
+              }));
+              setPortfolio(mapped);
+            }
+          } catch (err) {
+            // Fallback - positions were saved server-side
+          }
+        } else {
+          setUploadStatus({
+            type: 'error',
+            message: result.error || 'Upload failed',
+            details: result.details
+          });
+        }
+      } catch (error) {
+        setUploadStatus({ type: 'error', message: 'Network error: ' + error.message });
+      } finally {
+        setUploading(false);
+        e.target.value = '';
+      }
+    };
+
+    const downloadTemplate = () => {
+      window.open(`${API_URL}/api/portfolio/template`, '_blank');
     };
 
     return (
@@ -497,29 +542,123 @@ export default function SentixProFrontend() {
           </div>
         </div>
 
-        {/* Add Position Button */}
-        <button
-          onClick={() => setShowAddForm(!showAddForm)}
-          style={{
-            width: "100%",
-            padding: "12px",
-            background: `linear-gradient(135deg, ${purple}, #7c3aed)`,
-            border: "none",
-            borderRadius: 8,
-            color: "#fff",
-            fontSize: 13,
-            fontWeight: 700,
-            cursor: "pointer",
-            marginBottom: 16
-          }}
-        >
-          {showAddForm ? '❌ Cancelar' : '➕ Agregar Posición'}
-        </button>
+        {/* Action Buttons */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 16 }}>
+          <button
+            onClick={() => { setShowAddForm(!showAddForm); setShowBatchUpload(false); }}
+            style={{
+              padding: "12px",
+              background: `linear-gradient(135deg, ${purple}, #7c3aed)`,
+              border: "none",
+              borderRadius: 8,
+              color: "#fff",
+              fontSize: 13,
+              fontWeight: 700,
+              cursor: "pointer"
+            }}
+          >
+            {showAddForm ? 'Cancelar' : 'Agregar Posicion'}
+          </button>
+          <button
+            onClick={() => { setShowBatchUpload(!showBatchUpload); setShowAddForm(false); }}
+            style={{
+              padding: "12px",
+              background: `linear-gradient(135deg, ${blue}, #2563eb)`,
+              border: "none",
+              borderRadius: 8,
+              color: "#fff",
+              fontSize: 13,
+              fontWeight: 700,
+              cursor: "pointer"
+            }}
+          >
+            {showBatchUpload ? 'Cancelar' : 'Subir CSV/Excel'}
+          </button>
+        </div>
+
+        {/* Batch Upload Section */}
+        {showBatchUpload && (
+          <div style={{ ...card, marginBottom: 16, borderColor: blue }}>
+            <div style={sTitle}>IMPORTAR PORTFOLIO (CSV/EXCEL)</div>
+
+            <div style={{
+              background: bg3,
+              borderRadius: 8,
+              padding: "16px",
+              marginBottom: 14,
+              border: `1px dashed ${border}`,
+              textAlign: "center"
+            }}>
+              <div style={{ fontSize: 13, color: text, marginBottom: 12 }}>
+                Sube un archivo CSV o Excel con tus posiciones
+              </div>
+
+              <input
+                type="file"
+                accept=".csv,.xlsx,.xls"
+                onChange={handleFileUpload}
+                disabled={uploading}
+                style={{
+                  display: "block",
+                  margin: "0 auto 12px",
+                  fontSize: 12,
+                  color: text
+                }}
+              />
+
+              {uploading && (
+                <div style={{ fontSize: 12, color: amber, marginTop: 8 }}>
+                  Procesando archivo...
+                </div>
+              )}
+
+              {uploadStatus && (
+                <div style={{
+                  fontSize: 12,
+                  color: uploadStatus.type === 'success' ? green : red,
+                  marginTop: 8,
+                  padding: "8px 12px",
+                  background: uploadStatus.type === 'success' ? `${green}15` : `${red}15`,
+                  borderRadius: 6
+                }}>
+                  {uploadStatus.message}
+                  {uploadStatus.details && (
+                    <div style={{ marginTop: 6, fontSize: 11, whiteSpace: "pre-wrap" }}>
+                      {uploadStatus.details.join('\n')}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <button
+              onClick={downloadTemplate}
+              style={{
+                width: "100%",
+                padding: "10px",
+                background: bg3,
+                border: `1px solid ${border}`,
+                borderRadius: 6,
+                color: text,
+                fontSize: 12,
+                fontWeight: 600,
+                cursor: "pointer"
+              }}
+            >
+              Descargar plantilla CSV
+            </button>
+
+            <div style={{ fontSize: 11, color: muted, marginTop: 10, lineHeight: 1.6 }}>
+              Formato: Asset, Amount, Buy Price, Purchase Date, Notes<br />
+              Assets: bitcoin, ethereum, solana, cardano, ripple, polkadot, dogecoin, binancecoin, avalanche-2, chainlink (o BTC, ETH, SOL, etc.)
+            </div>
+          </div>
+        )}
 
         {/* Add Position Form */}
         {showAddForm && (
           <div style={{ ...card, marginBottom: 16 }}>
-            <div style={sTitle}>Nueva Posición</div>
+            <div style={sTitle}>Nueva Posicion</div>
             <div style={{ display: "grid", gap: 12 }}>
               <div>
                 <label style={{ fontSize: 11, color: muted, display: "block", marginBottom: 6 }}>
@@ -598,7 +737,7 @@ export default function SentixProFrontend() {
                   cursor: "pointer"
                 }}
               >
-                ✅ Agregar
+                Agregar
               </button>
             </div>
           </div>
@@ -609,7 +748,7 @@ export default function SentixProFrontend() {
           <div style={sTitle}>MIS POSICIONES</div>
           {portfolio.length === 0 ? (
             <div style={{ padding: 30, textAlign: "center", color: muted }}>
-              No tienes posiciones aún. Agrega una arriba.
+              No tienes posiciones aun. Agrega una arriba o sube un archivo CSV.
             </div>
           ) : (
             <div style={{ display: "grid", gap: 10 }}>
@@ -617,7 +756,7 @@ export default function SentixProFrontend() {
                 const currentPrice = marketData?.crypto?.[position.asset]?.price || 0;
                 const positionValue = position.amount * currentPrice;
                 const positionPnL = positionValue - (position.amount * position.buyPrice);
-                const positionPnLPercent = ((currentPrice - position.buyPrice) / position.buyPrice) * 100;
+                const positionPnLPercent = position.buyPrice > 0 ? ((currentPrice - position.buyPrice) / position.buyPrice) * 100 : 0;
 
                 return (
                   <div key={position.id} style={{
@@ -645,11 +784,11 @@ export default function SentixProFrontend() {
                       <div style={{ fontSize: 15, fontWeight: 700 }}>
                         {formatLargeNumber(positionValue)}
                       </div>
-                      <div style={{ 
-                        fontSize: 13, 
-                        fontWeight: 700, 
+                      <div style={{
+                        fontSize: 13,
+                        fontWeight: 700,
                         color: positionPnL >= 0 ? green : red,
-                        marginTop: 4 
+                        marginTop: 4
                       }}>
                         {positionPnL >= 0 ? '+' : ''}{formatLargeNumber(positionPnL)}
                       </div>
@@ -669,7 +808,7 @@ export default function SentixProFrontend() {
                         cursor: "pointer"
                       }}
                     >
-                      🗑️
+                      Eliminar
                     </button>
                   </div>
                 );
@@ -682,15 +821,59 @@ export default function SentixProFrontend() {
   };
 
   const AlertsTab = () => {
+    const [testResult, setTestResult] = useState(null);
+    const [testing, setTesting] = useState(false);
+
+    const handleTestAlert = async () => {
+      setTesting(true);
+      setTestResult(null);
+      try {
+        const response = await fetch(`${API_URL}/api/send-alert`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: alertConfig.email,
+            message: 'Test alert from SENTIX Pro - System working correctly!'
+          })
+        });
+        const data = await response.json();
+        setTestResult(data);
+      } catch (error) {
+        setTestResult({ success: false, message: 'Error: ' + error.message });
+      } finally {
+        setTesting(false);
+      }
+    };
+
     return (
       <div>
+        {/* Telegram Setup - Primary alert channel */}
+        <div style={{
+          background: "rgba(59, 130, 246, 0.1)",
+          border: `1px solid ${blue}`,
+          borderRadius: 8,
+          padding: "14px 18px",
+          marginBottom: 16
+        }}>
+          <div style={{ fontSize: 13, fontWeight: 700, color: blue, marginBottom: 8 }}>
+            ALERTAS POR TELEGRAM (ACTIVO)
+          </div>
+          <div style={{ fontSize: 12, color: text, lineHeight: 1.8 }}>
+            1. Busca el bot de SENTIX Pro en Telegram<br />
+            2. Envia <code style={{ background: bg3, padding: "2px 6px", borderRadius: 4 }}>/start</code> para suscribirte a alertas automaticas<br />
+            3. Recibiras alertas BUY/SELL cuando la confianza sea alta<br />
+            4. Usa <code style={{ background: bg3, padding: "2px 6px", borderRadius: 4 }}>/señales</code> para ver señales activas<br />
+            5. Usa <code style={{ background: bg3, padding: "2px 6px", borderRadius: 4 }}>/stop</code> para desactivar alertas
+          </div>
+        </div>
+
         {/* Config */}
         <div style={card}>
-          <div style={sTitle}>⚙️ CONFIGURACIÓN DE ALERTAS</div>
-          
+          <div style={sTitle}>CONFIGURACION DE ALERTAS</div>
+
           <div style={{ marginBottom: 16 }}>
             <label style={{ fontSize: 11, color: muted, display: "block", marginBottom: 6 }}>
-              EMAIL
+              EMAIL (para referencia)
             </label>
             <input
               type="email"
@@ -710,7 +893,7 @@ export default function SentixProFrontend() {
 
           <div style={{ marginBottom: 16 }}>
             <label style={{ fontSize: 11, color: muted, display: "block", marginBottom: 6 }}>
-              CONFIANZA MÍNIMA: {alertConfig.minConfidence}%
+              CONFIANZA MINIMA: {alertConfig.minConfidence}%
             </label>
             <input
               type="range"
@@ -724,63 +907,78 @@ export default function SentixProFrontend() {
           </div>
 
           <button
-            onClick={sendTestAlert}
+            onClick={handleTestAlert}
+            disabled={testing}
             style={{
               width: "100%",
               padding: "10px",
-              background: `linear-gradient(135deg, ${purple}, #7c3aed)`,
+              background: testing ? bg3 : `linear-gradient(135deg, ${purple}, #7c3aed)`,
               border: "none",
               borderRadius: 7,
               color: "#fff",
               fontSize: 12,
               fontWeight: 700,
-              cursor: "pointer"
+              cursor: testing ? "not-allowed" : "pointer"
             }}
           >
-            🧪 ENVIAR ALERTA DE PRUEBA
+            {testing ? 'Enviando...' : 'ENVIAR ALERTA DE PRUEBA'}
           </button>
-        </div>
 
-        {/* Telegram Setup */}
-        <div style={{
-          background: "rgba(59, 130, 246, 0.1)",
-          border: `1px solid ${blue}`,
-          borderRadius: 8,
-          padding: "14px 18px",
-          marginBottom: 16
-        }}>
-          <div style={{ fontSize: 13, fontWeight: 700, color: blue, marginBottom: 8 }}>
-            📱 ALERTAS POR TELEGRAM (GRATIS)
-          </div>
-          <div style={{ fontSize: 12, color: text, lineHeight: 1.7 }}>
-            1. Busca <code style={{ background: bg3, padding: "2px 6px", borderRadius: 4 }}>@OracleProBot</code> en Telegram<br />
-            2. Envía <code style={{ background: bg3, padding: "2px 6px", borderRadius: 4 }}>/start</code><br />
-            3. Recibirás alertas instantáneas en tu celular 🚀
-          </div>
+          {testResult && (
+            <div style={{
+              marginTop: 12,
+              padding: "10px 14px",
+              background: bg3,
+              borderRadius: 6,
+              fontSize: 12,
+              color: testResult.success ? green : red,
+              lineHeight: 1.6
+            }}>
+              {testResult.success ? 'Test enviado' : 'Error'}
+              {testResult.delivery && (
+                <div style={{ marginTop: 6, color: muted, fontSize: 11 }}>
+                  Telegram: {testResult.delivery.telegram}<br />
+                  Email: {testResult.delivery.email}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Alert History */}
         <div style={card}>
-          <div style={sTitle}>📋 HISTORIAL DE ALERTAS</div>
+          <div style={sTitle}>HISTORIAL DE ALERTAS</div>
           {alerts.length === 0 ? (
             <div style={{ padding: 30, textAlign: "center", color: muted }}>
-              No hay alertas aún
+              No hay alertas aun. Las alertas se generan automaticamente cuando hay señales de alta confianza.
             </div>
           ) : (
-            <div style={{ maxHeight: 400, overflowY: "auto" }}>
+            <div style={{ maxHeight: 500, overflowY: "auto" }}>
               {alerts.map((alert, i) => (
-                <div key={i} style={{
+                <div key={alert.id || i} style={{
                   background: bg3,
-                  borderLeft: `3px solid ${alert.action === 'BUY' ? green : red}`,
+                  borderLeft: `3px solid ${alert.action === 'BUY' ? green : alert.action === 'SELL' ? red : amber}`,
                   borderRadius: 6,
                   padding: "12px 14px",
                   marginBottom: 10
                 }}>
-                  <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 4 }}>
-                    {alert.action === 'BUY' ? '🟢' : '🔴'} {alert.asset}
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                    <div style={{ fontSize: 13, fontWeight: 700 }}>
+                      {alert.action === 'BUY' ? '🟢' : alert.action === 'SELL' ? '🔴' : '⚪'} {alert.asset}
+                    </div>
+                    <div style={{
+                      fontSize: 10,
+                      color: alert.action === 'BUY' ? green : alert.action === 'SELL' ? red : amber,
+                      fontWeight: 700,
+                      background: `${alert.action === 'BUY' ? green : alert.action === 'SELL' ? red : amber}22`,
+                      padding: "3px 8px",
+                      borderRadius: 4
+                    }}>
+                      {alert.action}
+                    </div>
                   </div>
                   <div style={{ fontSize: 12, color: muted, marginBottom: 4 }}>
-                    Score: {alert.score}/100 · Confianza: {alert.confidence}%
+                    Score: {alert.score}/100 | Confianza: {alert.confidence}% | Precio: {formatPrice(alert.price)}
                   </div>
                   <div style={{ fontSize: 11, color: text }}>
                     {alert.reasons}
@@ -940,7 +1138,7 @@ export default function SentixProFrontend() {
           marginTop: 20,
           lineHeight: 1.8
         }}>
-          SENTIX PRO v1.0 · Real-time Trading System · Connected to Live APIs<br />
+          SENTIX PRO v2.0 · Real-time Trading System · Connected to Live APIs<br />
           ⚠ Herramienta de análisis. No constituye asesoramiento financiero.
         </div>
       </div>
