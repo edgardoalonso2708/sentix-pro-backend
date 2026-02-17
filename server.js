@@ -30,6 +30,7 @@ const {
 const { Resend } = require('resend');
 const { logger } = require('./logger');
 const { classifyAxiosError, Provider } = require('./errors');
+const { getFeatures, getFeaturesForAssets } = require('./featureStore');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -63,6 +64,9 @@ const bot = new SilentTelegramBot(TELEGRAM_BOT_TOKEN);
 let cachedMarketData = null;
 let cachedSignals = [];
 let lastSuccessfulCrypto = {}; // Preserve last known good crypto data
+
+// ─── SSE (Server-Sent Events) CLIENTS ──────────────────────────────────────
+const sseClients = new Set();
 
 // ─── CRYPTO ASSETS TO TRACK ───────────────────────────────────────────────
 const CRYPTO_ASSETS = {
@@ -316,6 +320,9 @@ async function updateMarketData() {
         lastUpdate: new Date().toISOString()
       };
       logger.info('Market data updated', { cryptoAssets: cryptoCount });
+
+      // Broadcast to SSE clients (Phase 1)
+      broadcastSSE('market', cachedMarketData);
     } else {
       // Update only non-crypto data, keep existing crypto
       cachedMarketData = {
@@ -325,6 +332,9 @@ async function updateMarketData() {
         lastUpdate: new Date().toISOString()
       };
       logger.warn('Market data partially updated (crypto unchanged, using cache)');
+
+      // Still broadcast partial update
+      broadcastSSE('market', cachedMarketData);
     }
   } catch (error) {
     logger.error('Market data update failed', { error: error.message });
@@ -378,6 +388,12 @@ async function generateSignals() {
 
   cachedSignals = signals.sort((a, b) => b.confidence - a.confidence);
   logger.info('Signals generated', { actionable: cachedSignals.length, total: assets.length });
+
+  // Broadcast to SSE clients (Phase 1)
+  if (cachedSignals.length > 0) {
+    broadcastSSE('signals', cachedSignals);
+  }
+
   return cachedSignals;
 }
 
@@ -557,13 +573,16 @@ async function processAlerts() {
 app.get('/', (req, res) => {
   res.json({
     status: 'SENTIX PRO Backend Online',
-    version: '2.1.0',
+    version: '2.3.0-phase1',  // Phase 1: Real OHLCV + Feature Store + SSE
     lastUpdate: cachedMarketData?.lastUpdate || null,
     signalsCount: cachedSignals.length,
     services: {
       telegram: bot.isActive() ? `active (${bot.getSubscribers().length} subscribers)` : 'not configured',
       email: resend ? 'active' : 'not configured',
-      database: SUPABASE_URL ? 'connected' : 'not configured'
+      database: SUPABASE_URL ? 'connected' : 'not configured',
+      sse: `active (${sseClients.size} clients)`,  // Phase 1: SSE status
+      binance: 'active (real OHLCV)',  // Phase 1: Binance data
+      featureStore: 'active'  // Phase 1: Feature computation
     }
   });
 });
@@ -577,6 +596,122 @@ app.get('/api/market', (req, res) => {
 
 app.get('/api/signals', (req, res) => {
   res.json(cachedSignals);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SSE (SERVER-SENT EVENTS) - Real-time Market Updates (Phase 1)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+app.get('/api/stream', (req, res) => {
+  // Set headers for SSE
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+
+  // Send initial connection message
+  res.write('data: {"type":"connected","timestamp":"' + new Date().toISOString() + '"}\n\n');
+
+  // Add client to set
+  const clientId = Date.now() + Math.random();
+  const client = { id: clientId, res };
+  sseClients.add(client);
+
+  logger.info('SSE client connected', { clientId, totalClients: sseClients.size });
+
+  // Send current market data immediately
+  if (cachedMarketData) {
+    res.write(`data: ${JSON.stringify({
+      type: 'market',
+      data: cachedMarketData,
+      timestamp: new Date().toISOString()
+    })}\n\n`);
+  }
+
+  // Send current signals immediately
+  if (cachedSignals.length > 0) {
+    res.write(`data: ${JSON.stringify({
+      type: 'signals',
+      data: cachedSignals,
+      timestamp: new Date().toISOString()
+    })}\n\n`);
+  }
+
+  // Keep-alive ping every 30 seconds
+  const keepAliveInterval = setInterval(() => {
+    res.write(': keep-alive\n\n');
+  }, 30000);
+
+  // Clean up on client disconnect
+  req.on('close', () => {
+    clearInterval(keepAliveInterval);
+    sseClients.delete(client);
+    logger.info('SSE client disconnected', { clientId, totalClients: sseClients.size });
+  });
+});
+
+// Helper function to broadcast to all SSE clients
+function broadcastSSE(eventType, data) {
+  if (sseClients.size === 0) return;
+
+  const message = `data: ${JSON.stringify({
+    type: eventType,
+    data,
+    timestamp: new Date().toISOString()
+  })}\n\n`;
+
+  let sent = 0;
+  let failed = 0;
+
+  for (const client of sseClients) {
+    try {
+      client.res.write(message);
+      sent++;
+    } catch (error) {
+      failed++;
+      sseClients.delete(client);
+    }
+  }
+
+  if (sent > 0 || failed > 0) {
+    logger.debug('SSE broadcast', { eventType, sent, failed, remaining: sseClients.size });
+  }
+}
+
+// New endpoint: Get features for an asset
+app.get('/api/features/:assetId', async (req, res) => {
+  try {
+    const assetId = req.params.assetId;
+    const interval = req.query.interval || '1h';
+
+    const features = await getFeatures(assetId, interval);
+
+    if (!features) {
+      return res.status(404).json({ error: 'Features not available for asset' });
+    }
+
+    res.json(features);
+  } catch (error) {
+    logger.error('Features fetch failed', { error: error.message });
+    res.status(500).json({ error: 'Failed to fetch features' });
+  }
+});
+
+// New endpoint: Get features for multiple assets
+app.post('/api/features/batch', async (req, res) => {
+  try {
+    const { assetIds, interval = '1h' } = req.body;
+
+    if (!assetIds || !Array.isArray(assetIds)) {
+      return res.status(400).json({ error: 'assetIds array required' });
+    }
+
+    const featuresMap = await getFeaturesForAssets(assetIds, interval);
+    res.json(featuresMap);
+  } catch (error) {
+    logger.error('Batch features fetch failed', { error: error.message });
+    res.status(500).json({ error: 'Failed to fetch features' });
+  }
 });
 
 app.get('/api/alerts', async (req, res) => {
@@ -795,17 +930,22 @@ app.use('/api/', createRateLimiter(60000, 100));
 // Export app for testing, only listen when run directly
 if (require.main === module) {
   app.listen(PORT, async () => {
-    logger.info('SENTIX PRO Backend v2.2 started', {
+    logger.info('SENTIX PRO Backend v2.3.0-phase1 started', {
       port: PORT,
       env: process.env.NODE_ENV || 'development',
       telegram: bot.isActive() ? 'active' : 'disabled',
-      email: resend ? 'active' : 'disabled'
+      email: resend ? 'active' : 'disabled',
+      phase1: {
+        binance: 'active',
+        featureStore: 'active',
+        sse: 'active'
+      }
     });
 
     await updateMarketData();
     await generateSignals();
 
-    logger.info('Initial market data loaded');
+    logger.info('Initial market data loaded - Phase 1 features enabled');
   });
 }
 
