@@ -4,108 +4,149 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const rateLimit = require('express-rate-limit');
+const { logger } = require('./logger');
+
+// Placeholder patterns that indicate unconfigured values
+const PLACEHOLDERS = ['YOUR_', 'REPLACE_', 'CHANGE_', 'EXAMPLE_', 'xxx', 'yyy', 'TODO', 'FIXME'];
 
 /**
- * Validate that required environment variables are present and safe
- * NEVER log the actual values
+ * Format validation rules for known env vars
+ */
+const ENV_RULES = {
+  SUPABASE_URL: {
+    required: true,
+    label: 'Supabase URL',
+    validate: (v) => {
+      if (!v.startsWith('https://')) return 'must start with https://';
+      if (!v.includes('.supabase.co')) return 'must be a valid Supabase URL (*.supabase.co)';
+      return null;
+    }
+  },
+  SUPABASE_KEY: {
+    required: true,
+    label: 'Supabase Key',
+    validate: (v) => {
+      if (!v.startsWith('eyJ')) return 'must be a valid JWT (starts with eyJ)';
+      const parts = v.split('.');
+      if (parts.length < 3) return 'must be a valid JWT (at least three dot-separated parts)';
+      return null;
+    }
+  },
+  TELEGRAM_BOT_TOKEN: {
+    required: false,
+    label: 'Telegram Bot',
+    validate: (v) => {
+      if (!/^\d+:[A-Za-z0-9_-]+$/.test(v)) return 'invalid format (expected 123456789:ABCdef...)';
+      return null;
+    }
+  },
+  RESEND_API_KEY: {
+    required: false,
+    label: 'Resend (Email)',
+    validate: (v) => {
+      if (!v.startsWith('re_')) return 'must start with re_';
+      return null;
+    }
+  },
+  ALPHA_VANTAGE_KEY: {
+    required: false,
+    label: 'Alpha Vantage (Metals)',
+    validate: null
+  }
+};
+
+/**
+ * Validate that required environment variables are present, safe, and well-formed.
+ * Exits process on critical failures. Returns validation summary.
  */
 function validateEnvironment() {
-  const required = ['SUPABASE_URL', 'SUPABASE_KEY'];
-  const missing = [];
-  
-  for (const key of required) {
-    if (!process.env[key] || process.env[key].trim() === '') {
-      missing.push(key);
-    }
-  }
-  
-  if (missing.length > 0) {
-    console.error('❌ Missing required environment variables:', missing.join(', '));
-    console.error('   Please set these in your .env file or Railway dashboard');
-    process.exit(1);
-  }
-  
-  // Check for placeholder values (common mistakes)
-  const placeholders = ['YOUR_', 'REPLACE_', 'CHANGE_', 'EXAMPLE_', 'xxx', 'yyy'];
-  
-  for (const key of required) {
+  const errors = [];
+  const warnings = [];
+  const status = {};
+
+  for (const [key, rule] of Object.entries(ENV_RULES)) {
     const value = process.env[key];
-    const hasPlaceholder = placeholders.some(ph => value.includes(ph));
-    
-    if (hasPlaceholder) {
-      console.error(`❌ ${key} appears to contain a placeholder value`);
-      console.error('   Please set a real API key in your environment');
-      process.exit(1);
+    const isEmpty = !value || value.trim() === '';
+
+    // Check presence
+    if (isEmpty) {
+      if (rule.required) {
+        errors.push(`${key} is missing (required)`);
+      } else {
+        status[key] = { configured: false, label: rule.label };
+      }
+      continue;
     }
+
+    // Check placeholders
+    const hasPlaceholder = PLACEHOLDERS.some(ph => value.toUpperCase().includes(ph));
+    if (hasPlaceholder) {
+      if (rule.required) {
+        errors.push(`${key} contains a placeholder value`);
+      } else {
+        warnings.push(`${key} appears to contain a placeholder`);
+        status[key] = { configured: false, label: rule.label };
+      }
+      continue;
+    }
+
+    // Run format validation
+    if (rule.validate) {
+      const formatError = rule.validate(value);
+      if (formatError) {
+        if (rule.required) {
+          errors.push(`${key}: ${formatError}`);
+        } else {
+          warnings.push(`${key}: ${formatError}`);
+          status[key] = { configured: false, label: rule.label };
+        }
+        continue;
+      }
+    }
+
+    status[key] = { configured: true, label: rule.label };
   }
-  
-  // Validate Supabase URL format
-  if (!process.env.SUPABASE_URL.startsWith('https://')) {
-    console.error('❌ SUPABASE_URL must start with https://');
+
+  // Fatal: exit on required env var failures
+  if (errors.length > 0) {
+    for (const err of errors) {
+      logger.error(`ENV validation failed: ${err}`);
+    }
+    logger.error('Fix the above environment variable issues and restart');
     process.exit(1);
   }
-  
-  // Optional keys - just log status without exposing values
-  const optional = {
-    'TELEGRAM_BOT_TOKEN': 'Telegram Bot',
-    'ALPHA_VANTAGE_KEY': 'Alpha Vantage (Metals)',
-    'RESEND_API_KEY': 'Resend (Email)'
-  };
-  
-  console.log('\n🔐 Security Status:');
-  console.log('   ✅ Required secrets validated');
-  
-  for (const [key, name] of Object.entries(optional)) {
-    const hasKey = process.env[key] && 
-                   process.env[key].length > 10 && 
-                   !placeholders.some(ph => process.env[key].includes(ph));
-    
-    console.log(`   ${hasKey ? '✅' : '⚠️ '} ${name}: ${hasKey ? 'Configured' : 'Not configured (optional)'}`);
+
+  // Non-fatal warnings
+  for (const w of warnings) {
+    logger.warn(`ENV warning: ${w}`);
   }
-  console.log('');
+
+  // Summary
+  logger.info('Environment validated', {
+    required: 'OK',
+    optional: Object.entries(status)
+      .filter(([k]) => !ENV_RULES[k].required)
+      .reduce((acc, [k, v]) => { acc[v.label] = v.configured ? 'configured' : 'not configured'; return acc; }, {})
+  });
+
+  return status;
 }
 
 /**
  * Mask sensitive data for safe logging
+ * @deprecated Use logger module directly — kept for backward compatibility
  */
 function maskSecret(value) {
-  if (!value || value.length < 8) return '***';
-  return value.substring(0, 4) + '***' + value.substring(value.length - 4);
+  const { maskValue } = require('./logger');
+  return maskValue(value);
 }
 
 /**
  * Safe logger that never exposes secrets
+ * @deprecated Use logger module directly — kept for backward compatibility
  */
 function safeLog(level, message, data = {}) {
-  const timestamp = new Date().toISOString();
-  const sanitized = {};
-  
-  // List of keys that should NEVER be logged
-  const secretKeys = [
-    'password', 'token', 'key', 'secret', 'api', 'auth',
-    'supabase', 'telegram', 'resend', 'alpha'
-  ];
-  
-  // Sanitize data object
-  for (const [key, value] of Object.entries(data)) {
-    const keyLower = key.toLowerCase();
-    const isSecret = secretKeys.some(sk => keyLower.includes(sk));
-    
-    if (isSecret && typeof value === 'string') {
-      sanitized[key] = maskSecret(value);
-    } else {
-      sanitized[key] = value;
-    }
-  }
-  
-  const logEntry = {
-    timestamp,
-    level,
-    message,
-    ...sanitized
-  };
-  
-  console.log(JSON.stringify(logEntry));
+  logger[level] ? logger[level](message, data) : logger.info(message, data);
 }
 
 /**

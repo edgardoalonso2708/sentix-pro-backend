@@ -1,9 +1,11 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // SENTIX PRO - TELEGRAM BOT WRAPPER (SILENT MODE + ALERT DELIVERY)
 // Bot opcional sin spam de errores, con entrega automática de alertas
+// Phase 0: Hardened with structured logging
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const TelegramBot = require('node-telegram-bot-api');
+const { logger } = require('./logger');
 
 class SilentTelegramBot {
   constructor(token) {
@@ -34,30 +36,30 @@ class SilentTelegramBot {
         this.bot.on('polling_error', (error) => {
           errorCount++;
           if (errorCount <= 3) {
-            console.warn(`⚠️ Telegram polling error #${errorCount}: ${error.message}`);
+            logger.warn('Telegram polling error', { count: errorCount, error: error.message });
           }
           if (errorCount === 3) {
-            console.warn('⚠️ Telegram: suppressing further polling errors');
+            logger.warn('Telegram: suppressing further polling errors');
           }
           // If persistent auth errors, mark as disabled
           if (error.response?.statusCode === 401) {
-            console.error('❌ Telegram Bot token is INVALID (401 Unauthorized). Bot disabled.');
+            logger.error('Telegram Bot token is INVALID (401 Unauthorized). Bot disabled.');
             this.enabled = false;
           }
         });
 
         this.enabled = true;
-        console.log('✅ Telegram Bot initialized (token format valid)');
+        logger.info('Telegram Bot initialized');
 
       } catch (error) {
-        console.log('⚠️  Telegram Bot disabled (invalid token or network issue)');
+        logger.warn('Telegram Bot disabled (invalid token or network issue)');
         this.enabled = false;
       }
     } else {
       if (token && token.length > 5) {
-        console.log('⚠️  Telegram Bot token format invalid (expected: 123456789:ABCdef...)');
+        logger.warn('Telegram Bot token format invalid (expected: 123456789:ABCdef...)');
       } else {
-        console.log('ℹ️  Telegram Bot not configured (set TELEGRAM_BOT_TOKEN)');
+        logger.info('Telegram Bot not configured (set TELEGRAM_BOT_TOKEN)');
       }
     }
   }
@@ -67,7 +69,7 @@ class SilentTelegramBot {
    */
   subscribe(chatId) {
     this.subscribedChatIds.add(chatId);
-    console.log(`📱 Telegram subscriber added: ${chatId} (total: ${this.subscribedChatIds.size})`);
+    logger.info('Telegram subscriber added', { chatId, total: this.subscribedChatIds.size });
   }
 
   /**
@@ -75,7 +77,7 @@ class SilentTelegramBot {
    */
   unsubscribe(chatId) {
     this.subscribedChatIds.delete(chatId);
-    console.log(`📱 Telegram subscriber removed: ${chatId} (total: ${this.subscribedChatIds.size})`);
+    logger.info('Telegram subscriber removed', { chatId, total: this.subscribedChatIds.size });
   }
 
   /**

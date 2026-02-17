@@ -1,6 +1,7 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// SENTIX PRO - BACKEND SERVER V2.1
+// SENTIX PRO - BACKEND SERVER V2.2
 // Resilient Data Fetching + Signals + Alerts + Portfolio
+// Phase 0: Hardened errors, structured logging, jitter backoff
 // ═══════════════════════════════════════════════════════════════════════════════
 
 require('dotenv').config();
@@ -13,12 +14,12 @@ const { createClient } = require('@supabase/supabase-js');
 const { SilentTelegramBot, setupTelegramCommands } = require('./telegramBot');
 const { fetchMetalsPricesSafe } = require('./metalsAPI');
 const { generateSignalWithRealData } = require('./technicalAnalysis');
-const { 
-  upload, 
-  parsePortfolioCSV, 
-  savePortfolio, 
-  getPortfolio, 
-  calculatePortfolioMetrics 
+const {
+  upload,
+  parsePortfolioCSV,
+  savePortfolio,
+  getPortfolio,
+  calculatePortfolioMetrics
 } = require('./portfolioManager');
 const {
   validateEnvironment,
@@ -27,6 +28,8 @@ const {
   isValidUserId
 } = require('./security');
 const { Resend } = require('resend');
+const { logger } = require('./logger');
+const { classifyAxiosError, Provider } = require('./errors');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -48,9 +51,9 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 let resend = null;
 if (RESEND_API_KEY && RESEND_API_KEY.startsWith('re_') && RESEND_API_KEY.length > 10) {
   resend = new Resend(RESEND_API_KEY);
-  console.log('✅ Resend email client initialized');
+  logger.info('Resend email client initialized');
 } else {
-  console.log('ℹ️  Email alerts not configured (set RESEND_API_KEY)');
+  logger.info('Email alerts not configured (set RESEND_API_KEY)');
 }
 
 // Initialize Telegram Bot (silent mode, optional)
@@ -93,33 +96,44 @@ const COINCAP_IDS = {
 // RESILIENT HTTP CLIENT
 // ═══════════════════════════════════════════════════════════════════════════════
 
+const DEFAULT_TIMEOUT_MS = 15000;
+
 const apiClient = axios.create({
+  timeout: DEFAULT_TIMEOUT_MS,
   headers: {
-    'User-Agent': 'SentixPro/2.1 (Trading Dashboard)',
+    'User-Agent': 'SentixPro/2.2 (Trading Dashboard)',
     'Accept': 'application/json'
   }
 });
 
 /**
- * Retry wrapper with exponential backoff
+ * Retry wrapper with exponential backoff + jitter
+ * Jitter prevents thundering herd when multiple instances retry simultaneously
  */
 async function fetchWithRetry(fn, retries = 3, baseDelay = 2000) {
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       return await fn();
-    } catch (error) {
-      const isRateLimit = error.response?.status === 429;
-      const isServerError = error.response?.status >= 500;
+    } catch (rawError) {
+      const providerError = classifyAxiosError(rawError, 'HTTP', rawError.config?.url);
 
-      if (attempt === retries || (!isRateLimit && !isServerError && error.response)) {
-        throw error;
+      // Don't retry non-retryable errors
+      if (attempt === retries || !providerError.retryable) {
+        throw rawError;
       }
 
-      const delay = isRateLimit
-        ? baseDelay * Math.pow(2, attempt) // Longer backoff for rate limits
+      // Exponential backoff with jitter: delay * (0.5 + random 0-0.5)
+      const exponentialDelay = providerError.type === 'RATE_LIMIT'
+        ? baseDelay * Math.pow(2, attempt)  // Longer backoff for rate limits
         : baseDelay * attempt;
 
-      console.log(`⏳ Retry ${attempt}/${retries} in ${delay}ms (${error.message})`);
+      const jitter = exponentialDelay * (0.5 + Math.random() * 0.5);
+      const delay = Math.round(jitter);
+
+      logger.info(`Retry ${attempt}/${retries} in ${delay}ms`, {
+        error: providerError.type,
+        endpoint: providerError.endpoint
+      });
       await new Promise(resolve => setTimeout(resolve, delay));
     }
   }
@@ -166,29 +180,29 @@ async function fetchCryptoPrices() {
 
     if (Object.keys(cryptoData).length > 0) {
       lastSuccessfulCrypto = cryptoData;
-      console.log(`✅ CoinGecko: ${Object.keys(cryptoData).length} assets fetched`);
+      logger.info('CoinGecko fetch OK', { assets: Object.keys(cryptoData).length });
       return cryptoData;
     }
   } catch (error) {
-    console.warn(`⚠️ CoinGecko failed: ${error.message}`);
+    logger.providerError(classifyAxiosError(error, Provider.COINGECKO, 'simple/price'));
   }
 
   // Fallback: CoinCap API (no API key needed, generous limits)
   try {
-    console.log('🔄 Falling back to CoinCap API...');
+    logger.info('Falling back to CoinCap API');
     const cryptoData = await fetchFromCoinCap();
     if (Object.keys(cryptoData).length > 0) {
       lastSuccessfulCrypto = cryptoData;
-      console.log(`✅ CoinCap fallback: ${Object.keys(cryptoData).length} assets fetched`);
+      logger.info('CoinCap fallback OK', { assets: Object.keys(cryptoData).length });
       return cryptoData;
     }
   } catch (error) {
-    console.warn(`⚠️ CoinCap fallback also failed: ${error.message}`);
+    logger.providerError(classifyAxiosError(error, Provider.COINCAP, 'assets'));
   }
 
   // Last resort: return cached data if available
   if (Object.keys(lastSuccessfulCrypto).length > 0) {
-    console.log(`⚠️ Using cached crypto data (${Object.keys(lastSuccessfulCrypto).length} assets)`);
+    logger.warn('Using cached crypto data', { assets: Object.keys(lastSuccessfulCrypto).length });
     return lastSuccessfulCrypto;
   }
 
@@ -238,7 +252,7 @@ async function fetchFearGreed() {
 
     return { fearGreed: value, fearLabel: label };
   } catch (error) {
-    console.error('Error fetching Fear & Greed:', error.message);
+    logger.providerError(classifyAxiosError(error, Provider.ALTERNATIVE_ME, 'fng'));
     return { fearGreed: 50, fearLabel: 'Neutral' };
   }
 }
@@ -257,13 +271,11 @@ async function fetchGlobalData() {
       globalMcap: response.data.data.total_market_cap.usd
     };
   } catch (error) {
-    console.error('Error fetching global data:', error.message);
+    logger.providerError(classifyAxiosError(error, Provider.COINGECKO, 'global'));
     // Fallback: try CoinCap for BTC dominance
     try {
       const response = await apiClient.get('https://api.coincap.io/v2/assets/bitcoin', { timeout: 5000 });
       const btcMcap = parseFloat(response.data.data.marketCapUsd) || 0;
-      // Rough estimate of total market
-      const totalResponse = await apiClient.get('https://api.coincap.io/v2/assets?limit=1', { timeout: 5000 });
       return {
         btcDom: btcMcap > 0 ? '~55' : '0',
         globalMcap: 0
@@ -280,7 +292,7 @@ async function fetchMetalsPrices() {
 
 async function updateMarketData() {
   try {
-    console.log('🔄 Updating market data...');
+    logger.info('Updating market data');
 
     // Stagger CoinGecko calls to avoid rate limiting
     // Fetch crypto first (may need retries)
@@ -303,7 +315,7 @@ async function updateMarketData() {
         metals,
         lastUpdate: new Date().toISOString()
       };
-      console.log(`✅ Market data updated: ${cryptoCount} crypto assets, metals OK`);
+      logger.info('Market data updated', { cryptoAssets: cryptoCount });
     } else {
       // Update only non-crypto data, keep existing crypto
       cachedMarketData = {
@@ -312,10 +324,10 @@ async function updateMarketData() {
         metals,
         lastUpdate: new Date().toISOString()
       };
-      console.log(`⚠️ Market data partially updated (crypto unchanged, using cache)`);
+      logger.warn('Market data partially updated (crypto unchanged, using cache)');
     }
   } catch (error) {
-    console.error('Error updating market data:', error.message);
+    logger.error('Market data update failed', { error: error.message });
   }
 }
 
@@ -327,18 +339,18 @@ async function generateSignals() {
   const signals = [];
 
   if (!cachedMarketData || !cachedMarketData.crypto || Object.keys(cachedMarketData.crypto).length === 0) {
-    console.log('⚠️ No crypto data available for signal generation');
+    logger.warn('No crypto data available for signal generation');
     return signals;
   }
 
   const fearGreed = cachedMarketData.macro?.fearGreed || 50;
   const assets = Object.entries(cachedMarketData.crypto);
-  console.log(`📊 Generating signals for ${assets.length} assets (Fear & Greed: ${fearGreed})...`);
+  logger.info('Generating signals', { assets: assets.length, fearGreed });
 
   for (const [assetId, data] of assets) {
     try {
       if (!data.price || data.price <= 0) {
-        console.warn(`⚠️ Skipping ${assetId}: invalid price (${data.price})`);
+        logger.warn('Skipping asset: invalid price', { asset: assetId, price: data.price });
         continue;
       }
 
@@ -360,12 +372,12 @@ async function generateSignals() {
       // Delay between API calls - 2s to be safe with CoinGecko free tier
       await new Promise(resolve => setTimeout(resolve, 2000));
     } catch (error) {
-      console.error(`Signal generation failed for ${assetId}:`, error.message);
+      logger.error('Signal generation failed', { asset: assetId, error: error.message });
     }
   }
 
   cachedSignals = signals.sort((a, b) => b.confidence - a.confidence);
-  console.log(`📊 Generated ${cachedSignals.length} actionable signals from ${assets.length} assets`);
+  logger.info('Signals generated', { actionable: cachedSignals.length, total: assets.length });
   return cachedSignals;
 }
 
@@ -394,14 +406,14 @@ async function sendEmailAlert(to, subject, htmlBody) {
     });
 
     if (error) {
-      console.error('📧 Email send error:', error);
+      logger.error('Email send error', { provider: Provider.RESEND, error: error.message });
       return { success: false, error: error.message || 'Email send failed' };
     }
 
-    console.log(`📧 Email sent successfully to ${to} (id: ${data?.id})`);
+    logger.info('Email sent', { to, id: data?.id });
     return { success: true, id: data?.id };
   } catch (error) {
-    console.error('📧 Email exception:', error.message);
+    logger.error('Email exception', { provider: Provider.RESEND, error: error.message });
     return { success: false, error: error.message };
   }
 }
@@ -466,7 +478,7 @@ const recentAlertKeys = new Set();
 
 async function processAlerts() {
   try {
-    console.log('🔔 Processing alerts...');
+    logger.info('Processing alerts');
 
     const signals = await generateSignals();
     let savedCount = 0;
@@ -492,7 +504,7 @@ async function processAlerts() {
           });
 
         if (error) {
-          console.error('Error saving alert:', error.message);
+          logger.error('Alert save failed', { provider: Provider.SUPABASE, error: error.message });
         } else {
           savedCount++;
         }
@@ -502,7 +514,12 @@ async function processAlerts() {
           const result = await bot.broadcastAlert(signal);
           if (result.sent > 0) {
             telegramCount += result.sent;
-            console.log(`📱 Telegram alert sent for ${signal.asset} ${signal.action} to ${result.sent}/${result.total} subscribers`);
+            logger.info('Telegram alert sent', {
+              asset: signal.asset,
+              action: signal.action,
+              sent: result.sent,
+              total: result.total
+            });
           }
         }
 
@@ -522,9 +539,14 @@ async function processAlerts() {
       }
     }
 
-    console.log(`✅ Processed ${signals.length} signals: saved=${savedCount}, telegram=${telegramCount}, email=${emailCount}`);
+    logger.info('Alerts processed', {
+      signals: signals.length,
+      saved: savedCount,
+      telegram: telegramCount,
+      email: emailCount
+    });
   } catch (error) {
-    console.error('Error processing alerts:', error.message);
+    logger.error('Alert processing failed', { error: error.message });
   }
 }
 
@@ -568,7 +590,7 @@ app.get('/api/alerts', async (req, res) => {
     if (error) throw error;
     res.json(data || []);
   } catch (error) {
-    console.error('Error fetching alerts:', error.message);
+    logger.error('Failed to fetch alerts', { provider: Provider.SUPABASE, error: error.message });
     res.json([]);
   }
 });
@@ -623,7 +645,7 @@ app.post('/api/send-alert', async (req, res) => {
     results.telegram = 'bot not configured (set TELEGRAM_BOT_TOKEN)';
   }
 
-  console.log(`📧 Test alert: email=${results.email}, telegram=${results.telegram}`);
+  logger.info('Test alert sent', { email: results.email, telegram: results.telegram });
 
   res.json({
     success: true,
@@ -670,18 +692,18 @@ app.post('/api/portfolio/upload', upload.single('file'), async (req, res) => {
     });
     
   } catch (error) {
-    console.error('Portfolio upload error:', error);
-    
+    logger.error('Portfolio upload failed', { error: error.message, type: error.type });
+
     if (error.type === 'validation') {
       return res.status(400).json({
         error: 'Validation failed',
         details: error.errors
       });
     }
-    
-    res.status(500).json({ 
+
+    res.status(500).json({
       error: 'Failed to upload portfolio',
-      message: error.message 
+      message: error.message
     });
   }
 });
@@ -709,7 +731,7 @@ app.get('/api/portfolio/:userId', async (req, res) => {
     });
     
   } catch (error) {
-    console.error('Portfolio fetch error:', error);
+    logger.error('Portfolio fetch failed', { error: error.message });
     res.status(500).json({ error: 'Failed to fetch portfolio' });
   }
 });
@@ -734,7 +756,7 @@ app.delete('/api/portfolio/:userId/:positionId', async (req, res) => {
     res.json({ success: true, message: 'Position deleted' });
     
   } catch (error) {
-    console.error('Portfolio delete error:', error);
+    logger.error('Portfolio delete failed', { error: error.message });
     res.status(500).json({ error: 'Failed to delete position' });
   }
 });
@@ -745,7 +767,7 @@ app.delete('/api/portfolio/:userId/:positionId', async (req, res) => {
 
 if (bot.isActive()) {
   setupTelegramCommands(bot, () => cachedMarketData, () => cachedSignals);
-  console.log('✅ Telegram commands registered');
+  logger.info('Telegram commands registered');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -773,32 +795,30 @@ app.use('/api/', createRateLimiter(60000, 100));
 // Export app for testing, only listen when run directly
 if (require.main === module) {
   app.listen(PORT, async () => {
-    console.log('\n╔═══════════════════════════════════════════════════════════════════╗');
-    console.log('║                    🚀 SENTIX PRO BACKEND V2.1                     ║');
-    console.log('║                      Server Started                               ║');
-    console.log('╠═══════════════════════════════════════════════════════════════════╣');
-    console.log(`║  Port: ${PORT}                                                     ║`);
-    console.log(`║  Environment: ${process.env.NODE_ENV || 'development'}                                            ║`);
-    console.log(`║  Telegram Bot: ${bot.isActive() ? 'Active ✅' : 'Disabled ⚠️ '}                                 ║`);
-    console.log('╚═══════════════════════════════════════════════════════════════════╝\n');
+    logger.info('SENTIX PRO Backend v2.2 started', {
+      port: PORT,
+      env: process.env.NODE_ENV || 'development',
+      telegram: bot.isActive() ? 'active' : 'disabled',
+      email: resend ? 'active' : 'disabled'
+    });
 
     await updateMarketData();
     await generateSignals();
 
-    console.log('✅ Initial market data loaded');
+    logger.info('Initial market data loaded');
   });
 }
 
 module.exports = app;
 
 process.on('SIGTERM', () => {
-  console.log('SIGTERM received, shutting down gracefully...');
+  logger.info('SIGTERM received, shutting down gracefully');
   bot.stop();
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
-  console.log('\nSIGINT received, shutting down gracefully...');
+  logger.info('SIGINT received, shutting down gracefully');
   bot.stop();
   process.exit(0);
 });

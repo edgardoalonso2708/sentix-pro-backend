@@ -1,14 +1,18 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // SENTIX PRO - TECHNICAL ANALYSIS ENGINE (PROFESSIONAL)
 // Implementación correcta de indicadores técnicos sin look-ahead bias
+// Phase 0: Hardened with structured logging and error taxonomy
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const axios = require('axios');
+const { logger } = require('./logger');
+const { classifyAxiosError, Provider } = require('./errors');
 
-// Reusable HTTP client with proper headers
+// Reusable HTTP client with proper headers and timeout
 const apiClient = axios.create({
+  timeout: 15000,
   headers: {
-    'User-Agent': 'SentixPro/2.1 (Trading Dashboard)',
+    'User-Agent': 'SentixPro/2.2 (Trading Dashboard)',
     'Accept': 'application/json'
   }
 });
@@ -61,8 +65,7 @@ async function fetchHistoricalData(coinId, days = 30) {
       volume: volumes[i] ? volumes[i][1] : 0
     }));
   } catch (error) {
-    const isRateLimit = error.response?.status === 429;
-    console.warn(`⚠️ CoinGecko historical ${coinId}: ${error.message}${isRateLimit ? ' (rate limited)' : ''}`);
+    logger.providerError(classifyAxiosError(error, Provider.COINGECKO, `market_chart/${coinId}`));
   }
 
   // Fallback: CoinCap if CoinGecko failed
@@ -88,10 +91,10 @@ async function fetchHistoricalData(coinId, days = 30) {
       }));
 
       if (result.length > 0) {
-        console.log(`✅ CoinCap fallback for ${coinId}: ${result.length} data points`);
+        logger.info('CoinCap historical fallback OK', { coinId, dataPoints: result.length });
       }
     } catch (fallbackError) {
-      console.warn(`⚠️ CoinCap fallback ${coinId}: ${fallbackError.message}`);
+      logger.providerError(classifyAxiosError(fallbackError, Provider.COINCAP, `history/${coinId}`));
     }
   }
 
@@ -101,7 +104,7 @@ async function fetchHistoricalData(coinId, days = 30) {
   } else {
     // Return cached data if available (even if stale)
     if (cached) {
-      console.log(`⚠️ Using stale cache for ${coinId} historical data`);
+      logger.warn('Using stale historical cache', { coinId });
       return cached.data;
     }
   }
@@ -517,7 +520,7 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
     };
     
   } catch (error) {
-    console.error(`Error generating signal for ${asset}:`, error.message);
+    logger.error('Signal generation error', { asset, error: error.message });
     return {
       asset: asset.toUpperCase(),
       action: 'HOLD',

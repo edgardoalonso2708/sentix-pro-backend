@@ -1,9 +1,11 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // SENTIX PRO - METALS PRICE FETCHER
 // API alternativa gratuita para Gold y Silver sin límites restrictivos
+// Phase 0: Hardened with structured logging
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const axios = require('axios');
+const { logger } = require('./logger');
 
 /**
  * Fetch metals prices from alternative free sources
@@ -35,8 +37,8 @@ async function fetchMetalsPrices() {
     };
     
   } catch (error) {
-    console.log('Using fallback metal prices');
-    
+    logger.warn('Metals API failed, using fallback prices');
+
     // Fallback con precios aproximados actuales
     return {
       gold: {
@@ -119,7 +121,7 @@ async function fetchMetalsPricesSafe() {
   try {
     return await fetchMetalsPrices();
   } catch (error) {
-    console.log('Metals API unavailable, using static prices');
+    logger.warn('Metals API unavailable, using static prices');
     return {
       gold: { price: 2040, change24h: 0, symbol: 'XAU' },
       silver: { price: 24.50, change24h: 0, symbol: 'XAG' }
