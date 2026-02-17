@@ -21,6 +21,7 @@ const ErrorType = Object.freeze({
  * Providers tracked by the system
  */
 const Provider = Object.freeze({
+  BINANCE: 'Binance',
   COINGECKO: 'CoinGecko',
   COINCAP: 'CoinCap',
   ALTERNATIVE_ME: 'Alternative.me',
