@@ -2,11 +2,13 @@
 // SENTIX PRO - TECHNICAL ANALYSIS ENGINE (PROFESSIONAL)
 // Implementación correcta de indicadores técnicos sin look-ahead bias
 // Phase 0: Hardened with structured logging and error taxonomy
+// Phase 1: Real OHLCV candles (1m, 5m, 1h) from Binance for precision
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const axios = require('axios');
 const { logger } = require('./logger');
 const { classifyAxiosError, Provider } = require('./errors');
+const { fetchOHLCVForAsset } = require('./binanceAPI');
 
 // Reusable HTTP client with proper headers and timeout
 const apiClient = axios.create({
@@ -110,6 +112,75 @@ async function fetchHistoricalData(coinId, days = 30) {
   }
 
   return result;
+}
+
+/**
+ * Fetch OHLCV candles with intelligent fallback chain
+ * Primary: Binance (high-resolution, fast)
+ * Fallback 1: CoinGecko (daily candles)
+ * Fallback 2: CoinCap (hourly/daily)
+ *
+ * @param {string} coinId - CoinGecko coin ID
+ * @param {string} interval - Timeframe (1m, 5m, 15m, 1h, 4h, 1d) - Binance format
+ * @param {number} limit - Number of candles (default 100)
+ * @returns {Promise<Array>} Array of {timestamp, open, high, low, close, volume}
+ */
+async function fetchOHLCVCandles(coinId, interval = '1h', limit = 100) {
+  const cacheKey = `ohlcv-${coinId}-${interval}-${limit}`;
+  const cached = historicalCache.get(cacheKey);
+
+  // Cache TTL varies by interval
+  const cacheTTL = interval.includes('m') ? 60 * 1000 : (interval === '1h' ? 5 * 60 * 1000 : CACHE_TTL);
+
+  if (cached && (Date.now() - cached.ts) < cacheTTL) {
+    return cached.data;
+  }
+
+  let candles = [];
+
+  // Primary: Binance Public API (fastest, most reliable for crypto)
+  try {
+    candles = await fetchOHLCVForAsset(coinId, interval, limit);
+
+    if (candles.length > 0) {
+      logger.debug('Binance OHLCV fetched', { coinId, interval, candles: candles.length });
+      historicalCache.set(cacheKey, { data: candles, ts: Date.now() });
+      return candles;
+    }
+  } catch (error) {
+    logger.warn('Binance OHLCV failed, trying fallback', { coinId, error: error.message });
+  }
+
+  // Fallback: Use old fetchHistoricalData (daily candles from CoinGecko/CoinCap)
+  try {
+    const dailyData = await fetchHistoricalData(coinId, limit);
+
+    // Convert to OHLCV format (approximation: use price as OHLC)
+    candles = dailyData.map(d => ({
+      timestamp: d.timestamp,
+      open: d.price,
+      high: d.price * 1.005,  // Approx 0.5% volatility
+      low: d.price * 0.995,
+      close: d.price,
+      volume: d.volume
+    }));
+
+    if (candles.length > 0) {
+      logger.info('Using CoinGecko/CoinCap daily candles as fallback', { coinId, candles: candles.length });
+      historicalCache.set(cacheKey, { data: candles, ts: Date.now() });
+      return candles;
+    }
+  } catch (fallbackError) {
+    logger.error('All OHLCV sources failed', { coinId, error: fallbackError.message });
+  }
+
+  // Last resort: check stale cache
+  if (cached) {
+    logger.warn('Using stale OHLCV cache', { coinId, age: Date.now() - cached.ts });
+    return cached.data;
+  }
+
+  return [];
 }
 
 /**
@@ -298,19 +369,24 @@ function calculateSupportResistance(historicalData) {
 
 /**
  * Generate trading signals based on real technical analysis
+ * NOW USES HIGH-RESOLUTION CANDLES (1h) from Binance for precision
+ *
  * @param {string} asset - Asset ID
  * @param {number} currentPrice - Current price
  * @param {number} change24h - 24h change percentage
  * @param {number} volume - Current volume
  * @param {number} fearGreed - Fear & Greed index
+ * @param {string} interval - Candle interval (default '1h' for intraday)
  * @returns {Promise<Object>} Trading signal with score and confidence
  */
-async function generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed) {
+async function generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, interval = '1h') {
   try {
-    // Fetch 30 days of historical data
-    const historicalData = await fetchHistoricalData(asset, 30);
-    
-    if (historicalData.length < 14) {
+    // Fetch high-resolution OHLCV candles (1h = 7 days of data if limit=168)
+    // For daily: 1d = 30 days if limit=30
+    const candleLimit = interval === '1h' ? 168 : (interval.includes('m') ? 288 : 100);
+    const ohlcvData = await fetchOHLCVCandles(asset, interval, candleLimit);
+
+    if (ohlcvData.length < 14) {
       // Not enough data, return neutral signal
       return {
         asset: asset.toUpperCase(),
@@ -320,17 +396,33 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
         price: currentPrice,
         change24h,
         reasons: 'Insufficient historical data for technical analysis',
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        dataSource: 'insufficient',
+        interval
       };
     }
-    
-    const prices = historicalData.map(d => d.price);
-    
-    // Calculate technical indicators with REAL data
+
+    // Extract close prices for indicator calculations
+    const prices = ohlcvData.map(d => d.close);
+
+    // Extract high/low for support/resistance (use last 30 candles)
+    const recentCandles = ohlcvData.slice(-30);
+    const high = Math.max(...recentCandles.map(d => d.high));
+    const low = Math.min(...recentCandles.map(d => d.low));
+    const close = prices[prices.length - 1];
+
+    // Calculate technical indicators with REAL OHLCV data
     const rsi = calculateRSI(prices, 14);
     const macd = calculateMACD(prices, 12, 26, 9);
     const bollinger = calculateBollingerBands(prices, 20, 2);
-    const supportResistance = calculateSupportResistance(historicalData);
+
+    // Calculate support/resistance from actual high/low (more accurate)
+    const pivot = (high + low + close) / 3;
+    const supportResistance = {
+      support: (2 * pivot) - high,
+      resistance: (2 * pivot) - low,
+      pivot
+    };
     
     // Initialize scoring
     let score = 50; // Neutral base
@@ -439,15 +531,18 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
       confidence += 3;
     }
 
-    // ─── VOLUME ANALYSIS ─────────────────────────────────────────────
-    const recentVolumes = historicalData.slice(-7);
-    if (recentVolumes.length >= 3) {
-      const avgVolume = recentVolumes.reduce((sum, d) => sum + d.volume, 0) / recentVolumes.length;
-      if (avgVolume > 0 && volume > avgVolume * 1.5) {
+    // ─── VOLUME ANALYSIS (using real OHLCV volume data) ─────────────
+    const recentOHLCV = ohlcvData.slice(-24);  // Last 24 candles (24h for 1h interval)
+    if (recentOHLCV.length >= 3) {
+      const volumes = recentOHLCV.map(d => d.volume);
+      const avgVolume = volumes.reduce((sum, v) => sum + v, 0) / volumes.length;
+      const currentVolume = recentOHLCV[recentOHLCV.length - 1].volume;
+
+      if (avgVolume > 0 && currentVolume > avgVolume * 1.5) {
         score += 5;
         signals.push('High volume confirmation');
         confidence += 5;
-      } else if (avgVolume > 0 && volume > avgVolume * 1.2) {
+      } else if (avgVolume > 0 && currentVolume > avgVolume * 1.2) {
         score += 2;
         signals.push('Above-average volume');
         confidence += 2;
@@ -516,6 +611,9 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
           position: currentPrice > bollinger.upper ? 'above' : currentPrice < bollinger.lower ? 'below' : 'within'
         }
       },
+      dataSource: 'Binance OHLCV',  // Phase 1: Now using real candles
+      interval,
+      candlesAnalyzed: ohlcvData.length,
       timestamp: new Date().toISOString()
     };
     
@@ -536,6 +634,7 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
 
 module.exports = {
   fetchHistoricalData,
+  fetchOHLCVCandles,  // Phase 1: New high-resolution candles function
   calculateRSI,
   calculateMACD,
   calculateBollingerBands,
