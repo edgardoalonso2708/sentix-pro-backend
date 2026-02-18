@@ -24,8 +24,6 @@ describe('generateMockHistory', () => {
   test('first simulated price starts near 90% of current price', () => {
     const currentPrice = 100;
     const history = generateMockHistory(currentPrice, 30);
-    // First price starts at currentPrice * 0.9 then modified by random factor
-    // Should be roughly in the 85-95 range
     expect(history[0]).toBeGreaterThan(currentPrice * 0.8);
     expect(history[0]).toBeLessThan(currentPrice * 1.1);
   });
@@ -62,19 +60,15 @@ describe('generateMockHistory', () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe('computeSignalFromData', () => {
-  // Helper to create deterministic price arrays for specific RSI/MACD outcomes
   const makeBullishPrices = () => {
-    // Strongly rising prices → high RSI, positive MACD
     return Array.from({ length: 31 }, (_, i) => 1000 + i * 50);
   };
 
   const makeBearishPrices = () => {
-    // Strongly falling prices → low RSI, negative MACD
     return Array.from({ length: 31 }, (_, i) => 2000 - i * 50);
   };
 
   const makeNeutralPrices = () => {
-    // Flat prices → RSI ~50, MACD ~0
     return Array.from({ length: 31 }, () => 100);
   };
 
@@ -92,6 +86,7 @@ describe('computeSignalFromData', () => {
     expect(signal).toHaveProperty('asset');
     expect(signal).toHaveProperty('action');
     expect(signal).toHaveProperty('score');
+    expect(signal).toHaveProperty('rawScore');
     expect(signal).toHaveProperty('confidence');
     expect(signal).toHaveProperty('price');
     expect(signal).toHaveProperty('change24h');
@@ -110,43 +105,33 @@ describe('computeSignalFromData', () => {
     expect(signal.change24h).toBe(2.5);
   });
 
-  test('BUY signal when bullish indicators', () => {
-    const bullishData = { ...defaultData, change24h: 8 }; // Strong momentum
-    const signal = computeSignalFromData('bitcoin', bullishData, defaultMacro, makeBullishPrices());
-    // RSI >70 → -15, but MACD bullish +12, strong momentum +8 → score = 50-15+12+8=55
-    // Actually RSI>70 → score-=15 but also confidence +=20
+  test('score is 0-100 display range', () => {
+    const signal = computeSignalFromData('bitcoin', defaultData, defaultMacro, makeBullishPrices());
     expect(signal.score).toBeGreaterThanOrEqual(0);
     expect(signal.score).toBeLessThanOrEqual(100);
+  });
+
+  test('rawScore is bidirectional (-100 to +100 range)', () => {
+    const signal = computeSignalFromData('bitcoin', defaultData, defaultMacro, makeBullishPrices());
+    expect(signal.rawScore).toBeGreaterThanOrEqual(-100);
+    expect(signal.rawScore).toBeLessThanOrEqual(100);
   });
 
   test('SELL signal when bearish indicators with strong negative momentum', () => {
     const bearishData = { ...defaultData, change24h: -8 };
     const signal = computeSignalFromData('bitcoin', bearishData, defaultMacro, makeBearishPrices());
-    // RSI oversold (+15), MACD bearish (-12), weak momentum (-8) → 50+15-12-8 = 45 → HOLD
-    // Actually RSI<30: score+15, MACD bearish: score-12, change<-5: score-8
-    // 50+15-12-8 = 45 → HOLD (>=45)
     expect(['HOLD', 'SELL', 'BUY']).toContain(signal.action);
   });
 
-  test('score is clamped between 0 and 100', () => {
-    // Extreme bearish case
-    const extremeBearishData = { ...defaultData, change24h: -20 };
-    const signal = computeSignalFromData('bitcoin', extremeBearishData, defaultMacro, makeBearishPrices());
-    expect(signal.score).toBeGreaterThanOrEqual(0);
-    expect(signal.score).toBeLessThanOrEqual(100);
-  });
-
-  test('confidence is capped at 100', () => {
-    // All conditions trigger confidence boosts
+  test('confidence is capped at 85', () => {
     const data = { ...defaultData, change24h: 10 };
-    const macro = { fearGreed: 10 }; // Extreme fear
+    const macro = { fearGreed: 10 };
     const signal = computeSignalFromData('bitcoin', data, macro, makeBullishPrices());
-    expect(signal.confidence).toBeLessThanOrEqual(100);
+    expect(signal.confidence).toBeLessThanOrEqual(85);
   });
 
-  test('RSI oversold adds to score and confidence', () => {
+  test('RSI oversold adds to score', () => {
     const oversoldPrices = makeBearishPrices();
-    // RSI < 30 → score += 15, confidence += 20
     const signal = computeSignalFromData('bitcoin', defaultData, defaultMacro, oversoldPrices);
     expect(signal.reasons).toContain('RSI oversold');
   });
@@ -157,7 +142,7 @@ describe('computeSignalFromData', () => {
     expect(signal.reasons).toContain('RSI overbought');
   });
 
-  test('MACD bullish adds to score', () => {
+  test('MACD is reported in reasons', () => {
     const signal = computeSignalFromData('bitcoin', defaultData, defaultMacro, makeBullishPrices());
     expect(signal.reasons).toContain('MACD');
   });
@@ -174,22 +159,9 @@ describe('computeSignalFromData', () => {
     expect(signal.reasons).toContain('Weak 24h momentum');
   });
 
-  test('extreme fear bonus only applies when score > 50', () => {
-    const fearMacro = { fearGreed: 10 };
-    // With neutral prices and no momentum, MACD is ~0.
-    // If MACD bearish: score = 50-12 = 38. Fear bonus requires score>50, so no bonus.
-    const signal = computeSignalFromData('bitcoin', defaultData, fearMacro, makeBearishPrices());
-    // Score should NOT contain fear bonus since RSI oversold +15, MACD bearish -12 → 50+15-12=53 > 50 → might get bonus
-    // Actually depends on MACD of bearish prices
-    expect(typeof signal.score).toBe('number');
-  });
-
-  test('action classification: score >= 65 is BUY', () => {
-    // Manually verify action boundaries
-    const signal65 = computeSignalFromData('test', defaultData, defaultMacro, makeNeutralPrices());
-    // We can't directly set score, but we test the boundary logic:
-    // score >= 65 → BUY, score >= 45 → HOLD, else SELL
-    expect(['BUY', 'HOLD', 'SELL']).toContain(signal65.action);
+  test('action is one of BUY, SELL, HOLD', () => {
+    const signal = computeSignalFromData('test', defaultData, defaultMacro, makeNeutralPrices());
+    expect(['BUY', 'HOLD', 'SELL']).toContain(signal.action);
   });
 
   test('timestamp is a recent number', () => {
@@ -222,27 +194,11 @@ describe('generateSignals', () => {
 
     const signals = generateSignals(marketCache);
     expect(Array.isArray(signals)).toBe(true);
-    // Each signal should have required fields
     signals.forEach(s => {
       expect(s).toHaveProperty('asset');
       expect(s).toHaveProperty('action');
       expect(s).toHaveProperty('score');
       expect(s).toHaveProperty('confidence');
-      expect(s.confidence).toBeGreaterThanOrEqual(70);
-    });
-  });
-
-  test('only includes signals with confidence >= 70', () => {
-    const marketCache = {
-      crypto: {
-        bitcoin: { price: 65000, change24h: 0, volume24h: 1e10, marketCap: 1.2e12 },
-      },
-      macro: { fearGreed: 50, fearLabel: 'Neutral' },
-    };
-
-    const signals = generateSignals(marketCache);
-    signals.forEach(s => {
-      expect(s.confidence).toBeGreaterThanOrEqual(70);
     });
   });
 
@@ -281,7 +237,7 @@ describe('generateSignals', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// filterCriticalSignals Tests
+// filterCriticalSignals Tests (v3: uses rawScore instead of score)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe('filterCriticalSignals', () => {
@@ -289,67 +245,67 @@ describe('filterCriticalSignals', () => {
     expect(filterCriticalSignals([])).toEqual([]);
   });
 
-  test('keeps BUY signals with confidence >= 75 and score >= 70', () => {
+  test('keeps BUY signals with confidence >= 60 and rawScore >= 35', () => {
     const signals = [
-      { action: 'BUY', confidence: 80, score: 75, asset: 'BTC' },
-      { action: 'BUY', confidence: 75, score: 70, asset: 'ETH' },
+      { action: 'BUY', confidence: 65, rawScore: 40, asset: 'BTC' },
+      { action: 'BUY', confidence: 60, rawScore: 35, asset: 'ETH' },
     ];
     const critical = filterCriticalSignals(signals);
     expect(critical).toHaveLength(2);
   });
 
-  test('keeps SELL signals with confidence >= 75 and score <= 30', () => {
+  test('keeps SELL signals with confidence >= 60 and rawScore <= -35', () => {
     const signals = [
-      { action: 'SELL', confidence: 80, score: 25, asset: 'XRP' },
-      { action: 'SELL', confidence: 75, score: 30, asset: 'ADA' },
+      { action: 'SELL', confidence: 65, rawScore: -40, asset: 'XRP' },
+      { action: 'SELL', confidence: 60, rawScore: -35, asset: 'ADA' },
     ];
     const critical = filterCriticalSignals(signals);
     expect(critical).toHaveLength(2);
   });
 
-  test('filters out BUY signals with score < 70', () => {
+  test('filters out BUY signals with rawScore < 35', () => {
     const signals = [
-      { action: 'BUY', confidence: 80, score: 65, asset: 'BTC' },
+      { action: 'BUY', confidence: 70, rawScore: 30, asset: 'BTC' },
     ];
     expect(filterCriticalSignals(signals)).toHaveLength(0);
   });
 
-  test('filters out BUY signals with confidence < 75', () => {
+  test('filters out BUY signals with confidence < 60', () => {
     const signals = [
-      { action: 'BUY', confidence: 70, score: 80, asset: 'BTC' },
+      { action: 'BUY', confidence: 55, rawScore: 50, asset: 'BTC' },
     ];
     expect(filterCriticalSignals(signals)).toHaveLength(0);
   });
 
-  test('filters out SELL signals with score > 30', () => {
+  test('filters out SELL signals with rawScore > -35', () => {
     const signals = [
-      { action: 'SELL', confidence: 80, score: 35, asset: 'XRP' },
+      { action: 'SELL', confidence: 70, rawScore: -30, asset: 'XRP' },
     ];
     expect(filterCriticalSignals(signals)).toHaveLength(0);
   });
 
-  test('filters out SELL signals with confidence < 75', () => {
+  test('filters out SELL signals with confidence < 60', () => {
     const signals = [
-      { action: 'SELL', confidence: 70, score: 20, asset: 'XRP' },
+      { action: 'SELL', confidence: 55, rawScore: -40, asset: 'XRP' },
     ];
     expect(filterCriticalSignals(signals)).toHaveLength(0);
   });
 
   test('always filters out HOLD signals', () => {
     const signals = [
-      { action: 'HOLD', confidence: 90, score: 50, asset: 'DOT' },
-      { action: 'HOLD', confidence: 100, score: 0, asset: 'SOL' },
+      { action: 'HOLD', confidence: 90, rawScore: 0, asset: 'DOT' },
+      { action: 'HOLD', confidence: 100, rawScore: -50, asset: 'SOL' },
     ];
     expect(filterCriticalSignals(signals)).toHaveLength(0);
   });
 
   test('mixed signals are filtered correctly', () => {
     const signals = [
-      { action: 'BUY', confidence: 80, score: 75, asset: 'BTC' },   // critical
-      { action: 'BUY', confidence: 60, score: 80, asset: 'ETH' },   // not critical (conf < 75)
-      { action: 'SELL', confidence: 85, score: 20, asset: 'XRP' },  // critical
-      { action: 'SELL', confidence: 80, score: 50, asset: 'ADA' },  // not critical (score > 30)
-      { action: 'HOLD', confidence: 90, score: 50, asset: 'DOT' },  // never critical
+      { action: 'BUY', confidence: 65, rawScore: 40, asset: 'BTC' },   // critical
+      { action: 'BUY', confidence: 50, rawScore: 50, asset: 'ETH' },   // not critical (conf < 60)
+      { action: 'SELL', confidence: 70, rawScore: -45, asset: 'XRP' },  // critical
+      { action: 'SELL', confidence: 65, rawScore: -20, asset: 'ADA' },  // not critical (rawScore > -35)
+      { action: 'HOLD', confidence: 90, rawScore: 0, asset: 'DOT' },   // never critical
     ];
     const critical = filterCriticalSignals(signals);
     expect(critical).toHaveLength(2);
@@ -357,13 +313,13 @@ describe('filterCriticalSignals', () => {
     expect(critical[1].asset).toBe('XRP');
   });
 
-  test('boundary: BUY with exactly 75 confidence and 70 score passes', () => {
-    const signals = [{ action: 'BUY', confidence: 75, score: 70, asset: 'TEST' }];
+  test('boundary: BUY with exactly 60 confidence and 35 rawScore passes', () => {
+    const signals = [{ action: 'BUY', confidence: 60, rawScore: 35, asset: 'TEST' }];
     expect(filterCriticalSignals(signals)).toHaveLength(1);
   });
 
-  test('boundary: SELL with exactly 75 confidence and 30 score passes', () => {
-    const signals = [{ action: 'SELL', confidence: 75, score: 30, asset: 'TEST' }];
+  test('boundary: SELL with exactly 60 confidence and -35 rawScore passes', () => {
+    const signals = [{ action: 'SELL', confidence: 60, rawScore: -35, asset: 'TEST' }];
     expect(filterCriticalSignals(signals)).toHaveLength(1);
   });
 });

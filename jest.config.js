@@ -1,7 +1,7 @@
 module.exports = {
   testEnvironment: 'node',
-  testMatch: ['<rootDir>/__tests__/**/*.test.js'],
-  testPathIgnorePatterns: ['/node_modules/', '/.claude/'],
+  testRegex: '__tests__/.*\\.test\\.js$',
+  testPathIgnorePatterns: ['/node_modules/'],
   collectCoverageFrom: [
     'lib/**/*.js',
     'server.js',
