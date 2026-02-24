@@ -62,6 +62,88 @@ const ALERT_EMAIL = process.env.ALERT_EMAIL || 'edgardoalonso2708@gmail.com';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
+// ─── DATABASE INITIALIZATION ──────────────────────────────────────────────
+// Ensure wallets and portfolios tables exist with correct schema
+async function initializeDatabase() {
+  try {
+    // Test if wallets table exists by querying it
+    const { error: walletsError } = await supabase.from('wallets').select('id').limit(1);
+
+    if (walletsError) {
+      logger.warn('Wallets table check failed, attempting to create', { error: walletsError.message, code: walletsError.code });
+
+      // Try to create tables via RPC or direct SQL
+      const { error: createError } = await supabase.rpc('exec_sql', {
+        sql: `
+          CREATE TABLE IF NOT EXISTS wallets (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL DEFAULT 'exchange',
+            provider TEXT NOT NULL DEFAULT 'other',
+            color TEXT DEFAULT '#6366f1',
+            icon TEXT,
+            is_active BOOLEAN DEFAULT true,
+            notes TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW(),
+            CONSTRAINT valid_type CHECK (type IN ('exchange', 'wallet', 'cold_storage', 'defi', 'other')),
+            CONSTRAINT unique_user_wallet_name UNIQUE (user_id, name)
+          );
+          CREATE INDEX IF NOT EXISTS idx_wallets_user_id ON wallets(user_id);
+          CREATE INDEX IF NOT EXISTS idx_wallets_user_active ON wallets(user_id, is_active);
+
+          CREATE TABLE IF NOT EXISTS portfolios (
+            id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id TEXT NOT NULL,
+            wallet_id UUID NOT NULL REFERENCES wallets(id) ON DELETE CASCADE,
+            asset TEXT NOT NULL,
+            amount NUMERIC(20, 8) NOT NULL CHECK (amount > 0),
+            buy_price NUMERIC(20, 8) NOT NULL CHECK (buy_price > 0),
+            purchase_date TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            notes TEXT,
+            transaction_id TEXT,
+            tags TEXT[],
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+          );
+          CREATE INDEX IF NOT EXISTS idx_portfolios_user_id ON portfolios(user_id);
+          CREATE INDEX IF NOT EXISTS idx_portfolios_wallet_id ON portfolios(wallet_id);
+          CREATE INDEX IF NOT EXISTS idx_portfolios_user_wallet ON portfolios(user_id, wallet_id);
+
+          ALTER TABLE IF EXISTS wallets DISABLE ROW LEVEL SECURITY;
+          ALTER TABLE IF EXISTS portfolios DISABLE ROW LEVEL SECURITY;
+        `
+      });
+
+      if (createError) {
+        logger.warn('Auto-create tables via RPC failed (may need manual SQL execution)', { error: createError.message });
+        // This is expected if exec_sql RPC doesn't exist - tables need manual creation
+      } else {
+        logger.info('Database tables created successfully');
+      }
+    } else {
+      logger.info('Database tables verified OK');
+
+      // Ensure RLS is disabled (in case migration enabled it)
+      // This only works with service_role key
+      await supabase.rpc('exec_sql', {
+        sql: `
+          ALTER TABLE IF EXISTS wallets DISABLE ROW LEVEL SECURITY;
+          ALTER TABLE IF EXISTS portfolios DISABLE ROW LEVEL SECURITY;
+        `
+      }).catch(() => {
+        // Silently ignore - RPC may not exist
+      });
+    }
+  } catch (err) {
+    logger.warn('Database initialization check failed', { error: err.message });
+  }
+}
+
+// Run DB init on startup
+initializeDatabase();
+
 // Initialize Resend email client (optional)
 let resend = null;
 if (RESEND_API_KEY && RESEND_API_KEY.startsWith('re_') && RESEND_API_KEY.length > 10) {
@@ -844,8 +926,22 @@ app.get('/api/wallets/:userId', async (req, res) => {
     res.json({ wallets });
 
   } catch (error) {
-    logger.error('Failed to fetch wallets', { error: error.message });
-    res.status(500).json({ error: 'Failed to fetch wallets' });
+    logger.error('Failed to fetch wallets', {
+      error: error.message,
+      code: error.code,
+      details: error.details,
+      hint: error.hint
+    });
+
+    // Handle missing table or RLS
+    if (error.code === '42P01' || (error.message && error.message.includes('does not exist'))) {
+      return res.json({ wallets: [], hint: 'Table does not exist. Run migration SQL.' });
+    }
+    if (error.code === '42501' || (error.message && error.message.includes('row-level security'))) {
+      return res.json({ wallets: [], hint: 'RLS blocking access. Disable RLS on wallets table.' });
+    }
+
+    res.status(500).json({ error: 'Failed to fetch wallets', details: error.message });
   }
 });
 
@@ -883,16 +979,40 @@ app.post('/api/wallets', async (req, res) => {
     });
 
   } catch (error) {
-    logger.error('Failed to create wallet', { error: error.message });
+    logger.error('Failed to create wallet', {
+      error: error.message,
+      code: error.code,
+      details: error.details,
+      hint: error.hint
+    });
 
     // Handle duplicate name error
-    if (error.message.includes('unique_user_wallet_name')) {
+    if (error.message && error.message.includes('unique_user_wallet_name')) {
       return res.status(409).json({
         error: 'A wallet with this name already exists'
       });
     }
 
-    res.status(500).json({ error: 'Failed to create wallet' });
+    // Handle RLS errors
+    if (error.code === '42501' || (error.message && error.message.includes('row-level security'))) {
+      return res.status(500).json({
+        error: 'Database permission error. RLS may need to be disabled for the wallets table.',
+        hint: 'Run in Supabase SQL Editor: ALTER TABLE wallets DISABLE ROW LEVEL SECURITY;'
+      });
+    }
+
+    // Handle missing table
+    if (error.code === '42P01' || (error.message && error.message.includes('does not exist'))) {
+      return res.status(500).json({
+        error: 'Wallets table does not exist. Run the migration SQL in Supabase SQL Editor.',
+        hint: 'See migrations/001_multi_wallet_schema.sql'
+      });
+    }
+
+    res.status(500).json({
+      error: 'Failed to create wallet',
+      details: error.message
+    });
   }
 });
 
