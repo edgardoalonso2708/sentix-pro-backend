@@ -10,7 +10,8 @@ import { useState, useCallback, useEffect } from "react";
 export default function SentixProFrontend() {
   
   // ─── CONFIGURATION ─────────────────────────────────────────────────────────
-  const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
+  const rawApiUrl = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001').replace(/\/+$/, '');
+  const API_URL = rawApiUrl.startsWith('http') ? rawApiUrl : `https://${rawApiUrl}`;
   
   // ─── STATE ─────────────────────────────────────────────────────────────────
   const [marketData, setMarketData] = useState(null);
