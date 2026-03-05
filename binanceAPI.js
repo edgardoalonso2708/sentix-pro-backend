@@ -42,7 +42,8 @@ const SYMBOL_MAP = {
   polkadot: 'DOTUSDT',
   dogecoin: 'DOGEUSDT',
   'avalanche-2': 'AVAXUSDT',
-  chainlink: 'LINKUSDT'
+  chainlink: 'LINKUSDT',
+  'pax-gold': 'PAXGUSDT'  // Gold proxy - PAXG = 1 troy oz of gold
 };
 
 // Valid intervals for Binance klines API

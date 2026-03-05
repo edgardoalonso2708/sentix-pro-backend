@@ -41,10 +41,11 @@ class SilentTelegramBot {
           if (errorCount === 3) {
             logger.warn('Telegram: suppressing further polling errors');
           }
-          // If persistent auth errors, mark as disabled
+          // If persistent auth errors, mark as disabled and stop polling
           if (error.response?.statusCode === 401) {
             logger.error('Telegram Bot token is INVALID (401 Unauthorized). Bot disabled.');
             this.enabled = false;
+            try { this.bot.stopPolling(); } catch (_e) { /* silent */ }
           }
         });
 
