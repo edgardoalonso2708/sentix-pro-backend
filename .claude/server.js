@@ -442,14 +442,16 @@ async function updateMarketData() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async function generateSignals() {
-  const signals = [];
+  const allSignals = [];
 
   if (!cachedMarketData || !cachedMarketData.crypto || Object.keys(cachedMarketData.crypto).length === 0) {
     logger.warn('No crypto data available for signal generation');
-    return signals;
+    return allSignals;
   }
 
   const fearGreed = cachedMarketData.macro?.fearGreed || 50;
+
+  // ─── CRYPTO SIGNALS ─────────────────────────────────────────────────
   const assets = Object.entries(cachedMarketData.crypto);
   logger.info('Generating signals', { assets: assets.length, fearGreed });
 
@@ -468,29 +470,182 @@ async function generateSignals() {
         fearGreed
       );
 
-      // Include BUY/SELL with confidence >= 55, HOLD with confidence >= 70
-      if (signal.confidence >= 55 && (signal.action === 'BUY' || signal.action === 'SELL')) {
-        signals.push(signal);
-      } else if (signal.confidence >= 70 && signal.action === 'HOLD') {
-        signals.push(signal);
-      }
+      // Include ALL signals for display (user needs full visibility)
+      allSignals.push(signal);
 
-      // Delay between API calls - 2s to be safe with CoinGecko free tier
-      await new Promise(resolve => setTimeout(resolve, 2000));
+      // Delay between API calls to respect rate limits
+      await new Promise(resolve => setTimeout(resolve, 1500));
     } catch (error) {
       logger.error('Signal generation failed', { asset: assetId, error: error.message });
     }
   }
 
-  cachedSignals = signals.sort((a, b) => b.confidence - a.confidence);
-  logger.info('Signals generated', { actionable: cachedSignals.length, total: assets.length });
+  // ─── GOLD SIGNAL (via PAXG) ──────────────────────────────────────────
+  if (cachedMarketData.metals?.gold) {
+    try {
+      const gold = cachedMarketData.metals.gold;
+      if (gold.price > 0) {
+        const goldSignal = await generateSignalWithRealData(
+          'pax-gold',  // Maps to PAXGUSDT on Binance
+          gold.price,
+          gold.change24h || 0,
+          gold.volume24h || 0,
+          fearGreed
+        );
+        // Rename asset for display
+        goldSignal.asset = 'GOLD (XAU)';
+        goldSignal.assetClass = 'metal';
+        allSignals.push(goldSignal);
 
-  // Broadcast to SSE clients (Phase 1)
+        await new Promise(resolve => setTimeout(resolve, 1500));
+
+        // ─── SILVER SIGNAL (derived from gold analysis) ─────────────
+        if (cachedMarketData.metals?.silver) {
+          const silver = cachedMarketData.metals.silver;
+          if (silver.price > 0) {
+            // Silver is ~85% correlated with gold but more volatile
+            // Use gold's technical analysis as base, amplify the score
+            const silverSignal = { ...goldSignal };
+            silverSignal.asset = 'SILVER (XAG)';
+            silverSignal.price = silver.price;
+            silverSignal.change24h = silver.change24h || (gold.change24h ? gold.change24h * 1.3 : 0);
+            // Silver is more volatile - amplify the raw score by 15%
+            const amplifiedScore = Math.round(goldSignal.rawScore * 1.15);
+            silverSignal.rawScore = Math.max(-100, Math.min(100, amplifiedScore));
+            silverSignal.score = Math.round(Math.max(0, Math.min(100, (silverSignal.rawScore + 100) / 2)));
+            // Slightly lower confidence (derived, not direct analysis)
+            silverSignal.confidence = Math.max(0, goldSignal.confidence - 5);
+            silverSignal.reasons = goldSignal.reasons + ' • Derived from gold correlation (silver/gold ~0.85)';
+            silverSignal.dataSource = 'Gold correlation (PAXG OHLCV)';
+            silverSignal.assetClass = 'metal';
+
+            // Recalculate action based on amplified score
+            if (silverSignal.rawScore >= 25) silverSignal.action = 'BUY';
+            else if (silverSignal.rawScore >= 15 && silverSignal.confidence >= 35) silverSignal.action = 'BUY';
+            else if (silverSignal.rawScore <= -25) silverSignal.action = 'SELL';
+            else if (silverSignal.rawScore <= -15 && silverSignal.confidence >= 35) silverSignal.action = 'SELL';
+            else silverSignal.action = 'HOLD';
+
+            // Strength label
+            if (silverSignal.action === 'BUY') {
+              silverSignal.strengthLabel = silverSignal.rawScore >= 50 && silverSignal.confidence >= 55 ? 'STRONG BUY' :
+                silverSignal.rawScore >= 35 ? 'BUY' : 'WEAK BUY';
+            } else if (silverSignal.action === 'SELL') {
+              silverSignal.strengthLabel = silverSignal.rawScore <= -50 && silverSignal.confidence >= 55 ? 'STRONG SELL' :
+                silverSignal.rawScore <= -35 ? 'SELL' : 'WEAK SELL';
+            } else {
+              silverSignal.strengthLabel = 'HOLD';
+            }
+
+            allSignals.push(silverSignal);
+          }
+        }
+      }
+    } catch (error) {
+      logger.error('Gold/Silver signal generation failed', { error: error.message });
+    }
+  }
+
+  // Sort by confidence (highest first), then by action priority (BUY/SELL before HOLD)
+  cachedSignals = allSignals.sort((a, b) => {
+    const actionPriority = { BUY: 2, SELL: 2, HOLD: 0 };
+    const priorityDiff = (actionPriority[b.action] || 0) - (actionPriority[a.action] || 0);
+    if (priorityDiff !== 0) return priorityDiff;
+    return b.confidence - a.confidence;
+  });
+
+  const actionable = cachedSignals.filter(s => s.action !== 'HOLD').length;
+  logger.info('Signals generated', { total: cachedSignals.length, actionable });
+
+  // Persist signals to Supabase for durability across restarts
+  await persistSignals(cachedSignals);
+
+  // Broadcast to SSE clients
   if (cachedSignals.length > 0) {
     broadcastSSE('signals', cachedSignals);
   }
 
   return cachedSignals;
+}
+
+/**
+ * Persist signals to Supabase so they survive server restarts
+ */
+async function persistSignals(signals) {
+  try {
+    // Upsert all signals (replace previous batch)
+    const { error } = await supabase
+      .from('signals')
+      .upsert(
+        signals.map(s => ({
+          asset: s.asset,
+          action: s.action,
+          strength_label: s.strengthLabel || s.action,
+          score: s.score,
+          raw_score: s.rawScore || 0,
+          confidence: s.confidence,
+          price: s.price,
+          change_24h: s.change24h || 0,
+          reasons: s.reasons,
+          indicators: s.indicators || {},
+          data_source: s.dataSource || 'unknown',
+          interval_tf: s.interval || '1h',
+          asset_class: s.assetClass || 'crypto',
+          generated_at: s.timestamp || new Date().toISOString()
+        })),
+        { onConflict: 'asset' }
+      );
+
+    if (error) {
+      // Table may not exist yet - log but don't fail
+      if (error.code === '42P01') {
+        logger.debug('Signals table not yet created - signals stored in memory only');
+      } else {
+        logger.warn('Signal persistence failed', { error: error.message });
+      }
+    } else {
+      logger.debug('Signals persisted to database', { count: signals.length });
+    }
+  } catch (error) {
+    logger.debug('Signal persistence unavailable', { error: error.message });
+  }
+}
+
+/**
+ * Load persisted signals from Supabase (used on startup)
+ */
+async function loadPersistedSignals() {
+  try {
+    const { data, error } = await supabase
+      .from('signals')
+      .select('*')
+      .order('confidence', { ascending: false });
+
+    if (error) {
+      logger.debug('Could not load persisted signals', { error: error.message });
+      return [];
+    }
+
+    return (data || []).map(s => ({
+      asset: s.asset,
+      action: s.action,
+      strengthLabel: s.strength_label,
+      score: s.score,
+      rawScore: s.raw_score,
+      confidence: s.confidence,
+      price: s.price,
+      change24h: s.change_24h,
+      reasons: s.reasons,
+      indicators: s.indicators,
+      dataSource: s.data_source,
+      interval: s.interval_tf,
+      assetClass: s.asset_class,
+      timestamp: s.generated_at
+    }));
+  } catch (error) {
+    logger.debug('Signal load unavailable', { error: error.message });
+    return [];
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -597,46 +752,64 @@ async function processAlerts() {
     let telegramCount = 0;
     let emailCount = 0;
 
+    // Alert thresholds: BUY/SELL with confidence >= 55, or STRONG signals >= 45
+    const ALERT_MIN_CONFIDENCE = 55;
+    const STRONG_SIGNAL_CONFIDENCE = 45;
+
     for (const signal of signals) {
-      if (signal.confidence >= 70) {
+      const isActionable = signal.action === 'BUY' || signal.action === 'SELL';
+      const isHighConfidence = signal.confidence >= ALERT_MIN_CONFIDENCE;
+      const isStrongSignal = signal.confidence >= STRONG_SIGNAL_CONFIDENCE &&
+        (signal.strengthLabel?.includes('STRONG') || Math.abs(signal.rawScore || 0) >= 40);
+
+      if (isActionable && (isHighConfidence || isStrongSignal)) {
         // Deduplicate: only alert once per asset+action per cycle
         const alertKey = `${signal.asset}-${signal.action}`;
         if (recentAlertKeys.has(alertKey)) continue;
 
-        // Save to database
-        const { error } = await supabase
-          .from('alerts')
-          .insert({
-            asset: signal.asset,
-            action: signal.action,
-            score: signal.score,
-            confidence: signal.confidence,
-            reasons: signal.reasons,
-            price: signal.price
-          });
+        // Save to database (alerts table)
+        try {
+          const { error } = await supabase
+            .from('alerts')
+            .insert({
+              asset: signal.asset,
+              action: signal.action,
+              score: signal.score,
+              confidence: signal.confidence,
+              reasons: signal.reasons,
+              price: signal.price
+            });
 
-        if (error) {
-          logger.error('Alert save failed', { provider: Provider.SUPABASE, error: error.message });
-        } else {
-          savedCount++;
+          if (error) {
+            if (error.code === '42P01') {
+              logger.debug('Alerts table not yet created - skipping DB save');
+            } else {
+              logger.warn('Alert save failed', { error: error.message });
+            }
+          } else {
+            savedCount++;
+          }
+        } catch (dbError) {
+          logger.warn('Alert DB save error', { error: dbError.message });
         }
 
         // Send via Telegram to all subscribers
-        if (bot.isActive() && (signal.action === 'BUY' || signal.action === 'SELL')) {
+        if (bot.isActive()) {
           const result = await bot.broadcastAlert(signal);
           if (result.sent > 0) {
             telegramCount += result.sent;
             logger.info('Telegram alert sent', {
               asset: signal.asset,
               action: signal.action,
+              confidence: signal.confidence,
               sent: result.sent,
               total: result.total
             });
           }
         }
 
-        // Send via email for high-confidence BUY/SELL signals
-        if (resend && (signal.action === 'BUY' || signal.action === 'SELL')) {
+        // Send via email
+        if (resend) {
           const emailResult = await sendEmailAlert(
             ALERT_EMAIL,
             `${signal.action === 'BUY' ? '🟢' : '🔴'} SENTIX PRO: ${signal.action} ${signal.asset} (${signal.confidence}%)`,
@@ -645,14 +818,14 @@ async function processAlerts() {
           if (emailResult.success) emailCount++;
         }
 
-        // Mark as recently sent (clear after 30 minutes)
+        // Mark as recently sent (clear after 20 minutes for faster re-alerting)
         recentAlertKeys.add(alertKey);
-        setTimeout(() => recentAlertKeys.delete(alertKey), 30 * 60 * 1000);
+        setTimeout(() => recentAlertKeys.delete(alertKey), 20 * 60 * 1000);
       }
     }
 
     logger.info('Alerts processed', {
-      signals: signals.length,
+      totalSignals: signals.length,
       saved: savedCount,
       telegram: telegramCount,
       email: emailCount
@@ -690,8 +863,21 @@ app.get('/api/market', (req, res) => {
   res.json(cachedMarketData);
 });
 
-app.get('/api/signals', (req, res) => {
-  res.json(cachedSignals);
+app.get('/api/signals', async (req, res) => {
+  // Return in-memory signals if available
+  if (cachedSignals.length > 0) {
+    return res.json(cachedSignals);
+  }
+
+  // Fallback: load from database if in-memory is empty (e.g. after restart)
+  const persisted = await loadPersistedSignals();
+  if (persisted.length > 0) {
+    cachedSignals = persisted;
+    return res.json(persisted);
+  }
+
+  // No signals available yet
+  res.json([]);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1372,8 +1558,101 @@ app.delete('/api/portfolio/:userId/:positionId', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 if (bot.isActive()) {
-  setupTelegramCommands(bot, () => cachedMarketData, () => cachedSignals);
-  logger.info('Telegram commands registered');
+  // Custom command setup that persists subscribers to Supabase
+  bot.onText(/\/start/, async (msg) => {
+    const chatId = msg.chat.id;
+    bot.subscribe(chatId);
+    await saveTelegramSubscriber(chatId);
+    await bot.sendMessage(
+      chatId,
+      '🚀 *SENTIX Pro Bot Activado*\n\n' +
+      '✅ Suscrito a alertas automáticas\n' +
+      '📊 Recibirás señales de crypto, oro y plata\n\n' +
+      'Comandos:\n' +
+      '/señales - Señales activas\n' +
+      '/precio [ASSET] - Precio actual\n' +
+      '/mercado - Resumen del mercado\n' +
+      '/stop - Detener alertas',
+      { parse_mode: 'Markdown' }
+    );
+  });
+
+  bot.onText(/\/stop/, async (msg) => {
+    const chatId = msg.chat.id;
+    bot.unsubscribe(chatId);
+    await removeTelegramSubscriber(chatId);
+    await bot.sendMessage(chatId, '🔕 Alertas desactivadas.\nEnvía /start para reactivarlas.', { parse_mode: 'Markdown' });
+  });
+
+  bot.onText(/\/se[ñn]ales/, async (msg) => {
+    const chatId = msg.chat.id;
+    const signals = cachedSignals || [];
+
+    if (!signals || signals.length === 0) {
+      await bot.sendMessage(chatId, '📊 Generando señales... intenta de nuevo en 1 minuto.');
+      return;
+    }
+
+    let message = '🎯 *Señales Activas*\n\n';
+    // Show top 8 signals (including metals)
+    signals.slice(0, 8).forEach(s => {
+      const emoji = s.action === 'BUY' ? '🟢' : s.action === 'SELL' ? '🔴' : '⚪';
+      message += `${emoji} *${s.asset}* - ${s.strengthLabel || s.action}\n`;
+      message += `   Score: ${s.score} | Conf: ${s.confidence}%\n`;
+      message += `   $${Number(s.price).toLocaleString()}\n\n`;
+    });
+
+    await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+  });
+
+  bot.onText(/\/precio (.+)/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    const asset = match[1].toLowerCase();
+    const marketData = cachedMarketData;
+
+    if (marketData?.crypto?.[asset]) {
+      const data = marketData.crypto[asset];
+      await bot.sendMessage(chatId,
+        `💎 *${asset.toUpperCase()}*\nPrecio: $${data.price.toLocaleString()}\n24h: ${data.change24h >= 0 ? '+' : ''}${data.change24h.toFixed(2)}%`,
+        { parse_mode: 'Markdown' }
+      );
+    } else if (asset.includes('gold') || asset.includes('oro')) {
+      const gold = marketData?.metals?.gold;
+      if (gold) {
+        await bot.sendMessage(chatId, `🥇 *ORO (XAU)*\nPrecio: $${gold.price.toLocaleString()}\n24h: ${(gold.change24h || 0).toFixed(2)}%`, { parse_mode: 'Markdown' });
+      }
+    } else if (asset.includes('silver') || asset.includes('plata')) {
+      const silver = marketData?.metals?.silver;
+      if (silver) {
+        await bot.sendMessage(chatId, `🥈 *PLATA (XAG)*\nPrecio: $${silver.price.toLocaleString()}\n24h: ${(silver.change24h || 0).toFixed(2)}%`, { parse_mode: 'Markdown' });
+      }
+    } else {
+      await bot.sendMessage(chatId, '❌ Asset no encontrado. Usa: bitcoin, ethereum, solana, oro, plata, etc.');
+    }
+  });
+
+  bot.onText(/\/mercado/, async (msg) => {
+    const chatId = msg.chat.id;
+    const marketData = cachedMarketData;
+
+    if (marketData?.macro) {
+      let message = `📊 *Resumen del Mercado*\n\n` +
+        `Fear & Greed: ${marketData.macro.fearGreed}/100 (${marketData.macro.fearLabel})\n` +
+        `BTC Dom: ${marketData.macro.btcDom}%\n` +
+        `Market Cap: $${(marketData.macro.globalMcap / 1e12).toFixed(2)}T\n`;
+
+      if (marketData.metals?.gold) {
+        message += `\n🥇 Oro: $${marketData.metals.gold.price.toLocaleString()}\n`;
+        message += `🥈 Plata: $${marketData.metals.silver?.price?.toLocaleString() || 'N/A'}`;
+      }
+
+      await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
+    } else {
+      await bot.sendMessage(chatId, '⏳ Datos cargando...');
+    }
+  });
+
+  logger.info('Telegram commands registered (with persistence)');
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1401,23 +1680,87 @@ app.use('/api/', createRateLimiter(60000, 100));
 // Export app for testing, only listen when run directly
 if (require.main === module) {
   app.listen(PORT, async () => {
-    logger.info('SENTIX PRO Backend v2.3.0-phase1 started', {
+    logger.info('SENTIX PRO Backend v3.0 started', {
       port: PORT,
       env: process.env.NODE_ENV || 'development',
       telegram: bot.isActive() ? 'active' : 'disabled',
       email: resend ? 'active' : 'disabled',
-      phase1: {
-        binance: 'active',
-        featureStore: 'active',
-        sse: 'active'
-      }
+      features: ['binance-ohlcv', 'gold-silver-signals', 'signal-persistence', 'sse']
     });
 
+    // Load persisted signals immediately (so /api/signals returns data right away)
+    const persisted = await loadPersistedSignals();
+    if (persisted.length > 0) {
+      cachedSignals = persisted;
+      logger.info('Loaded persisted signals', { count: persisted.length });
+    }
+
+    // Load Telegram subscribers from database
+    await loadTelegramSubscribers();
+
+    // Fetch fresh market data and generate new signals
     await updateMarketData();
     await generateSignals();
 
-    logger.info('Initial market data loaded - Phase 1 features enabled');
+    logger.info('Initial data loaded - signals active for crypto + gold + silver');
   });
+}
+
+/**
+ * Load Telegram subscriber chat IDs from Supabase (persist across restarts)
+ */
+async function loadTelegramSubscribers() {
+  if (!bot.isActive()) return;
+
+  try {
+    const { data, error } = await supabase
+      .from('telegram_subscribers')
+      .select('chat_id');
+
+    if (error) {
+      if (error.code === '42P01') {
+        logger.debug('telegram_subscribers table not yet created');
+      } else {
+        logger.warn('Could not load Telegram subscribers', { error: error.message });
+      }
+      return;
+    }
+
+    for (const row of data || []) {
+      bot.subscribe(row.chat_id);
+    }
+
+    logger.info('Telegram subscribers loaded', { count: (data || []).length });
+  } catch (error) {
+    logger.debug('Telegram subscriber load unavailable', { error: error.message });
+  }
+}
+
+/**
+ * Save a Telegram subscriber chat ID to Supabase
+ */
+async function saveTelegramSubscriber(chatId) {
+  try {
+    await supabase
+      .from('telegram_subscribers')
+      .upsert({ chat_id: chatId, subscribed_at: new Date().toISOString() }, { onConflict: 'chat_id' });
+  } catch (error) {
+    logger.debug('Could not persist Telegram subscriber', { error: error.message });
+  }
+}
+
+/**
+ * Remove a Telegram subscriber from Supabase
+ */
+async function removeTelegramSubscriber(chatId) {
+  try {
+    await supabase
+      .from('telegram_subscribers')
+      .delete()
+      .eq('chat_id', chatId);
+  } catch (error) {
+    logger.debug('Could not remove Telegram subscriber', { error: error.message });
+  }
 }
 
 module.exports = app;

@@ -29,7 +29,7 @@ const COINCAP_HISTORY_IDS = {
   bitcoin: 'bitcoin', ethereum: 'ethereum', binancecoin: 'binance-coin',
   solana: 'solana', cardano: 'cardano', ripple: 'xrp',
   polkadot: 'polkadot', dogecoin: 'dogecoin', 'avalanche-2': 'avalanche',
-  chainlink: 'chainlink'
+  chainlink: 'chainlink', 'pax-gold': 'pax-gold'
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
