@@ -391,6 +391,52 @@ async function fetchMetalsPrices() {
   return await fetchMetalsPricesSafe();
 }
 
+// DXY (Dollar Index) proxy via EUR/USD exchange rate
+// EUR is 57.6% of DXY basket, so inverse EUR/USD ≈ DXY direction
+let cachedDxy = { dxy: 100, dxyTrend: 'neutral', dxyChange: 0 };
+let lastDxyFetch = 0;
+const DXY_CACHE_TTL = 15 * 60 * 1000; // 15 minutes (DXY moves slowly)
+
+async function fetchDXY() {
+  // Use cache if fresh
+  if (Date.now() - lastDxyFetch < DXY_CACHE_TTL && cachedDxy.dxy !== 100) {
+    return cachedDxy;
+  }
+
+  try {
+    // Free forex API - EUR/USD rate (no key needed)
+    const response = await apiClient.get(
+      'https://open.er-api.com/v6/latest/USD',
+      { timeout: 8000 }
+    );
+
+    if (response.data && response.data.rates && response.data.rates.EUR) {
+      const eurUsd = 1 / response.data.rates.EUR; // EUR/USD rate
+      // DXY proxy: EUR is 57.6% of DXY, approximate index
+      // DXY ≈ 50.14348 * (1/EUR) ^ 0.576 * (1/JPY) ^ 0.136 * ...
+      // Simplified: use EUR/USD inverse scaled to DXY range (~90-115)
+      const dxy = (1 / eurUsd) * 120; // Approximate scaling
+
+      // Determine trend from previous value
+      let dxyTrend = 'stable';
+      const dxyChange = cachedDxy.dxy > 0 && cachedDxy.dxy !== 100
+        ? ((dxy - cachedDxy.dxy) / cachedDxy.dxy) * 100
+        : 0;
+      if (dxyChange > 0.1) dxyTrend = 'rising';
+      else if (dxyChange < -0.1) dxyTrend = 'falling';
+
+      cachedDxy = { dxy: parseFloat(dxy.toFixed(2)), dxyTrend, dxyChange: parseFloat(dxyChange.toFixed(3)) };
+      lastDxyFetch = Date.now();
+      logger.info('DXY fetched', { dxy: cachedDxy.dxy, trend: dxyTrend });
+      return cachedDxy;
+    }
+  } catch (error) {
+    logger.debug('DXY fetch failed, using cached/default', { error: error.message });
+  }
+
+  return cachedDxy;
+}
+
 async function updateMarketData() {
   try {
     logger.info('Updating market data');
@@ -400,10 +446,11 @@ async function updateMarketData() {
     const crypto = await fetchCryptoPrices();
 
     // Then fetch the rest in parallel (different APIs)
-    const [fearGreedData, globalData, metals] = await Promise.all([
+    const [fearGreedData, globalData, metals, dxyData] = await Promise.all([
       fetchFearGreed(),
       fetchGlobalData(),
-      fetchMetalsPrices()
+      fetchMetalsPrices(),
+      fetchDXY()
     ]);
 
     const cryptoCount = Object.keys(crypto).length;
@@ -412,7 +459,7 @@ async function updateMarketData() {
     if (cryptoCount > 0 || !cachedMarketData) {
       cachedMarketData = {
         crypto: cryptoCount > 0 ? crypto : (cachedMarketData?.crypto || {}),
-        macro: { ...fearGreedData, ...globalData },
+        macro: { ...fearGreedData, ...globalData, ...dxyData },
         metals,
         lastUpdate: new Date().toISOString()
       };
@@ -424,7 +471,7 @@ async function updateMarketData() {
       // Update only non-crypto data, keep existing crypto
       cachedMarketData = {
         ...cachedMarketData,
-        macro: { ...fearGreedData, ...globalData },
+        macro: { ...fearGreedData, ...globalData, ...dxyData },
         metals,
         lastUpdate: new Date().toISOString()
       };
@@ -452,9 +499,18 @@ async function generateSignals() {
 
   const fearGreed = cachedMarketData.macro?.fearGreed || 50;
 
+  // Build macro context for signal engine (BTC dominance + DXY)
+  const macroData = {
+    btcDom: parseFloat(cachedMarketData.macro?.btcDom) || 0,
+    btcChange24h: cachedMarketData.crypto?.bitcoin?.change24h || 0,
+    dxy: cachedMarketData.macro?.dxy || 100,
+    dxyTrend: cachedMarketData.macro?.dxyTrend || 'neutral',
+    dxyChange: cachedMarketData.macro?.dxyChange || 0
+  };
+
   // ─── CRYPTO SIGNALS ─────────────────────────────────────────────────
   const assets = Object.entries(cachedMarketData.crypto);
-  logger.info('Generating signals', { assets: assets.length, fearGreed });
+  logger.info('Generating signals', { assets: assets.length, fearGreed, btcDom: macroData.btcDom, dxy: macroData.dxy });
 
   for (const [assetId, data] of assets) {
     try {
@@ -471,14 +527,15 @@ async function generateSignals() {
         logger.debug('Derivatives unavailable', { asset: assetId });
       }
 
-      // Multi-timeframe analysis (4H + 1H + 15M confluence)
+      // Multi-timeframe analysis (4H + 1H + 15M confluence) + macro context
       const signal = await generateMultiTimeframeSignal(
         assetId,
         data.price,
         data.change24h,
         data.volume24h,
         fearGreed,
-        derivativesData
+        derivativesData,
+        macroData
       );
 
       signal.assetClass = 'crypto';
@@ -613,6 +670,7 @@ async function persistSignals(signals) {
           trade_levels: s.tradeLevels || null,
           derivatives: s.derivatives || null,
           timeframes: s.timeframes || null,
+          macro_context: s.macroContext || null,
           data_source: s.dataSource || 'unknown',
           interval_tf: s.interval || 'multi',
           asset_class: s.assetClass || 'crypto',
@@ -665,6 +723,7 @@ async function loadPersistedSignals() {
       tradeLevels: s.trade_levels || null,
       derivatives: s.derivatives || null,
       timeframes: s.timeframes || null,
+      macroContext: s.macro_context || null,
       dataSource: s.data_source,
       interval: s.interval_tf,
       assetClass: s.asset_class,
@@ -1667,6 +1726,7 @@ if (bot.isActive()) {
       let message = `📊 *Resumen del Mercado*\n\n` +
         `Fear & Greed: ${marketData.macro.fearGreed}/100 (${marketData.macro.fearLabel})\n` +
         `BTC Dom: ${marketData.macro.btcDom}%\n` +
+        `DXY: ${marketData.macro.dxy || '—'} (${marketData.macro.dxyTrend || 'N/A'})\n` +
         `Market Cap: $${(marketData.macro.globalMcap / 1e12).toFixed(2)}T\n`;
 
       if (marketData.metals?.gold) {
