@@ -299,11 +299,17 @@ export default function SentixProFrontend() {
               sublabel: "Market share",
               color: amber 
             },
-            { 
-              label: "Total Market Cap", 
+            {
+              label: "DXY (Dollar)",
+              value: marketData.macro?.dxy || '—',
+              sublabel: marketData.macro?.dxyTrend === 'rising' ? 'Rising (bearish crypto)' : marketData.macro?.dxyTrend === 'falling' ? 'Falling (bullish crypto)' : 'Stable',
+              color: marketData.macro?.dxyTrend === 'rising' ? red : marketData.macro?.dxyTrend === 'falling' ? green : muted
+            },
+            {
+              label: "Total Market Cap",
               value: formatLargeNumber(marketData.macro?.globalMcap || 0),
               sublabel: "All cryptocurrencies",
-              color: blue 
+              color: blue
             },
             { 
               label: "Gold Price", 
@@ -581,6 +587,21 @@ export default function SentixProFrontend() {
                           <div style={{ fontSize: 9, color: muted }}>{signal.tradeLevels.takeProfit2Percent?.toFixed(1)}%</div>
                         </div>
                       </div>
+                      {/* Trailing Stop Row */}
+                      {signal.tradeLevels.trailingStop && (
+                        <div style={{ marginTop: 6, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                          <div>
+                            <div style={{ fontSize: 9, color: amber }}>TRAILING STOP</div>
+                            <div style={{ fontSize: 12, fontWeight: 700, color: amber }}>{formatPrice(signal.tradeLevels.trailingStop)}</div>
+                            <div style={{ fontSize: 9, color: muted }}>{signal.tradeLevels.trailingStopPercent?.toFixed(1)}%</div>
+                          </div>
+                          <div>
+                            <div style={{ fontSize: 9, color: muted }}>ACTIVA EN</div>
+                            <div style={{ fontSize: 12, fontWeight: 700, color: text }}>{formatPrice(signal.tradeLevels.trailingActivation)}</div>
+                            <div style={{ fontSize: 9, color: muted }}>+{Math.abs(signal.tradeLevels.trailingActivationPercent || 0).toFixed(1)}% profit</div>
+                          </div>
+                        </div>
+                      )}
                       <div style={{ marginTop: 6, display: "flex", gap: 12, alignItems: "center" }}>
                         <div style={{ fontSize: 10, color: signal.tradeLevels.riskRewardOk ? green : red, fontWeight: 700 }}>
                           R:R {signal.tradeLevels.riskRewardRatio?.toFixed(2) || '—'}
@@ -627,6 +648,38 @@ export default function SentixProFrontend() {
                           textTransform: "uppercase"
                         }}>
                           {signal.derivatives.sentiment.replace(/_/g, ' ')}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Macro Context */}
+                  {signal.macroContext && (
+                    <div style={{ display: "flex", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+                      {signal.macroContext.btcDomRegime && signal.macroContext.btcDomRegime !== 'neutral' && (
+                        <div style={{
+                          fontSize: 9,
+                          color: signal.macroContext.btcDomRegime === 'alt_season' ? green : red,
+                          fontWeight: 700,
+                          background: `${signal.macroContext.btcDomRegime === 'alt_season' ? green : red}15`,
+                          padding: "2px 8px",
+                          borderRadius: 4,
+                          textTransform: "uppercase"
+                        }}>
+                          {signal.macroContext.btcDomRegime === 'alt_season' ? 'ALT SEASON' : 'BTC SEASON'} ({signal.macroContext.btcDominance}%)
+                        </div>
+                      )}
+                      {signal.macroContext.dxyRegime && signal.macroContext.dxyRegime !== 'neutral' && (
+                        <div style={{
+                          fontSize: 9,
+                          color: signal.macroContext.dxyRegime === 'risk_on' ? green : red,
+                          fontWeight: 700,
+                          background: `${signal.macroContext.dxyRegime === 'risk_on' ? green : red}15`,
+                          padding: "2px 8px",
+                          borderRadius: 4,
+                          textTransform: "uppercase"
+                        }}>
+                          DXY {signal.macroContext.dxy} {signal.macroContext.dxyRegime === 'risk_on' ? 'RISK ON' : 'RISK OFF'}
                         </div>
                       )}
                     </div>

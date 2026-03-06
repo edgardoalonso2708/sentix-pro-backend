@@ -639,6 +639,23 @@ function calculateTradeLevels(action, currentPrice, support, resistance, pivot, 
   const tp1Percent = ((takeProfit1 - entry) / entry) * 100;
   const tp2Percent = ((takeProfit2 - entry) / entry) * 100;
 
+  // Trailing stop: wider than static SL to allow volatility, tightens as trade moves in profit
+  // ATR × 2.5 for crypto (wider than stocks due to high volatility)
+  const trailingMultiplier = 2.5;
+  let trailingStop, trailingActivation;
+  if (action === 'BUY') {
+    trailingStop = entry - (atr * trailingMultiplier);
+    trailingActivation = entry + atr; // Activate after 1 ATR profit
+  } else {
+    trailingStop = entry + (atr * trailingMultiplier);
+    trailingActivation = entry - atr;
+  }
+  trailingStop = Math.max(0.01, trailingStop);
+  trailingActivation = Math.max(0.01, trailingActivation);
+
+  const trailingStopPercent = ((trailingStop - entry) / entry) * 100;
+  const trailingActivationPercent = ((trailingActivation - entry) / entry) * 100;
+
   // Use appropriate decimal precision based on price magnitude
   const decimals = currentPrice > 100 ? 2 : currentPrice > 1 ? 4 : 6;
   const round = (v) => parseFloat(v.toFixed(decimals));
@@ -651,6 +668,11 @@ function calculateTradeLevels(action, currentPrice, support, resistance, pivot, 
     takeProfit1Percent: Math.round(tp1Percent * 100) / 100,
     takeProfit2: round(takeProfit2),
     takeProfit2Percent: Math.round(tp2Percent * 100) / 100,
+    trailingStop: round(trailingStop),
+    trailingStopPercent: Math.round(trailingStopPercent * 100) / 100,
+    trailingActivation: round(trailingActivation),
+    trailingActivationPercent: Math.round(trailingActivationPercent * 100) / 100,
+    trailingStepATR: round(atr), // Each step = 1 ATR
     riskRewardRatio: Math.round(riskRewardRatio * 100) / 100,
     riskRewardOk: riskRewardRatio >= 1.5,
     atrValue: round(atr),
@@ -736,12 +758,112 @@ function scoreDerivatives(derivatives, currentScore, priceChange) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SIGNAL GENERATION ENGINE v4.0
-// Strategy: Multi-factor weighted scoring with trend context
-// + Trade levels (SL/TP/R:R) + Derivatives sentiment + Multi-timeframe
+// MACRO CONTEXT SCORING
+// BTC Dominance correlation + DXY regime for macro-aware signals
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, interval = '1h', derivativesData = null) {
+/**
+ * Score BTC dominance impact on altcoins.
+ * Rising BTC dominance + BTC price drop = alts bleed harder.
+ * Falling BTC dominance = alt season, bullish for alts.
+ * @param {number} btcDom - Current BTC dominance % (e.g. 55.3)
+ * @param {number} btcChange24h - BTC 24h price change %
+ * @param {string} assetId - CoinGecko asset ID
+ * @param {number} assetChange24h - This asset's 24h change %
+ */
+function scoreBtcDominance(btcDom, btcChange24h, assetId, assetChange24h) {
+  // BTC itself is unaffected by its own dominance metric
+  if (assetId === 'bitcoin' || !btcDom || btcDom <= 0) {
+    return { scoreModifier: 0, confidenceModifier: 0, signals: [], regime: 'neutral' };
+  }
+
+  let scoreModifier = 0;
+  let confidenceModifier = 0;
+  const signals = [];
+  let regime = 'neutral';
+
+  // BTC dominance rising (>50%) + BTC price dropping = capital fleeing alts → bearish alts
+  if (btcDom > 55 && btcChange24h < -2) {
+    scoreModifier = -10;
+    confidenceModifier = 3;
+    regime = 'btc_season';
+    signals.push(`BTC dominance ${btcDom}% + BTC falling - alt blood bath risk`);
+  } else if (btcDom > 55 && btcChange24h > 2) {
+    // BTC dominance high + BTC pumping = money flowing to BTC not alts
+    scoreModifier = -5;
+    regime = 'btc_season';
+    signals.push(`BTC dominance ${btcDom}% + BTC rising - capital in BTC`);
+  } else if (btcDom < 45 && btcChange24h > 0) {
+    // Low BTC dominance + BTC stable/up = alt season
+    scoreModifier = 8;
+    confidenceModifier = 3;
+    regime = 'alt_season';
+    signals.push(`BTC dominance low ${btcDom}% - alt season active`);
+  } else if (btcDom < 50 && assetChange24h > btcChange24h + 3) {
+    // Alt outperforming BTC significantly = money rotating into alts
+    scoreModifier = 5;
+    regime = 'alt_season';
+    signals.push('Alt outperforming BTC - rotation signal');
+  } else if (btcDom > 52 && assetChange24h < btcChange24h - 3) {
+    // Alt underperforming BTC significantly = money leaving alts
+    scoreModifier = -5;
+    regime = 'btc_season';
+    signals.push('Alt underperforming BTC - capital exiting alts');
+  }
+
+  return { scoreModifier, confidenceModifier, signals, regime };
+}
+
+/**
+ * Score DXY (Dollar Index) macro regime impact on crypto.
+ * Strong dollar = bearish crypto, weak dollar = bullish crypto.
+ * @param {number} dxy - DXY index value (typically 90-115)
+ * @param {string} dxyTrend - 'rising', 'falling', or 'stable'
+ * @param {number} dxyChange - DXY % change (optional)
+ */
+function scoreDxyMacro(dxy, dxyTrend, dxyChange) {
+  if (!dxy || dxy <= 0) {
+    return { scoreModifier: 0, confidenceModifier: 0, signals: [], regime: 'neutral' };
+  }
+
+  let scoreModifier = 0;
+  let confidenceModifier = 0;
+  const signals = [];
+  let regime = 'neutral';
+
+  if (dxy > 105 && dxyTrend === 'rising') {
+    scoreModifier = -8;
+    confidenceModifier = -3;
+    regime = 'risk_off';
+    signals.push(`DXY strong ${dxy.toFixed(1)} & rising - risk-off for crypto`);
+  } else if (dxy > 103 && dxyTrend === 'rising') {
+    scoreModifier = -4;
+    regime = 'risk_off';
+    signals.push(`DXY elevated ${dxy.toFixed(1)} & rising - mild headwind`);
+  } else if (dxy < 98 && dxyTrend === 'falling') {
+    scoreModifier = 10;
+    confidenceModifier = 3;
+    regime = 'risk_on';
+    signals.push(`DXY weak ${dxy.toFixed(1)} & falling - risk-on for crypto`);
+  } else if (dxy < 100 && dxyTrend === 'falling') {
+    scoreModifier = 6;
+    regime = 'risk_on';
+    signals.push(`DXY below 100 ${dxy.toFixed(1)} & falling - bullish macro`);
+  } else if (dxy > 103) {
+    scoreModifier = -2;
+    signals.push(`DXY elevated ${dxy.toFixed(1)} - watchful`);
+  }
+
+  return { scoreModifier, confidenceModifier, signals, regime };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIGNAL GENERATION ENGINE v4.5
+// Strategy: Multi-factor weighted scoring with trend context
+// + Trade levels (SL/TP/R:R) + Derivatives + Macro context + Multi-timeframe
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, interval = '1h', derivativesData = null, macroData = null) {
   try {
     // Fetch candles - 168 for 1h (7 days), more for lower timeframes
     const candleLimit = interval === '1h' ? 200 : (interval.includes('m') ? 288 : 100);
@@ -1029,6 +1151,26 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
     confidence += derivativesScoring.confidenceModifier;
     signals.push(...derivativesScoring.signals);
 
+    // ─── 12. BTC DOMINANCE CORRELATION ────────────────────────────────
+    // Weight: up to ±10 score, up to 3 confidence
+    let btcDomScoring = { scoreModifier: 0, confidenceModifier: 0, signals: [], regime: 'neutral' };
+    if (macroData) {
+      btcDomScoring = scoreBtcDominance(macroData.btcDom, macroData.btcChange24h, asset, change24h);
+      score += btcDomScoring.scoreModifier;
+      confidence += btcDomScoring.confidenceModifier;
+      signals.push(...btcDomScoring.signals);
+    }
+
+    // ─── 13. DXY MACRO REGIME ─────────────────────────────────────────
+    // Weight: up to ±10 score, up to 3 confidence
+    let dxyScoring = { scoreModifier: 0, confidenceModifier: 0, signals: [], regime: 'neutral' };
+    if (macroData) {
+      dxyScoring = scoreDxyMacro(macroData.dxy, macroData.dxyTrend, macroData.dxyChange);
+      score += dxyScoring.scoreModifier;
+      confidence += dxyScoring.confidenceModifier;
+      signals.push(...dxyScoring.signals);
+    }
+
     // ─── SIGNAL AGREEMENT ANALYSIS ──────────────────────────────────
     // Count how many factors agree vs disagree
     const bullishFactors = [
@@ -1139,6 +1281,12 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
         longShortRatio: derivativesData.longShortRatio,
         sentiment: derivativesScoring.sentiment
       } : null,
+      macroContext: macroData ? {
+        btcDominance: macroData.btcDom,
+        btcDomRegime: btcDomScoring.regime,
+        dxy: macroData.dxy,
+        dxyRegime: dxyScoring.regime
+      } : null,
       dataSource: 'Binance OHLCV',
       interval,
       candlesAnalyzed: ohlcvData.length,
@@ -1180,13 +1328,14 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
  * @param {Object|null} derivativesData
  * @returns {Promise<Object>} Merged signal with confluence data
  */
-async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volume, fearGreed, derivativesData = null) {
+async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volume, fearGreed, derivativesData = null, macroData = null) {
   // Run all three timeframes in parallel
   // Pass derivatives only to 1h (primary) to avoid triple-counting
+  // Pass macroData only to 1h to avoid triple-counting macro impact
   const [signal4h, signal1h, signal15m] = await Promise.all([
-    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '4h', null),
-    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '1h', derivativesData),
-    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '15m', null)
+    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '4h', null, null),
+    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '1h', derivativesData, macroData),
+    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '15m', null, null)
   ]);
 
   // Classify each timeframe's direction
@@ -1197,9 +1346,9 @@ async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volu
   };
 
   const trends = {
-    tf4h: getTrend(signal4h),
-    tf1h: getTrend(signal1h),
-    tf15m: getTrend(signal15m)
+    '4h': getTrend(signal4h),
+    '1h': getTrend(signal1h),
+    '15m': getTrend(signal15m)
   };
 
   const bullishCount = Object.values(trends).filter(t => t === 'bullish').length;
@@ -1237,11 +1386,11 @@ async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volu
   }
 
   // 4h is the "governor" - don't fight the macro trend
-  if (trends.tf4h === 'bearish' && mergedRawScore > 0) {
+  if (trends['4h'] === 'bearish' && mergedRawScore > 0) {
     mergedRawScore *= 0.5;
     confidenceBonus -= 5;
     confluenceReasons.push('4H bearish governs - dampened bullish signal');
-  } else if (trends.tf4h === 'bullish' && mergedRawScore < 0) {
+  } else if (trends['4h'] === 'bullish' && mergedRawScore < 0) {
     mergedRawScore *= 0.5;
     confidenceBonus -= 5;
     confluenceReasons.push('4H bullish governs - dampened bearish signal');
@@ -1283,11 +1432,11 @@ async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volu
   // Confluence info
   allReasons.push(...confluenceReasons);
   // Timeframe-specific notes
-  if (trends.tf4h !== trends.tf1h) {
-    allReasons.push(`4H trend: ${trends.tf4h}`);
+  if (trends['4h'] !== trends['1h']) {
+    allReasons.push(`4H trend: ${trends['4h']}`);
   }
-  if (trends.tf15m !== trends.tf1h) {
-    allReasons.push(`15M trend: ${trends.tf15m}`);
+  if (trends['15m'] !== trends['1h']) {
+    allReasons.push(`15M trend: ${trends['15m']}`);
   }
 
   // Recalculate trade levels with merged action
@@ -1314,6 +1463,7 @@ async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volu
     indicators: signal1h.indicators,
     tradeLevels,
     derivatives: signal1h.derivatives || null,
+    macroContext: signal1h.macroContext || null,
     dataSource: 'Binance OHLCV (Multi-TF)',
     interval: 'multi',
     candlesAnalyzed: (signal4h.candlesAnalyzed || 0) + (signal1h.candlesAnalyzed || 0) + (signal15m.candlesAnalyzed || 0),
@@ -1321,20 +1471,20 @@ async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volu
 
     // Multi-timeframe confluence data
     timeframes: {
-      tf4h: {
-        trend: trends.tf4h,
+      '4h': {
+        trend: trends['4h'],
         score: signal4h.rawScore,
         confidence: signal4h.confidence,
         action: signal4h.action
       },
-      tf1h: {
-        trend: trends.tf1h,
+      '1h': {
+        trend: trends['1h'],
         score: signal1h.rawScore,
         confidence: signal1h.confidence,
         action: signal1h.action
       },
-      tf15m: {
-        trend: trends.tf15m,
+      '15m': {
+        trend: trends['15m'],
         score: signal15m.rawScore,
         confidence: signal15m.confidence,
         action: signal15m.action
@@ -1362,6 +1512,8 @@ module.exports = {
   detectBBSqueeze,
   calculateTradeLevels,
   scoreDerivatives,
+  scoreBtcDominance,
+  scoreDxyMacro,
   generateSignalWithRealData,
   generateMultiTimeframeSignal
 };
