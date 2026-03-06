@@ -376,36 +376,53 @@ export default function SentixProFrontend() {
           <div style={card}>
             <div style={sTitle}>🎯 SEÑALES ACTIVAS (Top 5)</div>
             <div style={{ display: "grid", gap: 10 }}>
-              {signals.slice(0, 5).map((signal, i) => (
-                <div key={i} style={{
-                  background: bg3,
-                  borderLeft: `3px solid ${signal.action === 'BUY' ? green : signal.action === 'SELL' ? red : amber}`,
-                  borderRadius: 6,
-                  padding: "10px 14px",
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                  flexWrap: "wrap",
-                  gap: 10
-                }}>
-                  <div style={{ flex: 1, minWidth: 200 }}>
-                    <div style={{ fontSize: 13, fontWeight: 700 }}>
-                      {signal.action === 'BUY' ? '🟢' : signal.action === 'SELL' ? '🔴' : '⚪'} {signal.asset}
+              {signals.slice(0, 5).map((signal, i) => {
+                const ac = signal.action === 'BUY' ? green : signal.action === 'SELL' ? red : amber;
+                const cc = signal.timeframes?.confluence === 'strong' ? green : signal.timeframes?.confluence === 'moderate' ? amber : signal.timeframes?.confluence === 'conflicting' ? red : muted;
+                return (
+                  <div key={i} style={{
+                    background: bg3,
+                    borderLeft: `3px solid ${ac}`,
+                    borderRadius: 6,
+                    padding: "10px 14px",
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                    gap: 10
+                  }}>
+                    <div style={{ flex: 1, minWidth: 200 }}>
+                      <div style={{ fontSize: 13, fontWeight: 700, display: "flex", alignItems: "center", gap: 6 }}>
+                        {signal.action === 'BUY' ? '🟢' : signal.action === 'SELL' ? '🔴' : '⚪'} {signal.asset}
+                        {signal.timeframes?.confluence && (
+                          <span style={{
+                            fontSize: 8,
+                            color: cc,
+                            fontWeight: 700,
+                            background: `${cc}18`,
+                            padding: "2px 6px",
+                            borderRadius: 3,
+                            textTransform: "uppercase"
+                          }}>
+                            {signal.timeframes.confluence === 'strong' ? '3/3' : signal.timeframes.confluence === 'moderate' ? '2/3' : '!'}
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ fontSize: 11, color: muted, marginTop: 2 }}>
+                        {signal.tradeLevels ? `R:R ${signal.tradeLevels.riskRewardRatio?.toFixed(1)} · ` : ''}{signal.reasons?.substring(0, 80)}{signal.reasons?.length > 80 ? '...' : ''}
+                      </div>
                     </div>
-                    <div style={{ fontSize: 11, color: muted, marginTop: 2 }}>
-                      {signal.reasons}
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ fontSize: 12, color: amber, fontWeight: 700 }}>
+                        {signal.confidence}% confianza
+                      </div>
+                      <div style={{ fontSize: 11, color: muted }}>
+                        Score: {signal.score}/100
+                      </div>
                     </div>
                   </div>
-                  <div style={{ textAlign: "right" }}>
-                    <div style={{ fontSize: 12, color: amber, fontWeight: 700 }}>
-                      {signal.confidence}% confianza
-                    </div>
-                    <div style={{ fontSize: 11, color: muted }}>
-                      Score: {signal.score}/100
-                    </div>
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
             <button
               onClick={() => setTab('signals')}
@@ -431,44 +448,67 @@ export default function SentixProFrontend() {
   };
 
   const SignalsTab = () => {
+    const confluenceColor = (c) => c === 'strong' ? green : c === 'moderate' ? amber : c === 'conflicting' ? red : muted;
+    const confluenceLabel = (c) => c === 'strong' ? 'CONFLUENCIA FUERTE' : c === 'moderate' ? 'CONFLUENCIA MODERADA' : c === 'conflicting' ? 'CONFLICTO' : 'DEBIL';
+    const actionColor = (a) => a === 'BUY' ? green : a === 'SELL' ? red : amber;
+    const tfLabel = { '4h': '4H', '1h': '1H', '15m': '15M' };
+
     return (
       <div>
         <div style={card}>
           <div style={sTitle}>🎯 TODAS LAS SEÑALES ACTIVAS</div>
-          
+
           {signals.length === 0 ? (
             <div style={{ padding: 30, textAlign: "center", color: muted }}>
-              No hay señales de alta confianza en este momento
+              No hay señales en este momento
             </div>
           ) : (
-            <div style={{ display: "grid", gap: 12 }}>
+            <div style={{ display: "grid", gap: 14 }}>
               {signals.map((signal, i) => (
                 <div key={i} style={{
                   background: bg3,
-                  borderLeft: `4px solid ${signal.action === 'BUY' ? green : signal.action === 'SELL' ? red : amber}`,
+                  borderLeft: `4px solid ${actionColor(signal.action)}`,
                   borderRadius: 8,
                   padding: "14px 18px"
                 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10, flexWrap: "wrap", gap: 10 }}>
+                  {/* Header: Asset + Action + Confidence */}
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 8, flexWrap: "wrap", gap: 10 }}>
                     <div>
                       <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 4 }}>
                         {signal.action === 'BUY' ? '🟢' : signal.action === 'SELL' ? '🔴' : '⚪'} {signal.asset}
                       </div>
                       <div style={{ fontSize: 13, color: muted }}>
-                        {formatPrice(signal.price)} · {signal.change24h >= 0 ? '+' : ''}{signal.change24h.toFixed(2)}% 24h
+                        {formatPrice(signal.price)} · {signal.change24h >= 0 ? '+' : ''}{signal.change24h?.toFixed(2) || '0.00'}% 24h
                       </div>
                     </div>
-                    <div style={{ textAlign: "right" }}>
-                      <div style={{
-                        fontSize: 11,
-                        color: signal.action === 'BUY' ? green : signal.action === 'SELL' ? red : amber,
-                        fontWeight: 700,
-                        background: `${signal.action === 'BUY' ? green : signal.action === 'SELL' ? red : amber}22`,
-                        padding: "4px 12px",
-                        borderRadius: 6,
-                        marginBottom: 6
-                      }}>
-                        {signal.action}
+                    <div style={{ textAlign: "right", display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                        {/* Confluence Badge */}
+                        {signal.timeframes?.confluence && (
+                          <div style={{
+                            fontSize: 9,
+                            color: confluenceColor(signal.timeframes.confluence),
+                            fontWeight: 700,
+                            background: `${confluenceColor(signal.timeframes.confluence)}18`,
+                            padding: "3px 8px",
+                            borderRadius: 4,
+                            letterSpacing: 0.5,
+                            textTransform: "uppercase"
+                          }}>
+                            {confluenceLabel(signal.timeframes.confluence)}
+                          </div>
+                        )}
+                        {/* Action Badge */}
+                        <div style={{
+                          fontSize: 11,
+                          color: actionColor(signal.action),
+                          fontWeight: 700,
+                          background: `${actionColor(signal.action)}22`,
+                          padding: "4px 12px",
+                          borderRadius: 6
+                        }}>
+                          {signal.action}
+                        </div>
                       </div>
                       <div style={{ fontSize: 12, color: amber, fontWeight: 700 }}>
                         {signal.confidence}% confianza
@@ -478,6 +518,121 @@ export default function SentixProFrontend() {
                       </div>
                     </div>
                   </div>
+
+                  {/* Timeframe Mini-Bar */}
+                  {signal.timeframes && signal.timeframes['4h'] && (
+                    <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+                      {['4h', '1h', '15m'].map(tf => {
+                        const tfData = signal.timeframes[tf];
+                        if (!tfData) return null;
+                        const tfActionColor = actionColor(tfData.action);
+                        return (
+                          <div key={tf} style={{
+                            flex: 1,
+                            background: bg2,
+                            borderRadius: 6,
+                            padding: "6px 8px",
+                            borderTop: `2px solid ${tfActionColor}`
+                          }}>
+                            <div style={{ fontSize: 10, color: muted, fontWeight: 700, marginBottom: 2 }}>
+                              {tfLabel[tf]}
+                            </div>
+                            <div style={{ fontSize: 11, color: tfActionColor, fontWeight: 700 }}>
+                              {tfData.action}
+                            </div>
+                            <div style={{ fontSize: 10, color: muted }}>
+                              {tfData.score}/100
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {/* Trade Levels Panel */}
+                  {signal.tradeLevels && signal.action !== 'HOLD' && (
+                    <div style={{
+                      background: bg2,
+                      borderRadius: 6,
+                      padding: "10px 12px",
+                      marginBottom: 10
+                    }}>
+                      <div style={{ fontSize: 10, color: muted, fontWeight: 700, marginBottom: 6, letterSpacing: 0.5 }}>
+                        NIVELES DE OPERACION
+                      </div>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 8 }}>
+                        <div>
+                          <div style={{ fontSize: 9, color: muted }}>ENTRADA</div>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: text }}>{formatPrice(signal.tradeLevels.entry)}</div>
+                        </div>
+                        <div>
+                          <div style={{ fontSize: 9, color: red }}>STOP LOSS</div>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: red }}>{formatPrice(signal.tradeLevels.stopLoss)}</div>
+                          <div style={{ fontSize: 9, color: muted }}>{signal.tradeLevels.stopLossPercent?.toFixed(1)}%</div>
+                        </div>
+                        <div>
+                          <div style={{ fontSize: 9, color: green }}>TP1</div>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: green }}>{formatPrice(signal.tradeLevels.takeProfit1)}</div>
+                          <div style={{ fontSize: 9, color: muted }}>{signal.tradeLevels.takeProfit1Percent?.toFixed(1)}%</div>
+                        </div>
+                        <div>
+                          <div style={{ fontSize: 9, color: green }}>TP2</div>
+                          <div style={{ fontSize: 12, fontWeight: 700, color: green }}>{formatPrice(signal.tradeLevels.takeProfit2)}</div>
+                          <div style={{ fontSize: 9, color: muted }}>{signal.tradeLevels.takeProfit2Percent?.toFixed(1)}%</div>
+                        </div>
+                      </div>
+                      <div style={{ marginTop: 6, display: "flex", gap: 12, alignItems: "center" }}>
+                        <div style={{ fontSize: 10, color: signal.tradeLevels.riskRewardOk ? green : red, fontWeight: 700 }}>
+                          R:R {signal.tradeLevels.riskRewardRatio?.toFixed(2) || '—'}
+                        </div>
+                        {!signal.tradeLevels.riskRewardOk && (
+                          <div style={{ fontSize: 9, color: red }}>
+                            ⚠ R:R bajo (&lt;1.5)
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Derivatives Row */}
+                  {signal.derivatives && signal.derivatives.fundingRate !== undefined && (
+                    <div style={{
+                      display: "flex",
+                      gap: 12,
+                      marginBottom: 10,
+                      flexWrap: "wrap"
+                    }}>
+                      <div style={{ fontSize: 11, color: muted }}>
+                        <span style={{ fontSize: 9, letterSpacing: 0.3 }}>FUNDING </span>
+                        <span style={{ color: signal.derivatives.fundingRate >= 0 ? green : red, fontWeight: 700 }}>
+                          {(signal.derivatives.fundingRate * 100).toFixed(4)}%
+                        </span>
+                      </div>
+                      {signal.derivatives.longShortRatio && (
+                        <div style={{ fontSize: 11, color: muted }}>
+                          <span style={{ fontSize: 9, letterSpacing: 0.3 }}>L/S </span>
+                          <span style={{ color: text, fontWeight: 700 }}>
+                            {signal.derivatives.longShortRatio.toFixed(2)}
+                          </span>
+                        </div>
+                      )}
+                      {signal.derivatives.sentiment && signal.derivatives.sentiment !== 'unavailable' && (
+                        <div style={{
+                          fontSize: 9,
+                          color: signal.derivatives.sentiment.includes('bullish') ? green : signal.derivatives.sentiment.includes('bearish') ? red : amber,
+                          fontWeight: 700,
+                          background: `${signal.derivatives.sentiment.includes('bullish') ? green : signal.derivatives.sentiment.includes('bearish') ? red : amber}15`,
+                          padding: "2px 8px",
+                          borderRadius: 4,
+                          textTransform: "uppercase"
+                        }}>
+                          {signal.derivatives.sentiment.replace(/_/g, ' ')}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Reasons */}
                   <div style={{ fontSize: 12, color: text, marginBottom: 8 }}>
                     {signal.reasons}
                   </div>
