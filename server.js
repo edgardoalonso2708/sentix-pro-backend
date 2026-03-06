@@ -13,7 +13,8 @@ const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 const { SilentTelegramBot, setupTelegramCommands } = require('./telegramBot');
 const { fetchMetalsPricesSafe } = require('./metalsAPI');
-const { generateSignalWithRealData } = require('./technicalAnalysis');
+const { generateSignalWithRealData, generateMultiTimeframeSignal } = require('./technicalAnalysis');
+const { fetchDerivativesData } = require('./binanceAPI');
 const {
   upload,
   parsePortfolioCSV,
@@ -462,71 +463,92 @@ async function generateSignals() {
         continue;
       }
 
-      const signal = await generateSignalWithRealData(
+      // Fetch derivatives data (funding rate, OI, L/S ratio)
+      let derivativesData = null;
+      try {
+        derivativesData = await fetchDerivativesData(assetId);
+      } catch (e) {
+        logger.debug('Derivatives unavailable', { asset: assetId });
+      }
+
+      // Multi-timeframe analysis (4H + 1H + 15M confluence)
+      const signal = await generateMultiTimeframeSignal(
         assetId,
         data.price,
         data.change24h,
         data.volume24h,
-        fearGreed
+        fearGreed,
+        derivativesData
       );
 
-      // Include ALL signals for display (user needs full visibility)
+      signal.assetClass = 'crypto';
       allSignals.push(signal);
 
-      // Delay between API calls to respect rate limits
+      // Delay between assets (OHLCV calls are parallel per asset, this is inter-asset)
       await new Promise(resolve => setTimeout(resolve, 1500));
     } catch (error) {
       logger.error('Signal generation failed', { asset: assetId, error: error.message });
     }
   }
 
-  // ─── GOLD SIGNAL (via PAXG) ──────────────────────────────────────────
+  // ─── GOLD SIGNAL (via PAXG - single timeframe, no futures) ─────────────
   if (cachedMarketData.metals?.gold) {
     try {
       const gold = cachedMarketData.metals.gold;
       if (gold.price > 0) {
         const goldSignal = await generateSignalWithRealData(
-          'pax-gold',  // Maps to PAXGUSDT on Binance
+          'pax-gold',
           gold.price,
           gold.change24h || 0,
           gold.volume24h || 0,
-          fearGreed
+          fearGreed,
+          '1h',
+          null  // No derivatives for PAXG
         );
-        // Rename asset for display
         goldSignal.asset = 'GOLD (XAU)';
         goldSignal.assetClass = 'metal';
         allSignals.push(goldSignal);
 
         await new Promise(resolve => setTimeout(resolve, 1500));
 
-        // ─── SILVER SIGNAL (derived from gold analysis) ─────────────
+        // ─── SILVER SIGNAL (derived from gold) ─────────────────────
         if (cachedMarketData.metals?.silver) {
           const silver = cachedMarketData.metals.silver;
           if (silver.price > 0) {
-            // Silver is ~85% correlated with gold but more volatile
-            // Use gold's technical analysis as base, amplify the score
             const silverSignal = { ...goldSignal };
             silverSignal.asset = 'SILVER (XAG)';
             silverSignal.price = silver.price;
             silverSignal.change24h = silver.change24h || (gold.change24h ? gold.change24h * 1.3 : 0);
-            // Silver is more volatile - amplify the raw score by 15%
             const amplifiedScore = Math.round(goldSignal.rawScore * 1.15);
             silverSignal.rawScore = Math.max(-100, Math.min(100, amplifiedScore));
             silverSignal.score = Math.round(Math.max(0, Math.min(100, (silverSignal.rawScore + 100) / 2)));
-            // Slightly lower confidence (derived, not direct analysis)
             silverSignal.confidence = Math.max(0, goldSignal.confidence - 5);
-            silverSignal.reasons = goldSignal.reasons + ' • Derived from gold correlation (silver/gold ~0.85)';
+            silverSignal.reasons = goldSignal.reasons + ' \u2022 Derived from gold correlation (silver/gold ~0.85)';
             silverSignal.dataSource = 'Gold correlation (PAXG OHLCV)';
             silverSignal.assetClass = 'metal';
+            silverSignal.derivatives = null;
+            // Recalculate trade levels for silver price
+            if (goldSignal.tradeLevels) {
+              const ratio = silver.price / gold.price;
+              silverSignal.tradeLevels = {
+                ...goldSignal.tradeLevels,
+                entry: parseFloat((goldSignal.tradeLevels.entry * ratio).toFixed(4)),
+                stopLoss: parseFloat((goldSignal.tradeLevels.stopLoss * ratio).toFixed(4)),
+                takeProfit1: parseFloat((goldSignal.tradeLevels.takeProfit1 * ratio).toFixed(4)),
+                takeProfit2: parseFloat((goldSignal.tradeLevels.takeProfit2 * ratio).toFixed(4)),
+                support: parseFloat((goldSignal.tradeLevels.support * ratio).toFixed(4)),
+                resistance: parseFloat((goldSignal.tradeLevels.resistance * ratio).toFixed(4)),
+                pivot: parseFloat((goldSignal.tradeLevels.pivot * ratio).toFixed(4)),
+                atrValue: parseFloat((goldSignal.tradeLevels.atrValue * ratio).toFixed(4))
+              };
+            }
 
-            // Recalculate action based on amplified score
             if (silverSignal.rawScore >= 25) silverSignal.action = 'BUY';
             else if (silverSignal.rawScore >= 15 && silverSignal.confidence >= 35) silverSignal.action = 'BUY';
             else if (silverSignal.rawScore <= -25) silverSignal.action = 'SELL';
             else if (silverSignal.rawScore <= -15 && silverSignal.confidence >= 35) silverSignal.action = 'SELL';
             else silverSignal.action = 'HOLD';
 
-            // Strength label
             if (silverSignal.action === 'BUY') {
               silverSignal.strengthLabel = silverSignal.rawScore >= 50 && silverSignal.confidence >= 55 ? 'STRONG BUY' :
                 silverSignal.rawScore >= 35 ? 'BUY' : 'WEAK BUY';
@@ -588,8 +610,11 @@ async function persistSignals(signals) {
           change_24h: s.change24h || 0,
           reasons: s.reasons,
           indicators: s.indicators || {},
+          trade_levels: s.tradeLevels || null,
+          derivatives: s.derivatives || null,
+          timeframes: s.timeframes || null,
           data_source: s.dataSource || 'unknown',
-          interval_tf: s.interval || '1h',
+          interval_tf: s.interval || 'multi',
           asset_class: s.assetClass || 'crypto',
           generated_at: s.timestamp || new Date().toISOString()
         })),
@@ -637,6 +662,9 @@ async function loadPersistedSignals() {
       change24h: s.change_24h,
       reasons: s.reasons,
       indicators: s.indicators,
+      tradeLevels: s.trade_levels || null,
+      derivatives: s.derivatives || null,
+      timeframes: s.timeframes || null,
       dataSource: s.data_source,
       interval: s.interval_tf,
       assetClass: s.asset_class,

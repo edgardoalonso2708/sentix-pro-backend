@@ -590,20 +590,158 @@ function detectBBSqueeze(prices, period = 20) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SIGNAL GENERATION ENGINE v3.0
-// Strategy: Multi-factor weighted scoring with trend context
-//
-// KEY CHANGES FROM v2:
-// 1. Confidence starts at 0 (not 50) - must be EARNED
-// 2. Score is bidirectional: positive = bullish, negative = bearish (not 0-100)
-// 3. Trend context determines how indicators are weighted
-// 4. Divergences add powerful contrarian signals
-// 5. ADX determines if we should even be trading (avoid ranging markets)
-// 6. Volume MUST confirm for high-confidence signals
-// 7. Fear & Greed is only a minor modifier, not a major signal
+// TRADE LEVEL CALCULATOR
+// Entry, Stop-Loss, Take-Profit, and Risk/Reward Ratio
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, interval = '1h') {
+/**
+ * Calculate trade entry, stop-loss, and take-profit levels using S/R + ATR
+ * @param {string} action - 'BUY', 'SELL', or 'HOLD'
+ * @param {number} currentPrice - Current market price
+ * @param {number} support - Calculated support level
+ * @param {number} resistance - Calculated resistance level
+ * @param {number} pivot - Pivot point
+ * @param {number} atr - Average True Range value
+ * @returns {Object|null} tradeLevels object or null if HOLD
+ */
+function calculateTradeLevels(action, currentPrice, support, resistance, pivot, atr) {
+  if (action === 'HOLD' || atr <= 0 || currentPrice <= 0) return null;
+
+  let entry, stopLoss, takeProfit1, takeProfit2;
+
+  if (action === 'BUY') {
+    entry = currentPrice;
+    // If price is near support, use support + small offset as entry
+    if (Math.abs(currentPrice - support) / currentPrice < 0.02) {
+      entry = support + (atr * 0.25);
+    }
+    stopLoss = support - (atr * 1.5);
+    takeProfit1 = resistance;
+    takeProfit2 = resistance + (atr * 2);
+  } else { // SELL
+    entry = currentPrice;
+    if (Math.abs(currentPrice - resistance) / currentPrice < 0.02) {
+      entry = resistance - (atr * 0.25);
+    }
+    stopLoss = resistance + (atr * 1.5);
+    takeProfit1 = support;
+    takeProfit2 = support - (atr * 2);
+  }
+
+  // Ensure stop-loss is positive
+  stopLoss = Math.max(0.01, stopLoss);
+
+  const risk = Math.abs(entry - stopLoss);
+  const reward = Math.abs(takeProfit1 - entry);
+  const riskRewardRatio = risk > 0 ? reward / risk : 0;
+
+  const stopLossPercent = ((stopLoss - entry) / entry) * 100;
+  const tp1Percent = ((takeProfit1 - entry) / entry) * 100;
+  const tp2Percent = ((takeProfit2 - entry) / entry) * 100;
+
+  // Use appropriate decimal precision based on price magnitude
+  const decimals = currentPrice > 100 ? 2 : currentPrice > 1 ? 4 : 6;
+  const round = (v) => parseFloat(v.toFixed(decimals));
+
+  return {
+    entry: round(entry),
+    stopLoss: round(stopLoss),
+    stopLossPercent: Math.round(stopLossPercent * 100) / 100,
+    takeProfit1: round(takeProfit1),
+    takeProfit1Percent: Math.round(tp1Percent * 100) / 100,
+    takeProfit2: round(takeProfit2),
+    takeProfit2Percent: Math.round(tp2Percent * 100) / 100,
+    riskRewardRatio: Math.round(riskRewardRatio * 100) / 100,
+    riskRewardOk: riskRewardRatio >= 1.5,
+    atrValue: round(atr),
+    support: round(support),
+    resistance: round(resistance),
+    pivot: round(pivot)
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DERIVATIVES SCORING
+// Funding Rate + Open Interest + Long/Short Ratio analysis
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Score derivatives data for signal modification
+ * @param {Object|null} derivatives - From fetchDerivativesData()
+ * @param {number} currentScore - Current raw score from technical analysis
+ * @param {number} priceChange - Recent price change %
+ * @returns {Object} { scoreModifier, confidenceModifier, signals[], sentiment }
+ */
+function scoreDerivatives(derivatives, currentScore, priceChange) {
+  if (!derivatives) return { scoreModifier: 0, confidenceModifier: 0, signals: [], sentiment: 'unavailable' };
+
+  let scoreModifier = 0;
+  let confidenceModifier = 0;
+  const signals = [];
+  let sentiment = 'neutral';
+
+  const fr = derivatives.fundingRatePercent || 0;
+  const lsr = derivatives.longShortRatio || 1;
+
+  // --- Funding Rate Analysis ---
+  // Extreme positive = over-leveraged longs → contrarian bearish
+  // Extreme negative = over-leveraged shorts → contrarian bullish
+  if (fr > 0.1) {
+    scoreModifier -= 15;
+    confidenceModifier += 5;
+    sentiment = 'over_leveraged_long';
+    signals.push(`Extreme funding (+${fr.toFixed(3)}%) - crowded longs, reversal risk`);
+  } else if (fr > 0.05) {
+    scoreModifier -= 7;
+    confidenceModifier += 3;
+    sentiment = 'over_leveraged_long';
+    signals.push(`High funding (+${fr.toFixed(3)}%) - longs paying shorts`);
+  } else if (fr < -0.1) {
+    scoreModifier += 15;
+    confidenceModifier += 5;
+    sentiment = 'over_leveraged_short';
+    signals.push(`Extreme neg. funding (${fr.toFixed(3)}%) - crowded shorts, squeeze risk`);
+  } else if (fr < -0.05) {
+    scoreModifier += 7;
+    confidenceModifier += 3;
+    sentiment = 'over_leveraged_short';
+    signals.push(`Neg. funding (${fr.toFixed(3)}%) - shorts paying longs`);
+  }
+
+  // --- Long/Short Ratio ---
+  if (lsr > 2.0) {
+    scoreModifier -= 5;
+    signals.push(`L/S ratio crowded long (${lsr.toFixed(2)})`);
+  } else if (lsr < 0.5) {
+    scoreModifier += 5;
+    signals.push(`L/S ratio lean short (${lsr.toFixed(2)})`);
+  }
+
+  // --- OI + Price Direction (trend health) ---
+  if (priceChange > 2 && derivatives.openInterest > 0) {
+    confidenceModifier += 5;
+    signals.push('Rising price + OI confirms trend');
+  } else if (priceChange < -2 && derivatives.openInterest > 0) {
+    confidenceModifier -= 3;
+    signals.push('Falling price with high OI - liquidation risk');
+  }
+
+  // Default sentiment from L/S ratio if not set by funding
+  if (sentiment === 'neutral') {
+    if (lsr > 1.5) sentiment = 'over_leveraged_long';
+    else if (lsr < 0.67) sentiment = 'over_leveraged_short';
+  }
+
+  return { scoreModifier, confidenceModifier, signals, sentiment };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIGNAL GENERATION ENGINE v4.0
+// Strategy: Multi-factor weighted scoring with trend context
+// + Trade levels (SL/TP/R:R) + Derivatives sentiment + Multi-timeframe
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, interval = '1h', derivativesData = null) {
   try {
     // Fetch candles - 168 for 1h (7 days), more for lower timeframes
     const candleLimit = interval === '1h' ? 200 : (interval.includes('m') ? 288 : 100);
@@ -884,6 +1022,13 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
       confidence += 1;
     }
 
+    // ─── 11. DERIVATIVES SENTIMENT (Funding Rate + OI) ──────────────
+    // Weight: up to ±15 score, up to 5 confidence
+    const derivativesScoring = scoreDerivatives(derivativesData, score, change24h);
+    score += derivativesScoring.scoreModifier;
+    confidence += derivativesScoring.confidenceModifier;
+    signals.push(...derivativesScoring.signals);
+
     // ─── SIGNAL AGREEMENT ANALYSIS ──────────────────────────────────
     // Count how many factors agree vs disagree
     const bullishFactors = [
@@ -945,6 +1090,19 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
       strengthLabel = 'HOLD';
     }
 
+    // ─── TRADE LEVELS ─────────────────────────────────────────────
+    const tradeLevels = calculateTradeLevels(
+      action, currentPrice,
+      supportResistance.support, supportResistance.resistance,
+      supportResistance.pivot, atr
+    );
+
+    if (tradeLevels && !tradeLevels.riskRewardOk) {
+      signals.push(`Poor R:R (${tradeLevels.riskRewardRatio}:1) - consider waiting`);
+    } else if (tradeLevels && tradeLevels.riskRewardRatio >= 2.5) {
+      signals.push(`Excellent R:R (${tradeLevels.riskRewardRatio}:1)`);
+    }
+
     return {
       asset: asset.toUpperCase(),
       action,
@@ -972,6 +1130,15 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
         bbSqueeze: bbSqueeze.squeeze,
         atrPercent: atrPercent.toFixed(2)
       },
+      tradeLevels,
+      derivatives: derivativesData ? {
+        fundingRate: derivativesData.fundingRate,
+        fundingRatePercent: derivativesData.fundingRatePercent,
+        fundingRateAnnualized: derivativesData.fundingRateAnnualized,
+        openInterest: derivativesData.openInterest,
+        longShortRatio: derivativesData.longShortRatio,
+        sentiment: derivativesScoring.sentiment
+      } : null,
       dataSource: 'Binance OHLCV',
       interval,
       candlesAnalyzed: ohlcvData.length,
@@ -995,6 +1162,188 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// MULTI-TIMEFRAME CONFLUENCE ENGINE
+// Analyzes 4H + 1H + 15M and merges into a single high-quality signal
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Generate a multi-timeframe confluent signal.
+ * Runs analysis on 4h, 1h, and 15m candles, then merges with weighted scoring.
+ * 4h = macro trend (40%), 1h = signal (40%), 15m = entry timing (20%)
+ *
+ * @param {string} asset - CoinGecko asset ID
+ * @param {number} currentPrice
+ * @param {number} change24h
+ * @param {number} volume
+ * @param {number} fearGreed
+ * @param {Object|null} derivativesData
+ * @returns {Promise<Object>} Merged signal with confluence data
+ */
+async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volume, fearGreed, derivativesData = null) {
+  // Run all three timeframes in parallel
+  // Pass derivatives only to 1h (primary) to avoid triple-counting
+  const [signal4h, signal1h, signal15m] = await Promise.all([
+    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '4h', null),
+    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '1h', derivativesData),
+    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '15m', null)
+  ]);
+
+  // Classify each timeframe's direction
+  const getTrend = (signal) => {
+    if (signal.rawScore >= 15) return 'bullish';
+    if (signal.rawScore <= -15) return 'bearish';
+    return 'neutral';
+  };
+
+  const trends = {
+    tf4h: getTrend(signal4h),
+    tf1h: getTrend(signal1h),
+    tf15m: getTrend(signal15m)
+  };
+
+  const bullishCount = Object.values(trends).filter(t => t === 'bullish').length;
+  const bearishCount = Object.values(trends).filter(t => t === 'bearish').length;
+
+  // Determine confluence level
+  let confluence;
+  if (bullishCount === 3 || bearishCount === 3) confluence = 'strong';
+  else if (bullishCount === 2 || bearishCount === 2) confluence = 'moderate';
+  else if (bullishCount >= 1 && bearishCount >= 1) confluence = 'conflicting';
+  else confluence = 'weak';
+
+  // Weighted merge: 4h = 40%, 1h = 40%, 15m = 20%
+  let mergedRawScore = (signal4h.rawScore * 0.40) +
+                       (signal1h.rawScore * 0.40) +
+                       (signal15m.rawScore * 0.20);
+
+  // Confluence adjustments
+  let confidenceBonus = 0;
+  const confluenceReasons = [];
+
+  if (confluence === 'strong') {
+    mergedRawScore *= 1.15;
+    confidenceBonus = 15;
+    confluenceReasons.push('STRONG confluence - all timeframes aligned');
+  } else if (confluence === 'moderate') {
+    confidenceBonus = 5;
+    confluenceReasons.push('Moderate confluence - 2/3 timeframes agree');
+  } else if (confluence === 'conflicting') {
+    mergedRawScore *= 0.7;
+    confidenceBonus = -10;
+    confluenceReasons.push('CONFLICTING timeframes - reduced conviction');
+  } else {
+    confluenceReasons.push('Weak confluence - no clear direction');
+  }
+
+  // 4h is the "governor" - don't fight the macro trend
+  if (trends.tf4h === 'bearish' && mergedRawScore > 0) {
+    mergedRawScore *= 0.5;
+    confidenceBonus -= 5;
+    confluenceReasons.push('4H bearish governs - dampened bullish signal');
+  } else if (trends.tf4h === 'bullish' && mergedRawScore < 0) {
+    mergedRawScore *= 0.5;
+    confidenceBonus -= 5;
+    confluenceReasons.push('4H bullish governs - dampened bearish signal');
+  }
+
+  mergedRawScore = Math.max(-100, Math.min(100, Math.round(mergedRawScore)));
+
+  let mergedConfidence = (signal4h.confidence * 0.40) +
+                         (signal1h.confidence * 0.40) +
+                         (signal15m.confidence * 0.20) +
+                         confidenceBonus;
+  mergedConfidence = Math.max(0, Math.min(85, Math.round(mergedConfidence)));
+
+  const displayScore = Math.round(Math.max(0, Math.min(100, (mergedRawScore + 100) / 2)));
+
+  // Determine action
+  let action = 'HOLD';
+  if (mergedRawScore >= 25) action = 'BUY';
+  else if (mergedRawScore >= 15 && mergedConfidence >= 40) action = 'BUY';
+  else if (mergedRawScore <= -25) action = 'SELL';
+  else if (mergedRawScore <= -15 && mergedConfidence >= 40) action = 'SELL';
+
+  // Strength label
+  let strengthLabel = 'HOLD';
+  if (action === 'BUY') {
+    if (mergedRawScore >= 50 && mergedConfidence >= 60) strengthLabel = 'STRONG BUY';
+    else if (mergedRawScore >= 35 && mergedConfidence >= 45) strengthLabel = 'BUY';
+    else strengthLabel = 'WEAK BUY';
+  } else if (action === 'SELL') {
+    if (mergedRawScore <= -50 && mergedConfidence >= 60) strengthLabel = 'STRONG SELL';
+    else if (mergedRawScore <= -35 && mergedConfidence >= 45) strengthLabel = 'SELL';
+    else strengthLabel = 'WEAK SELL';
+  }
+
+  // Merge reasons: 1h reasons + confluence context + timeframe divergences
+  const allReasons = [];
+  // Primary analysis from 1h
+  allReasons.push(...signal1h.reasons.split(' \u2022 '));
+  // Confluence info
+  allReasons.push(...confluenceReasons);
+  // Timeframe-specific notes
+  if (trends.tf4h !== trends.tf1h) {
+    allReasons.push(`4H trend: ${trends.tf4h}`);
+  }
+  if (trends.tf15m !== trends.tf1h) {
+    allReasons.push(`15M trend: ${trends.tf15m}`);
+  }
+
+  // Recalculate trade levels with merged action
+  const tradeLevels = signal1h.tradeLevels
+    ? calculateTradeLevels(
+        action, currentPrice,
+        signal1h.tradeLevels.support,
+        signal1h.tradeLevels.resistance,
+        signal1h.tradeLevels.pivot,
+        signal1h.tradeLevels.atrValue
+      )
+    : null;
+
+  return {
+    asset: asset.toUpperCase(),
+    action,
+    strengthLabel,
+    score: displayScore,
+    rawScore: mergedRawScore,
+    confidence: mergedConfidence,
+    price: currentPrice,
+    change24h,
+    reasons: allReasons.join(' \u2022 '),
+    indicators: signal1h.indicators,
+    tradeLevels,
+    derivatives: signal1h.derivatives || null,
+    dataSource: 'Binance OHLCV (Multi-TF)',
+    interval: 'multi',
+    candlesAnalyzed: (signal4h.candlesAnalyzed || 0) + (signal1h.candlesAnalyzed || 0) + (signal15m.candlesAnalyzed || 0),
+    timestamp: new Date().toISOString(),
+
+    // Multi-timeframe confluence data
+    timeframes: {
+      tf4h: {
+        trend: trends.tf4h,
+        score: signal4h.rawScore,
+        confidence: signal4h.confidence,
+        action: signal4h.action
+      },
+      tf1h: {
+        trend: trends.tf1h,
+        score: signal1h.rawScore,
+        confidence: signal1h.confidence,
+        action: signal1h.action
+      },
+      tf15m: {
+        trend: trends.tf15m,
+        score: signal15m.rawScore,
+        confidence: signal15m.confidence,
+        action: signal15m.action
+      },
+      confluence
+    }
+  };
+}
+
 module.exports = {
   fetchHistoricalData,
   fetchOHLCVCandles,
@@ -1011,5 +1360,8 @@ module.exports = {
   calculateATR,
   analyzeVolumeProfile,
   detectBBSqueeze,
-  generateSignalWithRealData
+  calculateTradeLevels,
+  scoreDerivatives,
+  generateSignalWithRealData,
+  generateMultiTimeframeSignal
 };

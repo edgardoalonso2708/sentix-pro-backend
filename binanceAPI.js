@@ -303,12 +303,145 @@ function getRateLimitStatus() {
   };
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// BINANCE FUTURES API (Public, no auth required)
+// Funding Rate, Open Interest, Long/Short Ratio
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const BINANCE_FUTURES_BASE = 'https://fapi.binance.com';
+
+const binanceFuturesClient = axios.create({
+  baseURL: BINANCE_FUTURES_BASE,
+  timeout: 10000,
+  headers: {
+    'User-Agent': 'SentixPro/4.0 (Trading Analytics)',
+    'Accept': 'application/json'
+  }
+});
+
+// Futures symbols (PAXG does NOT have futures on Binance)
+const FUTURES_SYMBOL_MAP = { ...SYMBOL_MAP };
+delete FUTURES_SYMBOL_MAP['pax-gold'];
+
+/**
+ * Fetch current funding rate from Binance USDM Futures
+ * @param {string} symbol - e.g. 'BTCUSDT'
+ * @returns {Promise<Object>} { fundingRate, fundingTime, markPrice }
+ */
+async function fetchFundingRate(symbol) {
+  if (!checkRateLimit()) throw new Error('Rate limited');
+  try {
+    const response = await binanceFuturesClient.get('/fapi/v1/fundingRate', {
+      params: { symbol: symbol.toUpperCase(), limit: 1 }
+    });
+    const data = response.data?.[0] || {};
+    return {
+      fundingRate: parseFloat(data.fundingRate) || 0,
+      fundingTime: data.fundingTime,
+      markPrice: parseFloat(data.markPrice) || 0
+    };
+  } catch (error) {
+    const providerError = classifyAxiosError(error, Provider.BINANCE || 'Binance', `/fundingRate/${symbol}`);
+    logger.providerError(providerError);
+    throw error;
+  }
+}
+
+/**
+ * Fetch open interest from Binance USDM Futures
+ * @param {string} symbol - e.g. 'BTCUSDT'
+ * @returns {Promise<Object>} { openInterest, symbol, time }
+ */
+async function fetchOpenInterest(symbol) {
+  if (!checkRateLimit()) throw new Error('Rate limited');
+  try {
+    const response = await binanceFuturesClient.get('/fapi/v1/openInterest', {
+      params: { symbol: symbol.toUpperCase() }
+    });
+    return {
+      openInterest: parseFloat(response.data.openInterest) || 0,
+      symbol: response.data.symbol,
+      time: response.data.time
+    };
+  } catch (error) {
+    const providerError = classifyAxiosError(error, Provider.BINANCE || 'Binance', `/openInterest/${symbol}`);
+    logger.providerError(providerError);
+    throw error;
+  }
+}
+
+/**
+ * Fetch global long/short account ratio (0 weight - free!)
+ * @param {string} symbol - e.g. 'BTCUSDT'
+ * @param {string} period - '5m', '15m', '30m', '1h', '2h', '4h'
+ * @returns {Promise<Object>}
+ */
+async function fetchLongShortRatio(symbol, period = '1h') {
+  try {
+    const response = await binanceFuturesClient.get('/futures/data/globalLongShortAccountRatio', {
+      params: { symbol: symbol.toUpperCase(), period, limit: 1 }
+    });
+    const data = response.data?.[0] || {};
+    return {
+      longShortRatio: parseFloat(data.longShortRatio) || 1,
+      longAccount: parseFloat(data.longAccount) || 0.5,
+      shortAccount: parseFloat(data.shortAccount) || 0.5,
+      timestamp: data.timestamp
+    };
+  } catch (error) {
+    logger.warn('Long/short ratio fetch failed', { symbol, error: error.message });
+    return { longShortRatio: 1, longAccount: 0.5, shortAccount: 0.5, timestamp: null };
+  }
+}
+
+/**
+ * Fetch all derivatives data for a CoinGecko asset ID
+ * Aggregates funding rate, open interest, and long/short ratio in parallel
+ * @param {string} coinGeckoId - e.g. 'bitcoin'
+ * @returns {Promise<Object|null>} Derivatives data or null if not available
+ */
+async function fetchDerivativesData(coinGeckoId) {
+  const symbol = FUTURES_SYMBOL_MAP[coinGeckoId];
+  if (!symbol) return null; // No futures for this asset (e.g. PAXG)
+
+  try {
+    const [funding, oi, lsRatio] = await Promise.all([
+      fetchFundingRate(symbol),
+      fetchOpenInterest(symbol),
+      fetchLongShortRatio(symbol)
+    ]);
+
+    const fundingRatePercent = funding.fundingRate * 100;
+    const fundingRateAnnualized = fundingRatePercent * 3 * 365; // 3 funding periods/day
+
+    return {
+      fundingRate: funding.fundingRate,
+      fundingRatePercent: Math.round(fundingRatePercent * 10000) / 10000,
+      fundingRateAnnualized: Math.round(fundingRateAnnualized * 100) / 100,
+      openInterest: oi.openInterest,
+      longShortRatio: lsRatio.longShortRatio,
+      longAccount: lsRatio.longAccount,
+      shortAccount: lsRatio.shortAccount,
+      markPrice: funding.markPrice,
+      timestamp: new Date().toISOString()
+    };
+  } catch (error) {
+    logger.warn('Derivatives data fetch failed', { coinGeckoId, error: error.message });
+    return null;
+  }
+}
+
 module.exports = {
   fetchKlines,
   fetchOHLCVForAsset,
   fetch24hTicker,
   fetchMultiple24hTickers,
   getRateLimitStatus,
+  fetchFundingRate,
+  fetchOpenInterest,
+  fetchLongShortRatio,
+  fetchDerivativesData,
   SYMBOL_MAP,
+  FUTURES_SYMBOL_MAP,
   VALID_INTERVALS
 };
