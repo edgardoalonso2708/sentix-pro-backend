@@ -46,6 +46,18 @@ const { Resend } = require('resend');
 const { logger } = require('./logger');
 const { classifyAxiosError, Provider } = require('./errors');
 const { getFeatures, getFeaturesForAssets } = require('./featureStore');
+const {
+  getOrCreateConfig,
+  updateConfig,
+  resetPaperAccount,
+  evaluateAndExecute,
+  monitorAndManage,
+  getPerformanceMetrics,
+  getTradeHistory,
+  getOpenPositions,
+  executeFullClose,
+  resolveCurrentPrice
+} = require('./paperTrading');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -467,6 +479,26 @@ async function updateMarketData() {
 
       // Broadcast to SSE clients (Phase 1)
       broadcastSSE('market', cachedMarketData);
+
+      // ─── PAPER TRADING POSITION MONITORING ────────────────────────────
+      try {
+        const ptMonitor = await monitorAndManage(supabase, 'default-user', cachedMarketData);
+        if (ptMonitor.closedTrades && ptMonitor.closedTrades.length > 0) {
+          for (const closedTrade of ptMonitor.closedTrades) {
+            await broadcastPaperTradeNotification(closedTrade, 'close');
+          }
+          broadcastSSE('paper_trade', { action: 'closed', trades: ptMonitor.closedTrades });
+        }
+        if (ptMonitor.partialCloses && ptMonitor.partialCloses.length > 0) {
+          for (const partial of ptMonitor.partialCloses) {
+            await broadcastPaperTradeNotification(partial, 'partial');
+          }
+          broadcastSSE('paper_trade', { action: 'partial', trades: ptMonitor.partialCloses });
+        }
+      } catch (ptError) {
+        logger.debug('Paper trading monitor cycle', { error: ptError.message });
+      }
+
     } else {
       // Update only non-crypto data, keep existing crypto
       cachedMarketData = {
@@ -917,6 +949,24 @@ async function processAlerts() {
       telegram: telegramCount,
       email: emailCount
     });
+
+    // ─── PAPER TRADING EVALUATION ─────────────────────────────────────────
+    try {
+      const ptResult = await evaluateAndExecute(supabase, 'default-user', signals, cachedMarketData);
+      if (ptResult.newTrades.length > 0) {
+        logger.info('Paper trades opened', {
+          count: ptResult.newTrades.length,
+          assets: ptResult.newTrades.map(t => t.asset)
+        });
+        for (const trade of ptResult.newTrades) {
+          await broadcastPaperTradeNotification(trade, 'open');
+        }
+        broadcastSSE('paper_trade', { action: 'opened', trades: ptResult.newTrades });
+      }
+    } catch (ptError) {
+      logger.warn('Paper trading evaluation failed', { error: ptError.message });
+    }
+
   } catch (error) {
     logger.error('Alert processing failed', { error: error.message });
   }
@@ -1044,6 +1094,48 @@ function broadcastSSE(eventType, data) {
 
   if (sent > 0 || failed > 0) {
     logger.debug('SSE broadcast', { eventType, sent, failed, remaining: sseClients.size });
+  }
+}
+
+// ─── PAPER TRADE TELEGRAM NOTIFICATIONS ─────────────────────────────────────
+async function broadcastPaperTradeNotification(trade, action) {
+  if (!bot.isActive()) return;
+
+  const emoji = action === 'open'
+    ? (trade.direction === 'LONG' ? '📈' : '📉')
+    : action === 'partial' ? '🎯'
+    : parseFloat(trade.realized_pnl) >= 0 ? '✅' : '❌';
+
+  let message;
+  if (action === 'open') {
+    message =
+      `${emoji} *PAPER TRADE ABIERTO*\n\n` +
+      `*${trade.asset}* - ${trade.direction}\n` +
+      `Entrada: $${Number(trade.entry_price).toLocaleString()}\n` +
+      `Stop Loss: $${Number(trade.stop_loss).toLocaleString()}\n` +
+      `TP1: $${Number(trade.take_profit_1).toLocaleString()}\n` +
+      `Tamaño: $${Number(trade.position_size_usd).toFixed(2)}\n` +
+      `Riesgo: $${Number(trade.risk_amount).toFixed(2)}\n\n` +
+      `⏰ ${new Date().toLocaleString('es-ES')}`;
+  } else if (action === 'partial') {
+    message =
+      `${emoji} *PAPER TRADE - TP1 ALCANZADO*\n\n` +
+      `*${trade.asset}*\n` +
+      `Cierre parcial (50%) a $${Number(trade.partial_close_price).toLocaleString()}\n` +
+      `P&L parcial: $${Number(trade.partial_close_pnl).toFixed(2)}\n\n` +
+      `⏰ ${new Date().toLocaleString('es-ES')}`;
+  } else {
+    message =
+      `${emoji} *PAPER TRADE CERRADO*\n\n` +
+      `*${trade.asset}* - ${trade.exit_reason}\n` +
+      `Entrada: $${Number(trade.entry_price).toLocaleString()}\n` +
+      `Salida: $${Number(trade.exit_price).toLocaleString()}\n` +
+      `P&L: $${Number(trade.realized_pnl).toFixed(2)} (${Number(trade.realized_pnl_percent).toFixed(2)}%)\n\n` +
+      `⏰ ${new Date().toLocaleString('es-ES')}`;
+  }
+
+  for (const chatId of bot.getSubscribers()) {
+    await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
   }
 }
 
@@ -1637,6 +1729,149 @@ app.delete('/api/portfolio/:userId/:positionId', async (req, res) => {
   } catch (error) {
     logger.error('Portfolio delete failed', { error: error.message });
     res.status(500).json({ error: 'Failed to delete position' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PAPER TRADING API ROUTES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Get paper trading config
+app.get('/api/paper/config/:userId', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+    const { config, error } = await getOrCreateConfig(supabase, userId);
+    if (error) return res.status(500).json({ error: error.message || 'Failed to get config' });
+    res.json({ config });
+  } catch (error) {
+    logger.error('Paper config fetch failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update paper trading config
+app.post('/api/paper/config/:userId', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+    const { config, error } = await updateConfig(supabase, userId, req.body);
+    if (error) return res.status(400).json({ error: error.message || error });
+    res.json({ config });
+  } catch (error) {
+    logger.error('Paper config update failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Reset paper trading account
+app.post('/api/paper/reset/:userId', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+    const { config, closedCount, error } = await resetPaperAccount(supabase, userId);
+    if (error) return res.status(500).json({ error: error.message || 'Reset failed' });
+    res.json({ config, closedCount, message: `Account reset. ${closedCount} trades closed.` });
+  } catch (error) {
+    logger.error('Paper reset failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get open paper positions with unrealized P&L
+app.get('/api/paper/positions/:userId', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+    const { positions, error } = await getOpenPositions(supabase, userId, cachedMarketData);
+    if (error) return res.status(500).json({ error: error.message || 'Failed to get positions' });
+    res.json({ positions });
+  } catch (error) {
+    logger.error('Paper positions fetch failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get paper trade history
+app.get('/api/paper/history/:userId', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+    const options = {
+      status: req.query.status || undefined,
+      asset: req.query.asset || undefined,
+      limit: parseInt(req.query.limit) || 50,
+      offset: parseInt(req.query.offset) || 0
+    };
+    const { trades, total, error } = await getTradeHistory(supabase, userId, options);
+    if (error) return res.status(500).json({ error: error.message || 'Failed to get history' });
+    res.json({ trades, total });
+  } catch (error) {
+    logger.error('Paper history fetch failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get performance metrics
+app.get('/api/paper/performance/:userId', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+    const { metrics, error } = await getPerformanceMetrics(supabase, userId);
+    if (error) return res.status(500).json({ error: error.message || 'Failed to get metrics' });
+    res.json({ metrics });
+  } catch (error) {
+    logger.error('Paper performance fetch failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Manually close a paper trade
+app.post('/api/paper/close/:tradeId', async (req, res) => {
+  try {
+    const tradeId = req.params.tradeId;
+
+    // Fetch trade
+    const { data: trade, error: fetchError } = await supabase
+      .from('paper_trades')
+      .select('*')
+      .eq('id', tradeId)
+      .in('status', ['open', 'partial'])
+      .single();
+
+    if (fetchError || !trade) {
+      return res.status(404).json({ error: 'Trade not found or already closed' });
+    }
+
+    // Get current price
+    const currentPrice = resolveCurrentPrice(trade.asset, cachedMarketData);
+    if (!currentPrice) {
+      return res.status(400).json({ error: 'Cannot resolve current price for ' + trade.asset });
+    }
+
+    const { closedTrade, pnl, error } = await executeFullClose(supabase, trade, currentPrice, 'manual');
+    if (error) return res.status(500).json({ error: error.message || 'Close failed' });
+
+    // Notify
+    await broadcastPaperTradeNotification(closedTrade, 'close');
+    broadcastSSE('paper_trade', { action: 'closed', trades: [closedTrade] });
+
+    res.json({ trade: closedTrade, pnl });
+  } catch (error) {
+    logger.error('Paper manual close failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
   }
 });
 

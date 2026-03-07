@@ -34,7 +34,14 @@ export default function SentixProFrontend() {
   const [portfolioLoading, setPortfolioLoading] = useState(false);
   const [walletsLoading, setWalletsLoading] = useState(false);
   const USER_ID = 'default-user';
-  
+
+  // Paper Trading
+  const [paperConfig, setPaperConfig] = useState(null);
+  const [paperPositions, setPaperPositions] = useState([]);
+  const [paperHistory, setPaperHistory] = useState([]);
+  const [paperMetrics, setPaperMetrics] = useState(null);
+  const [paperLoading, setPaperLoading] = useState(false);
+
   // ─── FETCH MARKET DATA ─────────────────────────────────────────────────────
   const fetchMarketData = useCallback(async () => {
     try {
@@ -1551,6 +1558,923 @@ export default function SentixProFrontend() {
     );
   };
 
+  // ─── PAPER TRADING TAB ────────────────────────────────────────────────────
+  const PaperTradingTab = () => {
+    const [showConfig, setShowConfig] = useState(false);
+    const [configForm, setConfigForm] = useState(null);
+    const [savingConfig, setSavingConfig] = useState(false);
+    const [closingTrade, setClosingTrade] = useState(null);
+    const [historyPage, setHistoryPage] = useState(0);
+    const [historyTotal, setHistoryTotal] = useState(0);
+    const [confirmReset, setConfirmReset] = useState(false);
+
+    const HISTORY_PAGE_SIZE = 10;
+
+    // Fetch all paper trading data
+    const loadPaperData = async () => {
+      setPaperLoading(true);
+      try {
+        const [configRes, posRes, histRes, perfRes] = await Promise.allSettled([
+          fetch(`${API_URL}/api/paper/config/${USER_ID}`),
+          fetch(`${API_URL}/api/paper/positions/${USER_ID}`),
+          fetch(`${API_URL}/api/paper/history/${USER_ID}?status=closed&limit=${HISTORY_PAGE_SIZE}&offset=${historyPage * HISTORY_PAGE_SIZE}`),
+          fetch(`${API_URL}/api/paper/performance/${USER_ID}`)
+        ]);
+
+        if (configRes.status === 'fulfilled' && configRes.value.ok) {
+          const d = await configRes.value.json();
+          setPaperConfig(d.config);
+          if (!configForm) setConfigForm(d.config);
+        }
+        if (posRes.status === 'fulfilled' && posRes.value.ok) {
+          const d = await posRes.value.json();
+          setPaperPositions(d.positions || []);
+        }
+        if (histRes.status === 'fulfilled' && histRes.value.ok) {
+          const d = await histRes.value.json();
+          setPaperHistory(d.trades || []);
+          setHistoryTotal(d.total || 0);
+        }
+        if (perfRes.status === 'fulfilled' && perfRes.value.ok) {
+          const d = await perfRes.value.json();
+          setPaperMetrics(d.metrics);
+        }
+      } catch (err) {
+        console.error('Paper data load error:', err);
+      } finally {
+        setPaperLoading(false);
+      }
+    };
+
+    useEffect(() => { loadPaperData(); }, [historyPage]);
+
+    // Auto refresh every 30s
+    useEffect(() => {
+      const interval = setInterval(loadPaperData, 30000);
+      return () => clearInterval(interval);
+    }, [historyPage]);
+
+    const handleSaveConfig = async () => {
+      if (!configForm) return;
+      setSavingConfig(true);
+      try {
+        const res = await fetch(`${API_URL}/api/paper/config/${USER_ID}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            is_enabled: configForm.is_enabled,
+            initial_capital: parseFloat(configForm.initial_capital),
+            risk_per_trade: parseFloat(configForm.risk_per_trade),
+            max_open_positions: parseInt(configForm.max_open_positions),
+            max_daily_loss_percent: parseFloat(configForm.max_daily_loss_percent),
+            cooldown_minutes: parseInt(configForm.cooldown_minutes),
+            min_confluence: parseInt(configForm.min_confluence),
+            min_rr_ratio: parseFloat(configForm.min_rr_ratio)
+          })
+        });
+        if (res.ok) {
+          const d = await res.json();
+          setPaperConfig(d.config);
+          setConfigForm(d.config);
+        }
+      } catch (err) {
+        console.error('Save config error:', err);
+      } finally {
+        setSavingConfig(false);
+      }
+    };
+
+    const handleCloseTrade = async (tradeId) => {
+      setClosingTrade(tradeId);
+      try {
+        const res = await fetch(`${API_URL}/api/paper/close/${tradeId}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: USER_ID })
+        });
+        if (res.ok) await loadPaperData();
+      } catch (err) {
+        console.error('Close trade error:', err);
+      } finally {
+        setClosingTrade(null);
+      }
+    };
+
+    const handleReset = async () => {
+      try {
+        const res = await fetch(`${API_URL}/api/paper/reset/${USER_ID}`, { method: 'POST' });
+        if (res.ok) {
+          setConfirmReset(false);
+          await loadPaperData();
+        }
+      } catch (err) {
+        console.error('Reset error:', err);
+      }
+    };
+
+    const handleToggleEnabled = async () => {
+      const newVal = !paperConfig?.is_enabled;
+      try {
+        const res = await fetch(`${API_URL}/api/paper/config/${USER_ID}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ is_enabled: newVal })
+        });
+        if (res.ok) {
+          const d = await res.json();
+          setPaperConfig(d.config);
+          if (configForm) setConfigForm(prev => ({ ...prev, is_enabled: newVal }));
+        }
+      } catch (err) {
+        console.error('Toggle error:', err);
+      }
+    };
+
+    const formatDuration = (entryAt, exitAt) => {
+      const ms = new Date(exitAt || Date.now()) - new Date(entryAt);
+      const hours = Math.floor(ms / 3600000);
+      const mins = Math.floor((ms % 3600000) / 60000);
+      if (hours > 24) return `${Math.floor(hours / 24)}d ${hours % 24}h`;
+      if (hours > 0) return `${hours}h ${mins}m`;
+      return `${mins}m`;
+    };
+
+    const inputStyle = {
+      width: '100%', padding: '8px 12px', background: bg3,
+      border: `1px solid ${border}`, borderRadius: 6,
+      color: text, fontFamily: 'monospace', fontSize: 12
+    };
+
+    const isEnabled = paperConfig?.is_enabled;
+    const capital = parseFloat(paperConfig?.current_capital || 10000);
+    const initialCap = parseFloat(paperConfig?.initial_capital || 10000);
+    const capitalPnl = capital - initialCap;
+    const capitalPnlPct = initialCap > 0 ? ((capitalPnl / initialCap) * 100) : 0;
+
+    return (
+      <div>
+        {/* Status Banner */}
+        <div style={{
+          background: isEnabled ? "rgba(0, 212, 170, 0.08)" : "rgba(239, 68, 68, 0.08)",
+          border: `1px solid ${isEnabled ? green : red}`,
+          borderRadius: 8, padding: "14px 18px", marginBottom: 16,
+          display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+            <div style={{
+              width: 10, height: 10, borderRadius: "50%",
+              background: isEnabled ? green : red,
+              boxShadow: `0 0 8px ${isEnabled ? green : red}`,
+              animation: isEnabled ? "pulse 2s infinite" : "none"
+            }} />
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 700, color: isEnabled ? green : red }}>
+                PAPER TRADING {isEnabled ? 'ACTIVO' : 'DESACTIVADO'}
+              </div>
+              <div style={{ fontSize: 10, color: muted, fontFamily: "monospace" }}>
+                Capital: ${capital.toLocaleString(undefined, { minimumFractionDigits: 2 })} ·
+                P&L: <span style={{ color: capitalPnl >= 0 ? green : red }}>
+                  {capitalPnl >= 0 ? '+' : ''}${capitalPnl.toFixed(2)} ({capitalPnlPct.toFixed(1)}%)
+                </span>
+              </div>
+            </div>
+          </div>
+          <button onClick={handleToggleEnabled} style={{
+            padding: "6px 16px", background: isEnabled ? "rgba(239,68,68,0.2)" : "rgba(0,212,170,0.2)",
+            border: `1px solid ${isEnabled ? red : green}`, borderRadius: 6,
+            color: isEnabled ? red : green, fontFamily: "monospace", fontSize: 11,
+            fontWeight: 700, cursor: "pointer"
+          }}>
+            {isEnabled ? '⏸ PAUSAR' : '▶ ACTIVAR'}
+          </button>
+        </div>
+
+        {/* Performance Cards */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 10, marginBottom: 16 }}>
+          {[
+            { label: "P&L TOTAL", value: `$${(paperMetrics?.totalPnl || 0).toFixed(2)}`, color: (paperMetrics?.totalPnl || 0) >= 0 ? green : red },
+            { label: "WIN RATE", value: `${paperMetrics?.winRate || 0}%`, color: (paperMetrics?.winRate || 0) >= 50 ? green : (paperMetrics?.winRate || 0) > 0 ? amber : muted },
+            { label: "TRADES", value: `${paperMetrics?.totalTrades || 0}`, sub: `${paperMetrics?.winCount || 0}W / ${paperMetrics?.lossCount || 0}L`, color: text },
+            { label: "CAPITAL", value: `$${capital.toLocaleString(undefined, { maximumFractionDigits: 0 })}`, color: capital >= initialCap ? green : red },
+            { label: "MAX DRAWDOWN", value: `$${(paperMetrics?.maxDrawdown || 0).toFixed(2)}`, color: red },
+            { label: "PROFIT FACTOR", value: paperMetrics?.profitFactor === Infinity ? '∞' : `${(paperMetrics?.profitFactor || 0).toFixed(2)}`, color: (paperMetrics?.profitFactor || 0) >= 1.5 ? green : (paperMetrics?.profitFactor || 0) >= 1 ? amber : red },
+          ].map((stat, i) => (
+            <div key={i} style={{ ...card, padding: "12px 14px", textAlign: "center" }}>
+              <div style={{ fontSize: 9, color: muted, textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 700, marginBottom: 6 }}>{stat.label}</div>
+              <div style={{ fontSize: 18, fontWeight: 800, fontFamily: "monospace", color: stat.color }}>{stat.value}</div>
+              {stat.sub && <div style={{ fontSize: 10, color: muted, fontFamily: "monospace", marginTop: 2 }}>{stat.sub}</div>}
+            </div>
+          ))}
+        </div>
+
+        {/* Open Positions */}
+        <div style={{ ...card, padding: "16px 20px" }}>
+          <div style={sTitle}>
+            POSICIONES ABIERTAS ({paperPositions.length})
+          </div>
+          {paperPositions.length === 0 ? (
+            <div style={{ textAlign: "center", padding: 20, color: muted, fontSize: 12 }}>
+              No hay trades abiertos. El sistema abrirá automáticamente cuando detecte señales fuertes.
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {paperPositions.map(pos => {
+                const isLong = pos.direction === 'LONG';
+                const pnlColor = pos.unrealizedPnl >= 0 ? green : red;
+                return (
+                  <div key={pos.id} style={{
+                    background: bg3, borderRadius: 8, padding: "12px 16px",
+                    borderLeft: `3px solid ${isLong ? green : red}`,
+                    display: "flex", justifyContent: "space-between", alignItems: "center",
+                    flexWrap: "wrap", gap: 8
+                  }}>
+                    <div style={{ minWidth: 120 }}>
+                      <div style={{ fontSize: 13, fontWeight: 700 }}>
+                        <span style={{ color: isLong ? green : red }}>{isLong ? '▲' : '▼'}</span>{' '}
+                        {pos.asset}
+                      </div>
+                      <div style={{ fontSize: 10, color: muted, fontFamily: "monospace" }}>
+                        {pos.direction} · {pos.entry_signal_strength} · {formatDuration(pos.entry_at)}
+                      </div>
+                    </div>
+
+                    <div style={{ textAlign: "center", minWidth: 100 }}>
+                      <div style={{ fontSize: 10, color: muted }}>Entrada → Actual</div>
+                      <div style={{ fontSize: 12, fontFamily: "monospace", fontWeight: 600 }}>
+                        ${Number(pos.entry_price).toLocaleString()} → <span style={{ color: pnlColor }}>${pos.currentPrice ? pos.currentPrice.toLocaleString() : '...'}</span>
+                      </div>
+                    </div>
+
+                    <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+                      <span style={{ background: "rgba(239,68,68,0.15)", color: red, padding: "2px 6px", borderRadius: 4, fontSize: 9, fontFamily: "monospace" }}>
+                        SL ${Number(pos.stop_loss).toLocaleString()}
+                      </span>
+                      <span style={{ background: "rgba(0,212,170,0.15)", color: green, padding: "2px 6px", borderRadius: 4, fontSize: 9, fontFamily: "monospace" }}>
+                        TP1 ${Number(pos.take_profit_1).toLocaleString()}
+                      </span>
+                      {pos.trailing_active && (
+                        <span style={{ background: "rgba(245,158,11,0.15)", color: amber, padding: "2px 6px", borderRadius: 4, fontSize: 9, fontFamily: "monospace" }}>
+                          TRAIL ${Number(pos.trailing_stop_current).toLocaleString()}
+                        </span>
+                      )}
+                      <span style={{ background: pos.status === 'partial' ? "rgba(245,158,11,0.15)" : "transparent", color: pos.status === 'partial' ? amber : muted, padding: "2px 6px", borderRadius: 4, fontSize: 9, fontFamily: "monospace" }}>
+                        {pos.status === 'partial' ? 'PARCIAL' : 'OPEN'}
+                      </span>
+                    </div>
+
+                    <div style={{ textAlign: "right", minWidth: 90 }}>
+                      <div style={{ fontSize: 14, fontWeight: 800, fontFamily: "monospace", color: pnlColor }}>
+                        {pos.unrealizedPnl >= 0 ? '+' : ''}${pos.unrealizedPnl.toFixed(2)}
+                      </div>
+                      <div style={{ fontSize: 10, fontFamily: "monospace", color: pnlColor }}>
+                        {pos.unrealizedPnlPercent >= 0 ? '+' : ''}{pos.unrealizedPnlPercent.toFixed(2)}%
+                      </div>
+                    </div>
+
+                    <button
+                      onClick={() => handleCloseTrade(pos.id)}
+                      disabled={closingTrade === pos.id}
+                      style={{
+                        padding: "4px 10px", background: "rgba(239,68,68,0.15)",
+                        border: `1px solid ${red}`, borderRadius: 4,
+                        color: red, fontFamily: "monospace", fontSize: 10,
+                        fontWeight: 700, cursor: "pointer", opacity: closingTrade === pos.id ? 0.5 : 1
+                      }}
+                    >
+                      {closingTrade === pos.id ? '...' : 'CERRAR'}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* Trade History */}
+        <div style={{ ...card, padding: "16px 20px" }}>
+          <div style={sTitle}>
+            HISTORIAL DE TRADES ({historyTotal})
+          </div>
+          {paperHistory.length === 0 ? (
+            <div style={{ textAlign: "center", padding: 20, color: muted, fontSize: 12 }}>
+              Aún no hay trades cerrados.
+            </div>
+          ) : (
+            <>
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "monospace", fontSize: 11 }}>
+                  <thead>
+                    <tr>
+                      {["Asset", "Dir", "Entrada", "Salida", "P&L", "%", "Duración", "Razón"].map((h, i) => (
+                        <th key={i} style={{
+                          padding: "6px 8px", textAlign: "left", fontSize: 9, color: muted,
+                          textTransform: "uppercase", letterSpacing: "0.08em",
+                          borderBottom: `1px solid ${border}`, fontWeight: 700
+                        }}>{h}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {paperHistory.map((trade, i) => {
+                      const pnl = parseFloat(trade.realized_pnl || 0);
+                      const pnlPct = parseFloat(trade.realized_pnl_percent || 0);
+                      const isWin = pnl > 0;
+                      return (
+                        <tr key={trade.id} style={{ background: i % 2 === 0 ? "transparent" : "rgba(255,255,255,0.02)" }}>
+                          <td style={{ padding: "6px 8px", fontWeight: 600 }}>{trade.asset}</td>
+                          <td style={{ padding: "6px 8px", color: trade.direction === 'LONG' ? green : red }}>{trade.direction === 'LONG' ? '▲ L' : '▼ S'}</td>
+                          <td style={{ padding: "6px 8px" }}>${Number(trade.entry_price).toLocaleString()}</td>
+                          <td style={{ padding: "6px 8px" }}>${Number(trade.exit_price).toLocaleString()}</td>
+                          <td style={{ padding: "6px 8px", color: isWin ? green : red, fontWeight: 700 }}>
+                            {isWin ? '+' : ''}${pnl.toFixed(2)}
+                          </td>
+                          <td style={{ padding: "6px 8px", color: isWin ? green : red }}>
+                            {isWin ? '+' : ''}{pnlPct.toFixed(2)}%
+                          </td>
+                          <td style={{ padding: "6px 8px", color: muted }}>{formatDuration(trade.entry_at, trade.exit_at)}</td>
+                          <td style={{ padding: "6px 8px" }}>
+                            <span style={{
+                              padding: "2px 6px", borderRadius: 4, fontSize: 9,
+                              background: trade.exit_reason === 'stop_loss' ? "rgba(239,68,68,0.15)" :
+                                trade.exit_reason?.includes('take_profit') ? "rgba(0,212,170,0.15)" :
+                                trade.exit_reason === 'trailing_stop' ? "rgba(245,158,11,0.15)" : "rgba(255,255,255,0.05)",
+                              color: trade.exit_reason === 'stop_loss' ? red :
+                                trade.exit_reason?.includes('take_profit') ? green :
+                                trade.exit_reason === 'trailing_stop' ? amber : muted
+                            }}>
+                              {(trade.exit_reason || 'unknown').replace(/_/g, ' ').toUpperCase()}
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+              {/* Pagination */}
+              {historyTotal > HISTORY_PAGE_SIZE && (
+                <div style={{ display: "flex", justifyContent: "space-between", marginTop: 10, alignItems: "center" }}>
+                  <button onClick={() => setHistoryPage(p => Math.max(0, p - 1))} disabled={historyPage === 0}
+                    style={{ padding: "4px 12px", background: bg3, border: `1px solid ${border}`, borderRadius: 4, color: historyPage === 0 ? muted : text, fontFamily: "monospace", fontSize: 10, cursor: historyPage === 0 ? "default" : "pointer" }}>
+                    ← Prev
+                  </button>
+                  <span style={{ fontSize: 10, color: muted, fontFamily: "monospace" }}>
+                    {historyPage + 1} / {Math.ceil(historyTotal / HISTORY_PAGE_SIZE)}
+                  </span>
+                  <button onClick={() => setHistoryPage(p => p + 1)} disabled={(historyPage + 1) * HISTORY_PAGE_SIZE >= historyTotal}
+                    style={{ padding: "4px 12px", background: bg3, border: `1px solid ${border}`, borderRadius: 4, color: (historyPage + 1) * HISTORY_PAGE_SIZE >= historyTotal ? muted : text, fontFamily: "monospace", fontSize: 10, cursor: (historyPage + 1) * HISTORY_PAGE_SIZE >= historyTotal ? "default" : "pointer" }}>
+                    Next →
+                  </button>
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        {/* Configuration Panel */}
+        <div style={{ ...card, padding: "16px 20px" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", cursor: "pointer" }}
+            onClick={() => setShowConfig(!showConfig)}>
+            <div style={sTitle}>⚙ CONFIGURACIÓN</div>
+            <span style={{ color: muted, fontSize: 12 }}>{showConfig ? '▲' : '▼'}</span>
+          </div>
+
+          {showConfig && configForm && (
+            <div style={{ marginTop: 12 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 14 }}>
+                <div>
+                  <label style={{ fontSize: 10, color: muted, marginBottom: 4, display: "block" }}>Capital Inicial ($)</label>
+                  <input type="number" value={configForm.initial_capital || 10000}
+                    onChange={e => setConfigForm(prev => ({ ...prev, initial_capital: e.target.value }))}
+                    style={inputStyle} />
+                </div>
+                <div>
+                  <label style={{ fontSize: 10, color: muted, marginBottom: 4, display: "block" }}>Riesgo por Trade (%)</label>
+                  <input type="number" step="0.5" min="0.5" max="5" value={(configForm.risk_per_trade || 0.02) * 100}
+                    onChange={e => setConfigForm(prev => ({ ...prev, risk_per_trade: parseFloat(e.target.value) / 100 }))}
+                    style={inputStyle} />
+                </div>
+                <div>
+                  <label style={{ fontSize: 10, color: muted, marginBottom: 4, display: "block" }}>Máx Posiciones Abiertas</label>
+                  <input type="number" min="1" max="10" value={configForm.max_open_positions || 3}
+                    onChange={e => setConfigForm(prev => ({ ...prev, max_open_positions: e.target.value }))}
+                    style={inputStyle} />
+                </div>
+                <div>
+                  <label style={{ fontSize: 10, color: muted, marginBottom: 4, display: "block" }}>Pérdida Diaria Máx (%)</label>
+                  <input type="number" step="1" min="1" max="20" value={(configForm.max_daily_loss_percent || 0.05) * 100}
+                    onChange={e => setConfigForm(prev => ({ ...prev, max_daily_loss_percent: parseFloat(e.target.value) / 100 }))}
+                    style={inputStyle} />
+                </div>
+                <div>
+                  <label style={{ fontSize: 10, color: muted, marginBottom: 4, display: "block" }}>Cooldown entre Trades (min)</label>
+                  <input type="number" min="5" max="120" value={configForm.cooldown_minutes || 30}
+                    onChange={e => setConfigForm(prev => ({ ...prev, cooldown_minutes: e.target.value }))}
+                    style={inputStyle} />
+                </div>
+                <div>
+                  <label style={{ fontSize: 10, color: muted, marginBottom: 4, display: "block" }}>Confluencia Mínima (1-3)</label>
+                  <input type="number" min="1" max="3" value={configForm.min_confluence || 2}
+                    onChange={e => setConfigForm(prev => ({ ...prev, min_confluence: e.target.value }))}
+                    style={inputStyle} />
+                </div>
+                <div>
+                  <label style={{ fontSize: 10, color: muted, marginBottom: 4, display: "block" }}>R:R Mínimo</label>
+                  <input type="number" step="0.1" min="1.0" max="5.0" value={configForm.min_rr_ratio || 1.5}
+                    onChange={e => setConfigForm(prev => ({ ...prev, min_rr_ratio: e.target.value }))}
+                    style={inputStyle} />
+                </div>
+              </div>
+
+              <div style={{ display: "flex", gap: 10, marginTop: 16, flexWrap: "wrap" }}>
+                <button onClick={handleSaveConfig} disabled={savingConfig}
+                  style={{
+                    padding: "8px 20px", background: `linear-gradient(135deg, ${purple}, #7c3aed)`,
+                    border: "none", borderRadius: 6, color: "#fff",
+                    fontFamily: "monospace", fontSize: 12, fontWeight: 700, cursor: "pointer",
+                    opacity: savingConfig ? 0.6 : 1
+                  }}>
+                  {savingConfig ? 'Guardando...' : '💾 GUARDAR CONFIG'}
+                </button>
+
+                {!confirmReset ? (
+                  <button onClick={() => setConfirmReset(true)}
+                    style={{
+                      padding: "8px 20px", background: "rgba(239,68,68,0.1)",
+                      border: `1px solid ${red}`, borderRadius: 6,
+                      color: red, fontFamily: "monospace", fontSize: 12, fontWeight: 700, cursor: "pointer"
+                    }}>
+                    🔄 RESET CUENTA
+                  </button>
+                ) : (
+                  <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                    <span style={{ fontSize: 11, color: red }}>¿Seguro? Cierra todos los trades y resetea capital.</span>
+                    <button onClick={handleReset} style={{
+                      padding: "6px 14px", background: red, border: "none", borderRadius: 4,
+                      color: "#fff", fontFamily: "monospace", fontSize: 11, fontWeight: 700, cursor: "pointer"
+                    }}>SÍ</button>
+                    <button onClick={() => setConfirmReset(false)} style={{
+                      padding: "6px 14px", background: bg3, border: `1px solid ${border}`, borderRadius: 4,
+                      color: muted, fontFamily: "monospace", fontSize: 11, cursor: "pointer"
+                    }}>NO</button>
+                  </div>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Extra stats */}
+        {paperMetrics && paperMetrics.totalTrades > 0 && (
+          <div style={{ ...card, padding: "16px 20px" }}>
+            <div style={sTitle}>ESTADÍSTICAS DETALLADAS</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 10 }}>
+              {[
+                { label: "Promedio Ganancia", value: `+$${(paperMetrics.avgProfit || 0).toFixed(2)}`, color: green },
+                { label: "Promedio Pérdida", value: `-$${(paperMetrics.avgLoss || 0).toFixed(2)}`, color: red },
+                { label: "Mejor Trade", value: paperMetrics.bestTrade ? `${paperMetrics.bestTrade.asset} +$${paperMetrics.bestTrade.pnl.toFixed(2)}` : '-', color: green },
+                { label: "Peor Trade", value: paperMetrics.worstTrade ? `${paperMetrics.worstTrade.asset} $${paperMetrics.worstTrade.pnl.toFixed(2)}` : '-', color: red },
+                { label: "Tiempo Promedio", value: `${(paperMetrics.avgHoldingTimeHours || 0).toFixed(1)}h`, color: text },
+                { label: "Racha Actual", value: `${paperMetrics.currentStreak || 0} ${paperMetrics.streakType === 'win' ? 'victorias' : paperMetrics.streakType === 'loss' ? 'derrotas' : '-'}`, color: paperMetrics.streakType === 'win' ? green : paperMetrics.streakType === 'loss' ? red : muted },
+              ].map((stat, i) => (
+                <div key={i} style={{ background: bg3, padding: "10px 14px", borderRadius: 6 }}>
+                  <div style={{ fontSize: 9, color: muted, textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 4 }}>{stat.label}</div>
+                  <div style={{ fontSize: 13, fontWeight: 700, fontFamily: "monospace", color: stat.color }}>{stat.value}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {paperLoading && (
+          <div style={{ textAlign: "center", padding: 10, fontSize: 10, color: muted, fontFamily: "monospace" }}>
+            Actualizando datos...
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  // ─── GUIDE TAB ────────────────────────────────────────────────────────────
+  const GuideTab = () => {
+    const [guideSection, setGuideSection] = useState(0);
+
+    const sectionHeaderStyle = {
+      fontSize: 16, fontWeight: 800, color: purple, letterSpacing: "0.02em",
+      marginBottom: 16, paddingBottom: 8,
+      borderBottom: `2px solid ${purple}`,
+      display: "flex", alignItems: "center", gap: 10
+    };
+    const tableStyle = {
+      width: "100%", borderCollapse: "collapse", fontFamily: "monospace", fontSize: 11
+    };
+    const thStyle = {
+      background: "rgba(168,85,247,0.2)", color: purple, fontWeight: 700,
+      padding: "8px 12px", textAlign: "left", fontSize: 10,
+      textTransform: "uppercase", letterSpacing: "0.08em",
+      borderBottom: `1px solid ${border}`
+    };
+    const tdStyle = (i) => ({
+      padding: "7px 12px", borderBottom: `1px solid ${border}`,
+      background: i % 2 === 0 ? "transparent" : "rgba(255,255,255,0.02)",
+      fontSize: 11, lineHeight: 1.5
+    });
+    const tipBox = {
+      background: "rgba(245,158,11,0.08)", borderLeft: `3px solid ${amber}`,
+      padding: "10px 14px", borderRadius: "0 6px 6px 0", marginBottom: 14,
+      fontSize: 11, lineHeight: 1.6, color: "#fbbf24"
+    };
+    const alertBox = {
+      background: "rgba(239,68,68,0.08)", borderLeft: `3px solid ${red}`,
+      padding: "10px 14px", borderRadius: "0 6px 6px 0", marginBottom: 14,
+      fontSize: 11, lineHeight: 1.6, color: "#fca5a5"
+    };
+    const flowBox = {
+      background: bg3, border: `1px solid ${border}`, borderRadius: 8,
+      padding: 16, fontFamily: "monospace", fontSize: 11,
+      lineHeight: 1.8, whiteSpace: "pre-wrap", color: muted
+    };
+
+    const sections = [
+      { icon: "🧬", title: "Anatomía de una Señal" },
+      { icon: "⏱", title: "Barra de Timeframes" },
+      { icon: "🎯", title: "Niveles de Operación" },
+      { icon: "🛡", title: "Trailing Stop" },
+      { icon: "📊", title: "Derivados" },
+      { icon: "🌍", title: "Contexto Macro" },
+      { icon: "💪", title: "Fuerza de la Señal" },
+      { icon: "⚙", title: "Los 13 Factores" },
+      { icon: "📈", title: "Dashboard Macro" },
+      { icon: "🔄", title: "Flujo de Decisión" },
+      { icon: "⚠", title: "Errores Comunes" },
+      { icon: "📖", title: "Glosario" },
+    ];
+
+    const GuideTable = ({ headers, rows }) => (
+      <table style={tableStyle}>
+        <thead><tr>{headers.map((h, i) => <th key={i} style={thStyle}>{h}</th>)}</tr></thead>
+        <tbody>{rows.map((row, ri) => (
+          <tr key={ri}>{row.map((cell, ci) => <td key={ci} style={tdStyle(ri)}>{cell}</td>)}</tr>
+        ))}</tbody>
+      </table>
+    );
+
+    const renderSection = () => {
+      switch(guideSection) {
+        case 0: return (<div>
+          <div style={sectionHeaderStyle}>🧬 1. Anatomía de una Señal</div>
+          <p style={{ color: muted, fontSize: 12, lineHeight: 1.6, marginBottom: 14 }}>Cada tarjeta de señal muestra esta información de arriba a abajo:</p>
+          <div style={{ ...sTitle, marginTop: 10 }}>Encabezado</div>
+          <GuideTable headers={["Elemento", "Significado"]} rows={[
+            ["🟢 + nombre", "Señal de COMPRA"],
+            ["🔴 + nombre", "Señal de VENTA"],
+            ["⚪ + nombre", "HOLD (esperar)"],
+            ["Precio actual", "Último precio del activo"],
+            ["% 24h", "Cambio de precio en las últimas 24 horas"],
+          ]} />
+          <div style={{ ...sTitle, marginTop: 18 }}>Badges (esquina superior derecha)</div>
+          <GuideTable headers={["Badge", "Significado"]} rows={[
+            [<span style={{color: green, fontWeight: 700}}>CONFLUENCIA FUERTE</span>, "Los 3 timeframes (4H, 1H, 15M) están de acuerdo"],
+            [<span style={{color: amber, fontWeight: 700}}>CONFLUENCIA MODERADA</span>, "2 de 3 timeframes de acuerdo"],
+            [<span style={{color: red, fontWeight: 700}}>CONFLICTO</span>, "Los timeframes se contradicen"],
+            ["BUY / SELL / HOLD", "La acción recomendada"],
+            ["X% confianza", "Qué tan seguro está el motor de la señal"],
+            ["Score X/100", "Puntaje general de la señal"],
+          ]} />
+        </div>);
+
+        case 1: return (<div>
+          <div style={sectionHeaderStyle}>⏱ 2. Barra de Timeframes (4H / 1H / 15M)</div>
+          <p style={{ color: muted, fontSize: 12, lineHeight: 1.6, marginBottom: 14 }}>Tres bloques que muestran qué dice cada temporalidad:</p>
+          <GuideTable headers={["Timeframe", "Peso", "Qué representa"]} rows={[
+            [<span style={{fontWeight: 700}}>4H</span>, "40%", "Tendencia macro. La dirección del mercado en las últimas horas."],
+            [<span style={{fontWeight: 700}}>1H</span>, "40%", "Señal principal. El timeframe donde se genera la señal de trading."],
+            [<span style={{fontWeight: 700}}>15M</span>, "20%", "Timing de entrada. Confirma si el momento exacto es bueno para entrar."],
+          ]} />
+          <div style={{ ...sTitle, marginTop: 18 }}>Cómo interpretarlo</div>
+          <div style={{ ...card, padding: 14 }}>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
+              <span style={{ color: green, fontWeight: 700, fontSize: 12 }}>● 3/3 de acuerdo</span>
+              <span style={{ color: muted, fontSize: 11 }}>— Alta probabilidad. Todas las temporalidades apuntan en la misma dirección.</span>
+            </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 8 }}>
+              <span style={{ color: amber, fontWeight: 700, fontSize: 12 }}>● 2/3 de acuerdo</span>
+              <span style={{ color: muted, fontSize: 11 }}>— Probabilidad moderada. Entra con menor posición.</span>
+            </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <span style={{ color: red, fontWeight: 700, fontSize: 12 }}>● Conflicto</span>
+              <span style={{ color: muted, fontSize: 11 }}>— El mercado está indeciso. No operes hasta que se aclare.</span>
+            </div>
+          </div>
+          <div style={tipBox}>💡 <strong>Regla de oro:</strong> El 4H es el "gobernador". Si el 4H dice SELL pero 1H y 15M dicen BUY, la señal se debilita automáticamente. Nunca vayas contra la tendencia macro.</div>
+        </div>);
+
+        case 2: return (<div>
+          <div style={sectionHeaderStyle}>🎯 3. Niveles de Operación (Trade Levels)</div>
+          <p style={{ color: muted, fontSize: 12, lineHeight: 1.6, marginBottom: 14 }}>Este panel solo aparece en señales de BUY o SELL (no en HOLD):</p>
+          <GuideTable headers={["Nivel", "Color", "Qué significa"]} rows={[
+            [<strong>ENTRADA</strong>, <span style={{color: text}}>⬜ Blanco</span>, "Precio al que deberías entrar"],
+            [<strong>STOP LOSS</strong>, <span style={{color: red}}>🟥 Rojo</span>, "Precio máximo de pérdida. Si llega aquí, vende para proteger tu capital."],
+            [<strong>TP1</strong>, <span style={{color: green}}>🟩 Verde</span>, "Primer objetivo de ganancia. Toma al menos 50% de tu posición aquí."],
+            [<strong>TP2</strong>, <span style={{color: green}}>🟩 Verde</span>, "Segundo objetivo (más ambicioso). Deja correr el resto hasta aquí."],
+            [<strong>TRAILING STOP</strong>, <span style={{color: amber}}>🟨 Amarillo</span>, "Stop dinámico que sube con el precio para proteger ganancias."],
+            [<strong>ACTIVA EN</strong>, <span style={{color: text}}>⬜ Blanco</span>, "Precio donde se activa el trailing stop (cuando ya tienes ganancia)."],
+            [<strong>R:R</strong>, <span style={{color: green}}>Verde/Rojo</span>, "Ratio riesgo/recompensa. Verde si ≥ 1.5, rojo si menor."],
+          ]} />
+          <div style={{ ...sTitle, marginTop: 18 }}>Para una señal de BUY - paso a paso</div>
+          <div style={{ ...card, padding: 14 }}>
+            {[
+              "1. Coloca tu orden de compra en el precio de ENTRADA",
+              "2. Inmediatamente coloca un stop-loss en STOP LOSS (protección obligatoria)",
+              "3. Cuando el precio suba a TP1, vende el 50% de tu posición (asegura ganancia)",
+              "4. Activa el TRAILING STOP cuando el precio alcance el nivel de activación",
+              "5. Deja el 50% restante correr hacia TP2 con el trailing protegiéndote"
+            ].map((step, i) => (
+              <div key={i} style={{ color: muted, fontSize: 11, lineHeight: 1.8, paddingLeft: 8, borderLeft: i === 0 ? "none" : undefined }}>
+                {step}
+              </div>
+            ))}
+          </div>
+          <div style={{ ...sTitle, marginTop: 18 }}>Ratio Riesgo/Recompensa (R:R)</div>
+          <GuideTable headers={["R:R", "Interpretación", "Acción"]} rows={[
+            ["≥ 2.5", "Excelente", <span style={{color: green}}>Operar con posición completa</span>],
+            ["≥ 1.5", "Aceptable", "Operar normalmente"],
+            ["< 1.5", <span style={{color: red, fontWeight: 700}}>Peligroso</span>, <span style={{color: red}}>NO operes. Arriesgas más de lo que puedes ganar.</span>],
+          ]} />
+        </div>);
+
+        case 3: return (<div>
+          <div style={sectionHeaderStyle}>🛡 4. Trailing Stop - Tu Protector de Ganancias</div>
+          <p style={{ color: muted, fontSize: 12, lineHeight: 1.6, marginBottom: 14 }}>El trailing stop es un stop-loss que se mueve automáticamente a tu favor:</p>
+          <GuideTable headers={["Concepto", "Detalle"]} rows={[
+            [<strong>Distancia inicial</strong>, "2.5 × ATR (más ancho que acciones por la volatilidad crypto)"],
+            [<strong>Se activa cuando</strong>, "Tu trade tiene 1 ATR de ganancia"],
+            [<strong>Paso</strong>, "Sube 1 ATR cada vez que el precio avanza"],
+          ]} />
+          <div style={{ ...sTitle, marginTop: 18 }}>Ejemplo práctico (BUY en Bitcoin a $100,000)</div>
+          <div style={{ ...card, padding: 14, fontFamily: "monospace", fontSize: 11, lineHeight: 2, color: muted }}>
+            <div>ATR = $2,000</div>
+            <div>Trailing stop inicial: <span style={{color: amber}}>$95,000</span> (100,000 - 2.5 × 2,000)</div>
+            <div>Se activa en: <span style={{color: text}}>$102,000</span> (ganancia de 1 ATR)</div>
+            <div>BTC sube a $104,000 → trailing sube a <span style={{color: amber}}>$99,000</span></div>
+            <div>BTC sube a $108,000 → trailing sube a <span style={{color: amber}}>$103,000</span></div>
+            <div>BTC cae a $103,000 → vendes con <span style={{color: green}}>ganancia de $3,000</span></div>
+          </div>
+          <div style={alertBox}>⚠ <strong>Sin trailing stop:</strong> Muchos traders ven +20% de ganancia y luego el precio se devuelve a 0%. El trailing evita esto.</div>
+        </div>);
+
+        case 4: return (<div>
+          <div style={sectionHeaderStyle}>📊 5. Derivados (Funding Rate, L/S Ratio)</div>
+          <p style={{ color: muted, fontSize: 12, lineHeight: 1.6, marginBottom: 14 }}>Esta fila muestra datos del mercado de futuros de Binance:</p>
+          <div style={{ ...sTitle }}>Funding Rate</div>
+          <GuideTable headers={["Valor", "Color", "Significado"]} rows={[
+            ["> +0.10%", <span style={{color: red}}>🔴</span>, <span style={{color: red}}>Peligro: Demasiados longs apalancados. Probable caída.</span>],
+            ["+0.05% a +0.10%", <span style={{color: red}}>🔴</span>, "Cautela: Longs elevados"],
+            ["-0.05% a +0.05%", "Normal", "Mercado equilibrado"],
+            ["-0.05% a -0.10%", <span style={{color: green}}>🟢</span>, "Oportunidad: Shorts elevados, posible squeeze alcista"],
+            ["< -0.10%", <span style={{color: green}}>🟢</span>, <span style={{color: green}}>Shorts extremos: Alta probabilidad de rebote explosivo</span>],
+          ]} />
+          <div style={tipBox}>💡 <strong>Clave:</strong> El funding rate es una señal <strong>contraria</strong>. Cuando todo el mundo está long (funding alto positivo), es probable que el precio caiga para liquidarlos.</div>
+          <div style={{ ...sTitle, marginTop: 14 }}>Long/Short Ratio</div>
+          <GuideTable headers={["Valor", "Significado"]} rows={[
+            ["> 2.0", "Longs abrumadores. Riesgo de liquidación en cascada hacia abajo."],
+            ["1.0 - 2.0", "Sesgo alcista moderado"],
+            ["0.67 - 1.0", "Equilibrado"],
+            ["< 0.5", "Shorts abrumadores. Riesgo de squeeze alcista."],
+          ]} />
+          <div style={{ ...sTitle, marginTop: 14 }}>Sentimiento</div>
+          <GuideTable headers={["Etiqueta", "Significado"]} rows={[
+            [<span style={{color: red}}>OVER LEVERAGED LONG</span>, "Exceso de apalancamiento alcista. Cuidado con comprar."],
+            [<span style={{color: green}}>OVER LEVERAGED SHORT</span>, "Exceso de apalancamiento bajista. Oportunidad de compra."],
+            ["NEUTRAL", "Posicionamiento equilibrado"],
+          ]} />
+        </div>);
+
+        case 5: return (<div>
+          <div style={sectionHeaderStyle}>🌍 6. Contexto Macro (BTC Dominance + DXY)</div>
+          <div style={{ ...sTitle }}>BTC Dominance (Dominancia de Bitcoin)</div>
+          <GuideTable headers={["Badge", "Color", "Significado", "Qué hacer"]} rows={[
+            [<span style={{color: green, fontWeight: 700}}>ALT SEASON</span>, <span style={{color: green}}>🟢</span>, "BTC dom baja (<45%). Dinero rotando a altcoins.", "Comprar altcoins."],
+            [<span style={{color: red, fontWeight: 700}}>BTC SEASON</span>, <span style={{color: red}}>🔴</span>, "BTC dom alta (>55%). Dinero concentrado en BTC.", "Solo operar BTC. Evitar alts."],
+            ["(no aparece)", "—", "Neutral (45-55%)", "Operar normalmente"],
+          ]} />
+          <div style={alertBox}>🚨 <strong>Regla crítica:</strong> Cuando ves "BTC SEASON" en rojo, no compres altcoins aunque la señal diga BUY. Las alts caen 2-3x más que BTC en estas fases.</div>
+          <div style={{ ...sTitle, marginTop: 14 }}>DXY (Índice del Dólar)</div>
+          <GuideTable headers={["Badge", "Color", "Significado", "Qué hacer"]} rows={[
+            [<span style={{color: green, fontWeight: 700}}>DXY RISK ON</span>, <span style={{color: green}}>🟢</span>, "Dólar débil y cayendo. Dinero fluye a crypto.", "Operar con confianza. Macro a favor."],
+            [<span style={{color: red, fontWeight: 700}}>DXY RISK OFF</span>, <span style={{color: red}}>🔴</span>, "Dólar fuerte y subiendo. Dinero sale de crypto.", "Reducir exposición. Macro en contra."],
+            ["(no aparece)", "—", "DXY estable", "Operar normalmente"],
+          ]} />
+          <div style={tipBox}>💡 La correlación inversa entre DXY y crypto es de ~85%. Cuando el dólar sube fuerte, crypto baja.</div>
+        </div>);
+
+        case 6: return (<div>
+          <div style={sectionHeaderStyle}>💪 7. Fuerza de la Señal</div>
+          <p style={{ color: muted, fontSize: 12, lineHeight: 1.6, marginBottom: 14 }}>Qué tan en serio tomar cada señal:</p>
+          <GuideTable headers={["Etiqueta", "Score", "Confianza", "Posición sugerida"]} rows={[
+            [<span style={{color: green, fontWeight: 700}}>STRONG BUY</span>, "≥ 75", "≥ 60%", "100% de tu tamaño normal"],
+            [<span style={{color: green}}>BUY</span>, "≥ 67", "≥ 45%", "75% de tu tamaño normal"],
+            [<span style={{color: amber}}>WEAK BUY</span>, "≥ 62", "< 45%", "50% o menos"],
+            ["HOLD", "38-62", "Cualquiera", <span style={{color: amber, fontWeight: 700}}>No operes. Espera mejor oportunidad.</span>],
+            [<span style={{color: amber}}>WEAK SELL</span>, "≤ 38", "< 45%", "Posición pequeña o no compres"],
+            [<span style={{color: red}}>SELL</span>, "≤ 33", "≥ 45%", "75% (short o cierra long)"],
+            [<span style={{color: red, fontWeight: 700}}>STRONG SELL</span>, "≤ 25", "≥ 60%", "Cierra posiciones long. Protege capital."],
+          ]} />
+        </div>);
+
+        case 7: return (<div>
+          <div style={sectionHeaderStyle}>⚙ 8. Los 13 Factores del Motor de Señales</div>
+          <p style={{ color: muted, fontSize: 12, lineHeight: 1.6, marginBottom: 14 }}>Cada señal se genera analizando estos 13 factores:</p>
+          <GuideTable headers={["#", "Factor", "Peso máx", "Qué analiza"]} rows={[
+            ["1", <strong>Tendencia EMA</strong>, "±20", "Dirección de medias móviles 9, 21, 50"],
+            ["2", <strong>ADX</strong>, "Multi.", "Fuerza de la tendencia (amplifica o reduce)"],
+            ["3", <strong>RSI</strong>, "±18", "Sobrecompra/sobreventa"],
+            ["4", <strong>MACD</strong>, "±15", "Momentum y cruces de señal"],
+            ["5", <strong>Bollinger Bands</strong>, "±10", "Volatilidad y posición del precio"],
+            ["6", <strong>Soporte/Resistencia</strong>, "±8", "Niveles clave de precio"],
+            ["7", <strong>Divergencias RSI</strong>, "±20", "Divergencias ocultas (cambios de tendencia)"],
+            ["8", <strong>Volumen</strong>, "±10", "Confirmación o negación del movimiento"],
+            ["9", <strong>Momentum 24h</strong>, "±10", "Fuerza del cambio diario"],
+            ["10", <strong>Fear & Greed</strong>, "±3", "Sentimiento extremo (contrarian)"],
+            ["11", <strong>Derivados</strong>, "±15", "Funding rate, OI, L/S ratio"],
+            ["12", <strong>BTC Dominance</strong>, "±10", "Flujo de capital BTC vs Alts"],
+            ["13", <strong>DXY Macro</strong>, "±10", "Fortaleza del dólar (contexto macro global)"],
+          ]} />
+        </div>);
+
+        case 8: return (<div>
+          <div style={sectionHeaderStyle}>📈 9. Dashboard - Sección Macro</div>
+          <p style={{ color: muted, fontSize: 12, lineHeight: 1.6, marginBottom: 14 }}>En el dashboard principal verás estas estadísticas:</p>
+          <GuideTable headers={["Indicador", "Qué es", "Cómo leerlo"]} rows={[
+            [<strong>Fear & Greed</strong>, "Sentimiento del mercado (0-100)", "< 25 = miedo extremo (oportunidad). > 75 = codicia (precaución)."],
+            [<strong>BTC Dominance</strong>, "% del mercado total que es Bitcoin", "> 55% = BTC season. < 45% = alt season."],
+            [<strong>DXY (Dollar)</strong>, "Índice de fuerza del dólar", "Rising = bearish crypto. Falling = bullish crypto."],
+            [<strong>Total Market Cap</strong>, "Capitalización total crypto", "Tendencia general del mercado"],
+            [<strong>Gold / Silver</strong>, "Precios de metales preciosos", "Refugios de valor. Si suben junto con crypto, el movimiento es más fuerte."],
+          ]} />
+        </div>);
+
+        case 9: return (<div>
+          <div style={sectionHeaderStyle}>🔄 10. Flujo de Decisión para Operar</div>
+          <p style={{ color: muted, fontSize: 12, lineHeight: 1.6, marginBottom: 14 }}>Sigue este proceso antes de cada trade:</p>
+          <div style={flowBox}>{`1. Mira la ACCIÓN (BUY/SELL/HOLD)
+   └─ HOLD? → NO OPERES. Espera.
+   └─ BUY o SELL? → Continúa...
+
+2. Verifica CONFLUENCIA
+   └─ Conflicto/Débil? → NO OPERES
+   └─ Moderada? → Reduce tamaño de posición a 50%
+   └─ Fuerte? → Posición normal. Continúa...
+
+3. Revisa R:R (Riesgo/Recompensa)
+   └─ < 1.5? → NO OPERES. No vale la pena.
+   └─ ≥ 1.5? → Continúa...
+
+4. Chequea DERIVADOS
+   └─ Funding > +0.10%? → Cuidado con BUY
+   └─ Funding < -0.10%? → Cuidado con SELL
+   └─ Normal? → Continúa...
+
+5. Revisa MACRO
+   └─ BTC SEASON + operando alt? → NO COMPRES
+   └─ DXY RISK OFF? → Reduce exposición
+   └─ Todo OK? → Continúa...
+
+6. EJECUTA
+   ✓ Compra/vende en precio de ENTRADA
+   ✓ Coloca STOP LOSS inmediatamente
+   ✓ Programa TP1 (vende 50%)
+   ✓ Activa TRAILING STOP en el nivel indicado
+   ✓ Deja correr el resto hacia TP2`}</div>
+        </div>);
+
+        case 10: return (<div>
+          <div style={sectionHeaderStyle}>⚠ 11. Errores Comunes a Evitar</div>
+          <GuideTable headers={["Error", "Por qué es peligroso", "Qué hacer"]} rows={[
+            [<strong>Operar sin stop-loss</strong>, "Una sola caída puede destruir tu cuenta", <span style={{color: green}}>Siempre usa el SL que indica la señal</span>],
+            [<strong>Ignorar R:R {'<'} 1.5</strong>, "Arriesgas más de lo que puedes ganar", "Si es rojo, no operes"],
+            [<strong>Comprar alts en BTC SEASON</strong>, "Las alts caen 2-3x más que BTC", "Solo opera BTC con badge rojo"],
+            [<strong>Ignorar confluencia en conflicto</strong>, "Los timeframes se contradicen", "Espera a que se alineen"],
+            [<strong>No tomar ganancias en TP1</strong>, "El precio puede devolverse a 0%", "Siempre vende al menos 50% en TP1"],
+            [<strong>WEAK BUY como STRONG</strong>, "Son señales muy diferentes en fiabilidad", "Reduce posición o espera mejor señal"],
+            [<strong>Ignorar funding rate extremo</strong>, "Las liquidaciones masivas causan crashes", "Si funding > 0.10%, no compres"],
+          ]} />
+        </div>);
+
+        case 11: return (<div>
+          <div style={sectionHeaderStyle}>📖 12. Glosario Rápido</div>
+          <GuideTable headers={["Término", "Significado"]} rows={[
+            [<strong>ATR</strong>, "Average True Range. Mide la volatilidad típica del activo."],
+            [<strong>RSI</strong>, "Relative Strength Index. Sobrecompra (>70) y sobreventa (<30)."],
+            [<strong>MACD</strong>, "Indicador de momentum. Cruces indican cambios de tendencia."],
+            [<strong>EMA</strong>, "Media móvil exponencial. 9 > 21 > 50 = tendencia alcista."],
+            [<strong>Bollinger Bands</strong>, "Bandas de volatilidad. Precio fuera = movimiento extremo."],
+            [<strong>ADX</strong>, "Mide fuerza de tendencia. > 30 = fuerte. < 20 = sin tendencia."],
+            [<strong>Funding Rate</strong>, "Tasa que pagan longs a shorts (o viceversa) cada 8 horas."],
+            [<strong>OI</strong>, "Open Interest. Total de posiciones abiertas en futuros."],
+            [<strong>L/S Ratio</strong>, "Proporción de longs vs shorts en el mercado."],
+            [<strong>DXY</strong>, "Índice del dólar americano contra una canasta de monedas."],
+            [<strong>Trailing Stop</strong>, "Stop-loss que se mueve automáticamente a tu favor."],
+            [<strong>R:R</strong>, "Risk/Reward. Cuánto puedes ganar vs cuánto puedes perder."],
+            [<strong>Confluence</strong>, "Cuando múltiples timeframes están de acuerdo en la dirección."],
+          ]} />
+          <div style={{ textAlign: "center", marginTop: 20, fontSize: 10, color: muted, fontFamily: "monospace" }}>
+            Sentix Pro v4.5 · Motor de 13 factores · Multi-timeframe · Derivados · Contexto Macro
+          </div>
+        </div>);
+
+        default: return null;
+      }
+    };
+
+    return (
+      <div>
+        {/* Guide Header */}
+        <div style={{
+          ...card,
+          background: `linear-gradient(135deg, rgba(168,85,247,0.12), rgba(59,130,246,0.08))`,
+          border: `1px solid rgba(168,85,247,0.3)`,
+          textAlign: "center", padding: "24px 20px"
+        }}>
+          <div style={{ fontSize: 32, marginBottom: 8 }}>📖</div>
+          <div style={{ fontSize: 18, fontWeight: 800, letterSpacing: "0.02em" }}>
+            GUÍA COMPLETA DE SEÑALES
+          </div>
+          <div style={{ fontSize: 11, color: muted, marginTop: 6, lineHeight: 1.5 }}>
+            Cómo interpretar y utilizar las señales de Sentix Pro para un trading efectivo
+          </div>
+          <div style={{
+            display: "inline-block", marginTop: 10, padding: "4px 12px",
+            background: "rgba(168,85,247,0.2)", borderRadius: 20,
+            fontSize: 10, color: purple, fontWeight: 700
+          }}>
+            v4.5 · 13 Factores · Multi-Timeframe
+          </div>
+        </div>
+
+        {/* Section Navigation */}
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 16 }}>
+          {sections.map((sec, i) => (
+            <button
+              key={i}
+              onClick={() => setGuideSection(i)}
+              style={{
+                padding: "6px 12px",
+                background: guideSection === i ? `linear-gradient(135deg, ${purple}, #7c3aed)` : bg3,
+                border: guideSection === i ? "none" : `1px solid ${border}`,
+                borderRadius: 6,
+                color: guideSection === i ? "#fff" : muted,
+                fontFamily: "monospace",
+                fontSize: 10,
+                fontWeight: guideSection === i ? 700 : 500,
+                cursor: "pointer",
+                transition: "all 0.2s"
+              }}
+            >
+              {sec.icon} {sec.title}
+            </button>
+          ))}
+        </div>
+
+        {/* Section Content */}
+        <div style={{ ...card, padding: "20px 24px" }}>
+          {renderSection()}
+        </div>
+
+        {/* Navigation arrows */}
+        <div style={{ display: "flex", justifyContent: "space-between", marginTop: 8 }}>
+          <button
+            onClick={() => setGuideSection(Math.max(0, guideSection - 1))}
+            disabled={guideSection === 0}
+            style={{
+              padding: "8px 16px", background: bg3, border: `1px solid ${border}`,
+              borderRadius: 6, color: guideSection === 0 ? muted : text,
+              fontFamily: "monospace", fontSize: 11, cursor: guideSection === 0 ? "default" : "pointer",
+              opacity: guideSection === 0 ? 0.4 : 1
+            }}
+          >
+            ← Anterior
+          </button>
+          <span style={{ fontSize: 10, color: muted, fontFamily: "monospace", alignSelf: "center" }}>
+            {guideSection + 1} / {sections.length}
+          </span>
+          <button
+            onClick={() => setGuideSection(Math.min(sections.length - 1, guideSection + 1))}
+            disabled={guideSection === sections.length - 1}
+            style={{
+              padding: "8px 16px", background: bg3, border: `1px solid ${border}`,
+              borderRadius: 6, color: guideSection === sections.length - 1 ? muted : text,
+              fontFamily: "monospace", fontSize: 11, cursor: guideSection === sections.length - 1 ? "default" : "pointer",
+              opacity: guideSection === sections.length - 1 ? 0.4 : 1
+            }}
+          >
+            Siguiente →
+          </button>
+        </div>
+      </div>
+    );
+  };
+
   // ─── LOADING STATE ─────────────────────────────────────────────────────────
   if (loading) {
     return (
@@ -1651,7 +2575,9 @@ export default function SentixProFrontend() {
             { k: "dashboard", label: "📊 DASHBOARD", desc: "Overview" },
             { k: "signals", label: "🎯 SEÑALES", desc: "Todas las alertas" },
             { k: "portfolio", label: "💼 PORTFOLIO", desc: "Tus posiciones" },
-            { k: "alerts", label: "🔔 ALERTAS", desc: "Configuración" }
+            { k: "alerts", label: "🔔 ALERTAS", desc: "Configuración" },
+            { k: "paper", label: "📈 PAPER", desc: "Trading simulado" },
+            { k: "guide", label: "📖 GUÍA", desc: "Cómo usar" }
           ].map(({ k, label, desc }) => (
             <button
               key={k}
@@ -1682,6 +2608,8 @@ export default function SentixProFrontend() {
         {tab === "signals" && <SignalsTab />}
         {tab === "portfolio" && <PortfolioTab />}
         {tab === "alerts" && <AlertsTab />}
+        {tab === "paper" && <PaperTradingTab />}
+        {tab === "guide" && <GuideTab />}
 
         {/* Footer */}
         <div style={{
