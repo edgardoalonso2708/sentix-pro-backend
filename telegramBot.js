@@ -1,10 +1,10 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// SENTIX PRO - TELEGRAM BOT WRAPPER (SILENT MODE + ALERT DELIVERY)
-// Bot opcional sin spam de errores, con entrega automática de alertas
-// Phase 0: Hardened with structured logging
+// SENTIX PRO - TELEGRAM BOT (Custom polling — no library conflicts)
+// Uses node-telegram-bot-api only for sendMessage, with manual getUpdates loop
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const TelegramBot = require('node-telegram-bot-api');
+const https = require('https');
 const { logger } = require('./logger');
 
 class SilentTelegramBot {
@@ -12,53 +12,24 @@ class SilentTelegramBot {
     this.enabled = false;
     this.bot = null;
     this.subscribedChatIds = new Set();
+    this._token = token;
+    this._offset = 0;
+    this._polling = false;
+    this._handlers = [];
 
-    // Validate token format: must be like "123456789:ABCdef..."
     const isValidToken = token &&
       token.length > 20 &&
       !token.includes('YOUR_') &&
       /^\d+:[A-Za-z0-9_-]+$/.test(token);
 
     if (isValidToken) {
-      try {
-        this.bot = new TelegramBot(token, {
-          polling: {
-            interval: 1000,
-            autoStart: true,
-            params: {
-              timeout: 10
-            }
-          }
-        });
-
-        // Track polling errors but don't spam
-        let errorCount = 0;
-        this.bot.on('polling_error', (error) => {
-          errorCount++;
-          if (errorCount <= 3) {
-            logger.warn('Telegram polling error', { count: errorCount, error: error.message });
-          }
-          if (errorCount === 3) {
-            logger.warn('Telegram: suppressing further polling errors');
-          }
-          // If persistent auth errors, mark as disabled and stop polling
-          if (error.response?.statusCode === 401) {
-            logger.error('Telegram Bot token is INVALID (401 Unauthorized). Bot disabled.');
-            this.enabled = false;
-            try { this.bot.stopPolling(); } catch (_e) { /* silent */ }
-          }
-        });
-
-        this.enabled = true;
-        logger.info('Telegram Bot initialized');
-
-      } catch (error) {
-        logger.warn('Telegram Bot disabled (invalid token or network issue)');
-        this.enabled = false;
-      }
+      // Create bot instance WITHOUT polling — only used for sendMessage
+      this.bot = new TelegramBot(token, { polling: false });
+      this.enabled = true;
+      logger.info('Telegram Bot initialized');
     } else {
       if (token && token.length > 5) {
-        logger.warn('Telegram Bot token format invalid (expected: 123456789:ABCdef...)');
+        logger.warn('Telegram Bot token format invalid');
       } else {
         logger.info('Telegram Bot not configured (set TELEGRAM_BOT_TOKEN)');
       }
@@ -66,49 +37,140 @@ class SilentTelegramBot {
   }
 
   /**
-   * Subscribe a chat to receive automatic alerts
+   * Start our own polling loop — single connection, no library conflicts
    */
+  async startCustomPolling() {
+    if (!this.enabled || this._polling) return;
+    this._polling = true;
+
+    // Clear stale sessions first
+    try {
+      await this._apiCall('deleteWebhook', { drop_pending_updates: true });
+      logger.info('Telegram: webhook cleared');
+    } catch (_) {}
+
+    await new Promise(r => setTimeout(r, 1000));
+    logger.info('Telegram: custom polling started');
+    this._pollLoop();
+  }
+
+  /**
+   * Single polling loop using getUpdates with long-poll
+   */
+  async _pollLoop() {
+    while (this._polling) {
+      try {
+        const data = await this._apiCall('getUpdates', {
+          offset: this._offset,
+          limit: 20,
+          timeout: 15
+        });
+
+        if (data.ok && data.result && data.result.length > 0) {
+          for (const update of data.result) {
+            this._offset = update.update_id + 1;
+            this._processUpdate(update);
+          }
+        }
+      } catch (err) {
+        const msg = err.message || '';
+        if (msg.includes('409')) {
+          // Conflict — wait and retry (should clear after old connection expires)
+          logger.warn('Telegram: 409 conflict in poll loop, waiting 15s');
+          await new Promise(r => setTimeout(r, 15000));
+        } else if (msg.includes('401')) {
+          logger.error('Telegram: 401 Unauthorized — bot disabled');
+          this.enabled = false;
+          this._polling = false;
+          return;
+        } else {
+          // Network error or timeout — brief pause then retry
+          await new Promise(r => setTimeout(r, 3000));
+        }
+      }
+    }
+  }
+
+  /**
+   * Process a single Telegram update
+   */
+  _processUpdate(update) {
+    if (!update.message || !update.message.text) return;
+    const text = update.message.text;
+    for (const { regex, callback } of this._handlers) {
+      const match = text.match(regex);
+      if (match) {
+        try { callback(update.message, match); } catch (e) {
+          logger.warn('Telegram handler error', { error: e.message });
+        }
+      }
+    }
+  }
+
+  /**
+   * Call Telegram Bot API via HTTPS (with timeout)
+   */
+  _apiCall(method, params = {}) {
+    return new Promise((resolve, reject) => {
+      const query = Object.entries(params)
+        .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+        .join('&');
+      const url = `https://api.telegram.org/bot${this._token}/${method}${query ? '?' + query : ''}`;
+
+      const req = https.get(url, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          try {
+            const json = JSON.parse(data);
+            if (!json.ok) {
+              const err = new Error(json.description || 'API error');
+              err.statusCode = json.error_code;
+              reject(err);
+            } else {
+              resolve(json);
+            }
+          } catch { reject(new Error('Invalid JSON response')); }
+        });
+      });
+
+      req.on('error', reject);
+      // Timeout: polling timeout (15s) + 5s buffer
+      req.setTimeout(20000, () => {
+        req.destroy();
+        reject(new Error('Request timeout'));
+      });
+    });
+  }
+
+  // ─── Standard bot methods ───────────────────────────────────────────────
+
   subscribe(chatId) {
     this.subscribedChatIds.add(chatId);
     logger.info('Telegram subscriber added', { chatId, total: this.subscribedChatIds.size });
   }
 
-  /**
-   * Unsubscribe a chat from automatic alerts
-   */
   unsubscribe(chatId) {
     this.subscribedChatIds.delete(chatId);
     logger.info('Telegram subscriber removed', { chatId, total: this.subscribedChatIds.size });
   }
 
-  /**
-   * Get all subscribed chat IDs
-   */
   getSubscribers() {
     return [...this.subscribedChatIds];
   }
 
-  /**
-   * Send message (silent fail if bot not enabled)
-   */
   async sendMessage(chatId, message, options = {}) {
     if (!this.enabled || !this.bot) {
       return { success: false, reason: 'bot_disabled' };
     }
-
     try {
       await this.bot.sendMessage(chatId, message, options);
       return { success: true };
     } catch (error) {
-      // Silent fail - no spam
       return { success: false, reason: error.message };
     }
   }
 
-  /**
-   * Broadcast alert to all subscribed chats
-   * Returns count of successful deliveries
-   */
   async broadcastAlert(signal) {
     if (!this.enabled || this.subscribedChatIds.size === 0) {
       return { sent: 0, total: this.subscribedChatIds.size };
@@ -129,49 +191,33 @@ class SilentTelegramBot {
       const result = await this.sendMessage(chatId, message, { parse_mode: 'Markdown' });
       if (result.success) sent++;
     }
-
     return { sent, total: this.subscribedChatIds.size };
   }
 
   /**
-   * Register command handler
+   * Register command handler (replaces library's onText)
    */
   onText(regex, callback) {
-    if (this.enabled && this.bot) {
-      this.bot.onText(regex, callback);
+    if (this.enabled) {
+      this._handlers.push({ regex, callback });
     }
   }
 
-  /**
-   * Check if bot is active
-   */
   isActive() {
     return this.enabled;
   }
 
-  /**
-   * Stop bot gracefully
-   */
   stop() {
-    if (this.bot) {
-      try {
-        this.bot.stopPolling();
-      } catch (error) {
-        // Silent
-      }
-    }
+    this._polling = false;
   }
 }
 
 /**
- * Setup Telegram bot commands if enabled
+ * Setup Telegram bot commands
  */
 function setupTelegramCommands(bot, marketDataGetter, signalsGetter) {
-  if (!bot.isActive()) {
-    return;
-  }
+  if (!bot.isActive()) return;
 
-  // /start command - auto-subscribe to alerts
   bot.onText(/\/start/, async (msg) => {
     const chatId = msg.chat.id;
     bot.subscribe(chatId);
@@ -188,27 +234,19 @@ function setupTelegramCommands(bot, marketDataGetter, signalsGetter) {
     );
   });
 
-  // /stop command - unsubscribe from alerts
   bot.onText(/\/stop/, async (msg) => {
     const chatId = msg.chat.id;
     bot.unsubscribe(chatId);
-    await bot.sendMessage(
-      chatId,
-      '🔕 Alertas desactivadas.\nEnvía /start para reactivarlas.',
-      { parse_mode: 'Markdown' }
-    );
+    await bot.sendMessage(chatId, '🔕 Alertas desactivadas.\nEnvía /start para reactivarlas.', { parse_mode: 'Markdown' });
   });
 
-  // /señales command - show active signals
   bot.onText(/\/se[ñn]ales/, async (msg) => {
     const chatId = msg.chat.id;
     const signals = signalsGetter ? signalsGetter() : [];
-
     if (!signals || signals.length === 0) {
       await bot.sendMessage(chatId, '📊 No hay señales activas en este momento.');
       return;
     }
-
     let message = '🎯 *Señales Activas*\n\n';
     signals.slice(0, 5).forEach(s => {
       const emoji = s.action === 'BUY' ? '🟢' : s.action === 'SELL' ? '🔴' : '⚪';
@@ -216,15 +254,12 @@ function setupTelegramCommands(bot, marketDataGetter, signalsGetter) {
       message += `   Score: ${s.score} | Confianza: ${s.confidence}%\n`;
       message += `   Precio: $${Number(s.price).toLocaleString()}\n\n`;
     });
-
     await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
   });
 
-  // /precio command
   bot.onText(/\/precio (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
     const asset = match[1].toLowerCase();
-
     const marketData = marketDataGetter();
     if (marketData && marketData.crypto && marketData.crypto[asset]) {
       const data = marketData.crypto[asset];
@@ -240,11 +275,9 @@ function setupTelegramCommands(bot, marketDataGetter, signalsGetter) {
     }
   });
 
-  // /mercado command
   bot.onText(/\/mercado/, async (msg) => {
     const chatId = msg.chat.id;
     const marketData = marketDataGetter();
-
     if (marketData && marketData.macro) {
       await bot.sendMessage(
         chatId,

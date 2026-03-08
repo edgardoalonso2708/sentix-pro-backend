@@ -2244,6 +2244,11 @@ if (require.main === module) {
     // Load Telegram subscribers from database
     await loadTelegramSubscribers();
 
+    // Start Telegram custom polling (after subscribers loaded, commands registered)
+    if (bot.isActive() && bot.startCustomPolling) {
+      bot.startCustomPolling();
+    }
+
     // Fetch fresh market data and generate new signals
     await updateMarketData();
     await generateSignals();
