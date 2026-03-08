@@ -863,11 +863,12 @@ function scoreDxyMacro(dxy, dxyTrend, dxyChange) {
 // + Trade levels (SL/TP/R:R) + Derivatives + Macro context + Multi-timeframe
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, interval = '1h', derivativesData = null, macroData = null) {
+async function generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, interval = '1h', derivativesData = null, macroData = null, preloadedCandles = null) {
   try {
     // Fetch candles - 168 for 1h (7 days), more for lower timeframes
+    // If preloadedCandles provided (backtesting), use those instead of fetching
     const candleLimit = interval === '1h' ? 200 : (interval.includes('m') ? 288 : 100);
-    const ohlcvData = await fetchOHLCVCandles(asset, interval, candleLimit);
+    const ohlcvData = preloadedCandles || await fetchOHLCVCandles(asset, interval, candleLimit);
 
     if (ohlcvData.length < 50) {
       return {
@@ -1328,14 +1329,15 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
  * @param {Object|null} derivativesData
  * @returns {Promise<Object>} Merged signal with confluence data
  */
-async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volume, fearGreed, derivativesData = null, macroData = null) {
+async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volume, fearGreed, derivativesData = null, macroData = null, preloadedCandlesMap = null) {
   // Run all three timeframes in parallel
   // Pass derivatives only to 1h (primary) to avoid triple-counting
   // Pass macroData only to 1h to avoid triple-counting macro impact
+  // If preloadedCandlesMap provided (backtesting), pass candles per timeframe
   const [signal4h, signal1h, signal15m] = await Promise.all([
-    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '4h', null, null),
-    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '1h', derivativesData, macroData),
-    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '15m', null, null)
+    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '4h', null, null, preloadedCandlesMap?.['4h'] || null),
+    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '1h', derivativesData, macroData, preloadedCandlesMap?.['1h'] || null),
+    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '15m', null, null, preloadedCandlesMap?.['15m'] || null)
   ]);
 
   // Classify each timeframe's direction

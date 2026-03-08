@@ -58,6 +58,7 @@ const {
   executeFullClose,
   resolveCurrentPrice
 } = require('./paperTrading');
+const { runBacktest } = require('./backtester');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -1871,6 +1872,175 @@ app.post('/api/paper/close/:tradeId', async (req, res) => {
     res.json({ trade: closedTrade, pnl });
   } catch (error) {
     logger.error('Paper manual close failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BACKTEST API ROUTES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── Launch a backtest ───────────────────────────────────────────────────────
+app.post('/api/backtest/run', async (req, res) => {
+  try {
+    const {
+      asset = 'bitcoin',
+      days = 90,
+      capital = 10000,
+      riskPerTrade = 0.02,
+      maxOpenPositions = 3,
+      minConfluence = 2,
+      minRR = 1.5,
+      stepInterval = '4h',
+      allowedStrength = ['STRONG BUY', 'STRONG SELL'],
+      cooldownBars = 6,
+      userId = 'default-user'
+    } = req.body;
+
+    // Validate inputs
+    if (days < 7 || days > 365) return res.status(400).json({ error: 'days must be between 7 and 365' });
+    if (capital < 100) return res.status(400).json({ error: 'capital must be at least 100' });
+    if (!['1h', '4h'].includes(stepInterval)) return res.status(400).json({ error: 'stepInterval must be 1h or 4h' });
+
+    // Create backtest record with status='running'
+    const { data: record, error: insertError } = await supabase
+      .from('backtest_results')
+      .insert({
+        user_id: userId,
+        asset,
+        days,
+        step_interval: stepInterval,
+        initial_capital: capital,
+        risk_per_trade: riskPerTrade,
+        max_open_positions: maxOpenPositions,
+        min_confluence: minConfluence,
+        min_rr_ratio: minRR,
+        allowed_strength: allowedStrength,
+        status: 'running',
+        progress: 0
+      })
+      .select()
+      .single();
+
+    if (insertError) {
+      logger.error('Failed to create backtest record', { error: insertError.message });
+      return res.status(500).json({ error: 'Failed to create backtest record' });
+    }
+
+    // Return immediately, run backtest in background
+    res.json({ id: record.id, status: 'running' });
+
+    // Execute backtest asynchronously
+    (async () => {
+      try {
+        const result = await runBacktest({
+          asset,
+          days,
+          interval: stepInterval,
+          capital,
+          riskPerTrade,
+          maxOpenPositions,
+          minConfluence,
+          minRR,
+          allowedStrength,
+          cooldownBars,
+          fearGreed: 50,
+          derivativesData: null,
+          macroData: null
+        }, async (progress) => {
+          // Update progress in DB
+          await supabase
+            .from('backtest_results')
+            .update({ progress })
+            .eq('id', record.id);
+        });
+
+        // Save completed results
+        await supabase
+          .from('backtest_results')
+          .update({
+            status: 'completed',
+            progress: 100,
+            total_trades: result.totalTrades,
+            win_count: result.winCount,
+            loss_count: result.lossCount,
+            win_rate: result.winRate,
+            total_pnl: result.totalPnl,
+            total_pnl_percent: result.totalPnlPercent,
+            max_drawdown: result.maxDrawdown,
+            max_drawdown_percent: result.maxDrawdownPercent,
+            profit_factor: result.profitFactor,
+            sharpe_ratio: result.sharpeRatio,
+            avg_holding_hours: result.avgHoldingHours,
+            trades: result.trades,
+            equity_curve: result.equityCurve,
+            metrics: result,
+            completed_at: new Date().toISOString()
+          })
+          .eq('id', record.id);
+
+        logger.info(`Backtest completed: ${record.id}`, {
+          asset, days, trades: result.totalTrades, pnl: result.totalPnl
+        });
+
+        // Broadcast via SSE
+        broadcastSSE('backtest_complete', { id: record.id, asset, status: 'completed' });
+
+      } catch (err) {
+        logger.error(`Backtest failed: ${record.id}`, { error: err.message });
+        await supabase
+          .from('backtest_results')
+          .update({
+            status: 'failed',
+            error_message: err.message,
+            completed_at: new Date().toISOString()
+          })
+          .eq('id', record.id);
+      }
+    })();
+
+  } catch (error) {
+    logger.error('Backtest launch failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ─── Get backtest results by ID ──────────────────────────────────────────────
+app.get('/api/backtest/results/:id', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('backtest_results')
+      .select('*')
+      .eq('id', req.params.id)
+      .single();
+
+    if (error || !data) return res.status(404).json({ error: 'Backtest not found' });
+
+    res.json(data);
+  } catch (error) {
+    logger.error('Backtest results fetch failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ─── Get backtest history for user ───────────────────────────────────────────
+app.get('/api/backtest/history/:userId', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('backtest_results')
+      .select('id, asset, days, step_interval, initial_capital, status, progress, total_trades, win_rate, total_pnl, total_pnl_percent, max_drawdown_percent, profit_factor, sharpe_ratio, error_message, started_at, completed_at, created_at')
+      .eq('user_id', req.params.userId)
+      .order('created_at', { ascending: false })
+      .limit(20);
+
+    if (error) {
+      logger.error('Backtest history fetch failed', { error: error.message });
+      return res.status(500).json({ error: 'Failed to fetch history' });
+    }
+
+    res.json(data || []);
+  } catch (error) {
+    logger.error('Backtest history failed', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
