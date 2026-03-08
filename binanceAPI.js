@@ -8,8 +8,17 @@ const axios = require('axios');
 const { logger } = require('./logger');
 const { classifyAxiosError, Provider } = require('./errors');
 
-// Binance Public API (no authentication required)
-const BINANCE_API_BASE = 'https://api.binance.com';
+// Binance Public API endpoints (in priority order)
+// api.binance.com is the primary, but returns 451 in some regions (US, etc.)
+// data-api.binance.vision is the geo-unrestricted mirror for market data
+const BINANCE_ENDPOINTS = [
+  'https://api.binance.com',
+  'https://data-api.binance.vision',
+  'https://api.binance.us'
+];
+
+// Active endpoint (auto-detected, persists for session)
+let activeBinanceBase = BINANCE_ENDPOINTS[0];
 
 // Rate limits: Weight per endpoint (public klines = 1 weight)
 // Binance rate limit: 6000 weight per minute (IP-based)
@@ -21,14 +30,20 @@ const RATE_LIMIT_INTERVAL_MS = 60000;
 let requestCount = 0;
 let rateLimitResetTime = Date.now() + RATE_LIMIT_INTERVAL_MS;
 
-// HTTP client with timeout
+// HTTP client with timeout (mutable baseURL via interceptor)
 const binanceClient = axios.create({
-  baseURL: BINANCE_API_BASE,
+  baseURL: activeBinanceBase,
   timeout: 10000,
   headers: {
     'User-Agent': 'SentixPro/2.2 (Trading Analytics)',
     'Accept': 'application/json'
   }
+});
+
+// Keep baseURL in sync with active endpoint
+binanceClient.interceptors.request.use(config => {
+  config.baseURL = activeBinanceBase;
+  return config;
 });
 
 // Symbol mapping: CoinGecko ID → Binance symbol
@@ -136,49 +151,80 @@ async function fetchKlines(symbol, interval = '1h', limit = 100, startTime = nul
     throw new Error(`Rate limited. Wait ${Math.ceil(waitTime / 1000)}s`);
   }
 
-  try {
-    const params = {
-      symbol: symbol.toUpperCase(),
-      interval,
-      limit
-    };
+  const params = {
+    symbol: symbol.toUpperCase(),
+    interval,
+    limit
+  };
 
-    if (startTime) params.startTime = startTime;
-    if (endTime) params.endTime = endTime;
+  if (startTime) params.startTime = startTime;
+  if (endTime) params.endTime = endTime;
 
-    const response = await binanceClient.get('/api/v3/klines', { params });
+  // Try current endpoint, fallback to alternatives on geo-block (451)
+  let lastError = null;
+  const endpointsToTry = [activeBinanceBase, ...BINANCE_ENDPOINTS.filter(e => e !== activeBinanceBase)];
 
-    // Transform to our internal format
-    const candles = response.data.map(k => ({
-      timestamp: k[0],               // Open time
-      open: parseFloat(k[1]),
-      high: parseFloat(k[2]),
-      low: parseFloat(k[3]),
-      close: parseFloat(k[4]),
-      volume: parseFloat(k[5]),
-      closeTime: k[6],
-      quoteVolume: parseFloat(k[7]),
-      trades: k[8],
-      takerBuyBaseVolume: parseFloat(k[9]),
-      takerBuyQuoteVolume: parseFloat(k[10])
-    }));
+  for (const endpoint of endpointsToTry) {
+    try {
+      const response = await binanceClient.get('/api/v3/klines', {
+        params,
+        baseURL: endpoint
+      });
 
-    logger.debug('Binance klines fetched', {
-      symbol,
-      interval,
-      candles: candles.length,
-      timeRange: candles.length > 0
-        ? `${new Date(candles[0].timestamp).toISOString()} to ${new Date(candles[candles.length - 1].timestamp).toISOString()}`
-        : 'empty'
-    });
+      // If this endpoint worked and it's not the active one, switch permanently
+      if (endpoint !== activeBinanceBase) {
+        logger.info(`Binance endpoint switched: ${activeBinanceBase} → ${endpoint}`);
+        activeBinanceBase = endpoint;
+      }
 
-    return candles;
+      // Transform to our internal format
+      const candles = response.data.map(k => ({
+        timestamp: k[0],               // Open time
+        open: parseFloat(k[1]),
+        high: parseFloat(k[2]),
+        low: parseFloat(k[3]),
+        close: parseFloat(k[4]),
+        volume: parseFloat(k[5]),
+        closeTime: k[6],
+        quoteVolume: parseFloat(k[7]),
+        trades: k[8],
+        takerBuyBaseVolume: parseFloat(k[9]),
+        takerBuyQuoteVolume: parseFloat(k[10])
+      }));
 
-  } catch (error) {
-    const providerError = classifyAxiosError(error, Provider.BINANCE || 'Binance', `/klines/${symbol}/${interval}`);
-    logger.providerError(providerError);
-    throw error;
+      logger.debug('Binance klines fetched', {
+        symbol, interval, endpoint,
+        candles: candles.length,
+        timeRange: candles.length > 0
+          ? `${new Date(candles[0].timestamp).toISOString()} to ${new Date(candles[candles.length - 1].timestamp).toISOString()}`
+          : 'empty'
+      });
+
+      return candles;
+
+    } catch (error) {
+      const status = error.response?.status;
+
+      // 451 = geo-blocked, 403 = forbidden — try next endpoint
+      if (status === 451 || status === 403) {
+        logger.warn(`Binance endpoint ${endpoint} returned ${status}, trying next...`);
+        lastError = error;
+        continue;
+      }
+
+      // Other errors: don't retry with other endpoints
+      const providerError = classifyAxiosError(error, Provider.BINANCE || 'Binance', `/klines/${symbol}/${interval}`);
+      logger.providerError(providerError);
+      throw error;
+    }
   }
+
+  // All endpoints failed
+  logger.error('All Binance endpoints failed', {
+    endpoints: endpointsToTry,
+    lastStatus: lastError?.response?.status
+  });
+  throw lastError || new Error('All Binance endpoints unavailable');
 }
 
 /**
@@ -213,32 +259,44 @@ async function fetch24hTicker(symbol) {
     throw new Error(`Rate limited. Wait ${Math.ceil(waitTime / 1000)}s`);
   }
 
-  try {
-    const response = await binanceClient.get('/api/v3/ticker/24hr', {
-      params: { symbol: symbol.toUpperCase() }
-    });
+  const endpointsToTry = [activeBinanceBase, ...BINANCE_ENDPOINTS.filter(e => e !== activeBinanceBase)];
 
-    const data = response.data;
-    return {
-      symbol: data.symbol,
-      priceChange: parseFloat(data.priceChange),
-      priceChangePercent: parseFloat(data.priceChangePercent),
-      weightedAvgPrice: parseFloat(data.weightedAvgPrice),
-      lastPrice: parseFloat(data.lastPrice),
-      volume: parseFloat(data.volume),
-      quoteVolume: parseFloat(data.quoteVolume),
-      openTime: data.openTime,
-      closeTime: data.closeTime,
-      firstId: data.firstId,
-      lastId: data.lastId,
-      count: data.count  // Number of trades
-    };
-
-  } catch (error) {
-    const providerError = classifyAxiosError(error, Provider.BINANCE || 'Binance', `/ticker/24hr/${symbol}`);
-    logger.providerError(providerError);
-    throw error;
+  for (const endpoint of endpointsToTry) {
+    try {
+      const response = await binanceClient.get('/api/v3/ticker/24hr', {
+        params: { symbol: symbol.toUpperCase() },
+        baseURL: endpoint
+      });
+      if (endpoint !== activeBinanceBase) {
+        logger.info(`Binance endpoint switched: ${activeBinanceBase} → ${endpoint}`);
+        activeBinanceBase = endpoint;
+      }
+      const data = response.data;
+      return {
+        symbol: data.symbol,
+        priceChange: parseFloat(data.priceChange),
+        priceChangePercent: parseFloat(data.priceChangePercent),
+        weightedAvgPrice: parseFloat(data.weightedAvgPrice),
+        lastPrice: parseFloat(data.lastPrice),
+        volume: parseFloat(data.volume),
+        quoteVolume: parseFloat(data.quoteVolume),
+        openTime: data.openTime,
+        closeTime: data.closeTime,
+        firstId: data.firstId,
+        lastId: data.lastId,
+        count: data.count
+      };
+    } catch (error) {
+      if (error.response?.status === 451 || error.response?.status === 403) {
+        logger.warn(`Binance endpoint ${endpoint} returned ${error.response.status}, trying next...`);
+        continue;
+      }
+      const providerError = classifyAxiosError(error, Provider.BINANCE || 'Binance', `/ticker/24hr/${symbol}`);
+      logger.providerError(providerError);
+      throw error;
+    }
   }
+  throw new Error('All Binance endpoints unavailable');
 }
 
 /**
@@ -253,37 +311,48 @@ async function fetchMultiple24hTickers(symbols) {
     throw new Error(`Rate limited. Wait ${Math.ceil(waitTime / 1000)}s`);
   }
 
-  try {
-    // Fetch all tickers in one request (no symbol param = all tickers)
-    const response = await binanceClient.get('/api/v3/ticker/24hr');
+  const endpointsToTry = [activeBinanceBase, ...BINANCE_ENDPOINTS.filter(e => e !== activeBinanceBase)];
 
-    // Filter only requested symbols
-    const symbolSet = new Set(symbols.map(s => s.toUpperCase()));
-    const tickers = {};
+  for (const endpoint of endpointsToTry) {
+    try {
+      const response = await binanceClient.get('/api/v3/ticker/24hr', { baseURL: endpoint });
 
-    for (const ticker of response.data) {
-      if (symbolSet.has(ticker.symbol)) {
-        tickers[ticker.symbol] = {
-          symbol: ticker.symbol,
-          priceChange: parseFloat(ticker.priceChange),
-          priceChangePercent: parseFloat(ticker.priceChangePercent),
-          lastPrice: parseFloat(ticker.lastPrice),
-          volume: parseFloat(ticker.volume),
-          quoteVolume: parseFloat(ticker.quoteVolume),
-          count: ticker.count
-        };
+      if (endpoint !== activeBinanceBase) {
+        logger.info(`Binance endpoint switched: ${activeBinanceBase} → ${endpoint}`);
+        activeBinanceBase = endpoint;
       }
+
+      const symbolSet = new Set(symbols.map(s => s.toUpperCase()));
+      const tickers = {};
+
+      for (const ticker of response.data) {
+        if (symbolSet.has(ticker.symbol)) {
+          tickers[ticker.symbol] = {
+            symbol: ticker.symbol,
+            priceChange: parseFloat(ticker.priceChange),
+            priceChangePercent: parseFloat(ticker.priceChangePercent),
+            lastPrice: parseFloat(ticker.lastPrice),
+            volume: parseFloat(ticker.volume),
+            quoteVolume: parseFloat(ticker.quoteVolume),
+            count: ticker.count
+          };
+        }
+      }
+
+      logger.debug('Binance 24h tickers fetched', { requested: symbols.length, found: Object.keys(tickers).length });
+      return tickers;
+
+    } catch (error) {
+      if (error.response?.status === 451 || error.response?.status === 403) {
+        logger.warn(`Binance endpoint ${endpoint} returned ${error.response.status}, trying next...`);
+        continue;
+      }
+      const providerError = classifyAxiosError(error, Provider.BINANCE || 'Binance', '/ticker/24hr');
+      logger.providerError(providerError);
+      throw error;
     }
-
-    logger.debug('Binance 24h tickers fetched', { requested: symbols.length, found: Object.keys(tickers).length });
-
-    return tickers;
-
-  } catch (error) {
-    const providerError = classifyAxiosError(error, Provider.BINANCE || 'Binance', '/ticker/24hr');
-    logger.providerError(providerError);
-    throw error;
   }
+  throw new Error('All Binance endpoints unavailable');
 }
 
 /**
@@ -308,15 +377,25 @@ function getRateLimitStatus() {
 // Funding Rate, Open Interest, Long/Short Ratio
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const BINANCE_FUTURES_BASE = 'https://fapi.binance.com';
+const BINANCE_FUTURES_ENDPOINTS = [
+  'https://fapi.binance.com',
+  'https://fapi.binance.us'
+];
+
+let activeFuturesBase = BINANCE_FUTURES_ENDPOINTS[0];
 
 const binanceFuturesClient = axios.create({
-  baseURL: BINANCE_FUTURES_BASE,
+  baseURL: activeFuturesBase,
   timeout: 10000,
   headers: {
     'User-Agent': 'SentixPro/4.0 (Trading Analytics)',
     'Accept': 'application/json'
   }
+});
+
+binanceFuturesClient.interceptors.request.use(config => {
+  config.baseURL = activeFuturesBase;
+  return config;
 });
 
 // Futures symbols (PAXG does NOT have futures on Binance)
@@ -330,21 +409,34 @@ delete FUTURES_SYMBOL_MAP['pax-gold'];
  */
 async function fetchFundingRate(symbol) {
   if (!checkRateLimit()) throw new Error('Rate limited');
-  try {
-    const response = await binanceFuturesClient.get('/fapi/v1/fundingRate', {
-      params: { symbol: symbol.toUpperCase(), limit: 1 }
-    });
-    const data = response.data?.[0] || {};
-    return {
-      fundingRate: parseFloat(data.fundingRate) || 0,
-      fundingTime: data.fundingTime,
-      markPrice: parseFloat(data.markPrice) || 0
-    };
-  } catch (error) {
-    const providerError = classifyAxiosError(error, Provider.BINANCE || 'Binance', `/fundingRate/${symbol}`);
-    logger.providerError(providerError);
-    throw error;
+
+  for (const endpoint of [activeFuturesBase, ...BINANCE_FUTURES_ENDPOINTS.filter(e => e !== activeFuturesBase)]) {
+    try {
+      const response = await binanceFuturesClient.get('/fapi/v1/fundingRate', {
+        params: { symbol: symbol.toUpperCase(), limit: 1 },
+        baseURL: endpoint
+      });
+      if (endpoint !== activeFuturesBase) {
+        logger.info(`Binance Futures endpoint switched: ${activeFuturesBase} → ${endpoint}`);
+        activeFuturesBase = endpoint;
+      }
+      const data = response.data?.[0] || {};
+      return {
+        fundingRate: parseFloat(data.fundingRate) || 0,
+        fundingTime: data.fundingTime,
+        markPrice: parseFloat(data.markPrice) || 0
+      };
+    } catch (error) {
+      if (error.response?.status === 451 || error.response?.status === 403) {
+        logger.warn(`Futures endpoint ${endpoint} returned ${error.response.status}, trying next...`);
+        continue;
+      }
+      const providerError = classifyAxiosError(error, Provider.BINANCE || 'Binance', `/fundingRate/${symbol}`);
+      logger.providerError(providerError);
+      throw error;
+    }
   }
+  throw new Error('All Binance Futures endpoints unavailable');
 }
 
 /**
@@ -354,20 +446,33 @@ async function fetchFundingRate(symbol) {
  */
 async function fetchOpenInterest(symbol) {
   if (!checkRateLimit()) throw new Error('Rate limited');
-  try {
-    const response = await binanceFuturesClient.get('/fapi/v1/openInterest', {
-      params: { symbol: symbol.toUpperCase() }
-    });
-    return {
-      openInterest: parseFloat(response.data.openInterest) || 0,
-      symbol: response.data.symbol,
-      time: response.data.time
-    };
-  } catch (error) {
-    const providerError = classifyAxiosError(error, Provider.BINANCE || 'Binance', `/openInterest/${symbol}`);
-    logger.providerError(providerError);
-    throw error;
+
+  for (const endpoint of [activeFuturesBase, ...BINANCE_FUTURES_ENDPOINTS.filter(e => e !== activeFuturesBase)]) {
+    try {
+      const response = await binanceFuturesClient.get('/fapi/v1/openInterest', {
+        params: { symbol: symbol.toUpperCase() },
+        baseURL: endpoint
+      });
+      if (endpoint !== activeFuturesBase) {
+        logger.info(`Binance Futures endpoint switched: ${activeFuturesBase} → ${endpoint}`);
+        activeFuturesBase = endpoint;
+      }
+      return {
+        openInterest: parseFloat(response.data.openInterest) || 0,
+        symbol: response.data.symbol,
+        time: response.data.time
+      };
+    } catch (error) {
+      if (error.response?.status === 451 || error.response?.status === 403) {
+        logger.warn(`Futures endpoint ${endpoint} returned ${error.response.status}, trying next...`);
+        continue;
+      }
+      const providerError = classifyAxiosError(error, Provider.BINANCE || 'Binance', `/openInterest/${symbol}`);
+      logger.providerError(providerError);
+      throw error;
+    }
   }
+  throw new Error('All Binance Futures endpoints unavailable');
 }
 
 /**
