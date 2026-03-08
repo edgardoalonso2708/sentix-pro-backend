@@ -59,6 +59,8 @@ const {
   resolveCurrentPrice
 } = require('./paperTrading');
 const { runBacktest } = require('./backtester');
+const { startOptimizationJob, getJobStatus, getAllJobs, PARAM_RANGES } = require('./optimizer');
+const { DEFAULT_STRATEGY_CONFIG } = require('./strategyConfig');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -2116,6 +2118,105 @@ app.get('/api/backtest/history/:userId', async (req, res) => {
     logger.error('Backtest history failed', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// STRATEGY OPTIMIZATION ENDPOINTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /api/optimize/params — List available parameters for optimization
+ */
+app.get('/api/optimize/params', (req, res) => {
+  const params = Object.entries(PARAM_RANGES).map(([key, range]) => ({
+    key,
+    label: range.label,
+    description: range.description,
+    min: range.min,
+    max: range.max,
+    step: range.step,
+    defaultValue: DEFAULT_STRATEGY_CONFIG[key],
+    testValues: Math.floor((range.max - range.min) / range.step) + 1
+  }));
+  res.json({ params, totalParams: params.length });
+});
+
+/**
+ * POST /api/optimize/run — Start an optimization job (async)
+ * Body: { asset, days, paramName, baseConfig?, capital? }
+ */
+app.post('/api/optimize/run', (req, res) => {
+  try {
+    const { asset, days, paramName, baseConfig, capital } = req.body;
+
+    if (!paramName || !PARAM_RANGES[paramName]) {
+      return res.status(400).json({
+        error: `Invalid parameter: ${paramName}`,
+        available: Object.keys(PARAM_RANGES)
+      });
+    }
+
+    if (!asset) {
+      return res.status(400).json({ error: 'asset is required' });
+    }
+
+    const validDays = Math.min(Math.max(days || 30, 7), 180);
+
+    const jobId = startOptimizationJob({
+      asset,
+      days: validDays,
+      paramName,
+      baseConfig: baseConfig || {},
+      capital: capital || 10000
+    });
+
+    logger.info('Optimization job started', { jobId, asset, paramName, days: validDays });
+
+    res.json({
+      jobId,
+      message: 'Optimization started',
+      paramName,
+      paramLabel: PARAM_RANGES[paramName].label,
+      asset,
+      days: validDays
+    });
+  } catch (error) {
+    logger.error('Failed to start optimization', { error: error.message });
+    res.status(500).json({ error: error.message });
+  }
+});
+
+/**
+ * GET /api/optimize/status/:jobId — Get optimization job progress
+ */
+app.get('/api/optimize/status/:jobId', (req, res) => {
+  const job = getJobStatus(req.params.jobId);
+  if (!job) {
+    return res.status(404).json({ error: 'Job not found' });
+  }
+  res.json(job);
+});
+
+/**
+ * GET /api/optimize/history — List all optimization jobs
+ */
+app.get('/api/optimize/history', (req, res) => {
+  const jobs = getAllJobs();
+  // Return summary (without full results to keep response small)
+  const summary = jobs.map(j => ({
+    jobId: j.jobId,
+    status: j.status,
+    paramName: j.paramName,
+    asset: j.asset,
+    days: j.days,
+    message: j.message,
+    startedAt: j.startedAt,
+    bestValue: j.result?.bestValue ?? null,
+    bestSharpe: j.result?.bestSharpe ?? null,
+    improvement: j.result?.improvement ?? null,
+    duration: j.result?.duration ?? null
+  }));
+  res.json(summary);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════

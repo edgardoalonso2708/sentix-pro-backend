@@ -604,8 +604,15 @@ function detectBBSqueeze(prices, period = 20) {
  * @param {number} atr - Average True Range value
  * @returns {Object|null} tradeLevels object or null if HOLD
  */
-function calculateTradeLevels(action, currentPrice, support, resistance, pivot, atr) {
+function calculateTradeLevels(action, currentPrice, support, resistance, pivot, atr, tradeConfig = {}) {
   if (action === 'HOLD' || atr <= 0 || currentPrice <= 0) return null;
+
+  // Trade level config with defaults matching original hardcoded values
+  const slMult = tradeConfig.atrStopMult || 1.5;
+  const tp2Mult = tradeConfig.atrTP2Mult || 2.0;
+  const trailMult = tradeConfig.atrTrailingMult || 2.5;
+  const trailActivation = tradeConfig.atrTrailingActivation || 1.0;
+  const minRR = tradeConfig.minRiskReward || 1.5;
 
   let entry, stopLoss, takeProfit1, takeProfit2;
 
@@ -615,17 +622,17 @@ function calculateTradeLevels(action, currentPrice, support, resistance, pivot, 
     if (Math.abs(currentPrice - support) / currentPrice < 0.02) {
       entry = support + (atr * 0.25);
     }
-    stopLoss = support - (atr * 1.5);
+    stopLoss = support - (atr * slMult);
     takeProfit1 = resistance;
-    takeProfit2 = resistance + (atr * 2);
+    takeProfit2 = resistance + (atr * tp2Mult);
   } else { // SELL
     entry = currentPrice;
     if (Math.abs(currentPrice - resistance) / currentPrice < 0.02) {
       entry = resistance - (atr * 0.25);
     }
-    stopLoss = resistance + (atr * 1.5);
+    stopLoss = resistance + (atr * slMult);
     takeProfit1 = support;
-    takeProfit2 = support - (atr * 2);
+    takeProfit2 = support - (atr * tp2Mult);
   }
 
   // Ensure stop-loss is positive
@@ -640,21 +647,19 @@ function calculateTradeLevels(action, currentPrice, support, resistance, pivot, 
   const tp2Percent = ((takeProfit2 - entry) / entry) * 100;
 
   // Trailing stop: wider than static SL to allow volatility, tightens as trade moves in profit
-  // ATR × 2.5 for crypto (wider than stocks due to high volatility)
-  const trailingMultiplier = 2.5;
-  let trailingStop, trailingActivation;
+  let trailingStop, trailingActivationPrice;
   if (action === 'BUY') {
-    trailingStop = entry - (atr * trailingMultiplier);
-    trailingActivation = entry + atr; // Activate after 1 ATR profit
+    trailingStop = entry - (atr * trailMult);
+    trailingActivationPrice = entry + (atr * trailActivation);
   } else {
-    trailingStop = entry + (atr * trailingMultiplier);
-    trailingActivation = entry - atr;
+    trailingStop = entry + (atr * trailMult);
+    trailingActivationPrice = entry - (atr * trailActivation);
   }
   trailingStop = Math.max(0.01, trailingStop);
-  trailingActivation = Math.max(0.01, trailingActivation);
+  trailingActivationPrice = Math.max(0.01, trailingActivationPrice);
 
   const trailingStopPercent = ((trailingStop - entry) / entry) * 100;
-  const trailingActivationPercent = ((trailingActivation - entry) / entry) * 100;
+  const trailingActivationPercent = ((trailingActivationPrice - entry) / entry) * 100;
 
   // Use appropriate decimal precision based on price magnitude
   const decimals = currentPrice > 100 ? 2 : currentPrice > 1 ? 4 : 6;
@@ -670,11 +675,11 @@ function calculateTradeLevels(action, currentPrice, support, resistance, pivot, 
     takeProfit2Percent: Math.round(tp2Percent * 100) / 100,
     trailingStop: round(trailingStop),
     trailingStopPercent: Math.round(trailingStopPercent * 100) / 100,
-    trailingActivation: round(trailingActivation),
+    trailingActivation: round(trailingActivationPrice),
     trailingActivationPercent: Math.round(trailingActivationPercent * 100) / 100,
     trailingStepATR: round(atr), // Each step = 1 ATR
     riskRewardRatio: Math.round(riskRewardRatio * 100) / 100,
-    riskRewardOk: riskRewardRatio >= 1.5,
+    riskRewardOk: riskRewardRatio >= minRR,
     atrValue: round(atr),
     support: round(support),
     resistance: round(resistance),
@@ -863,7 +868,11 @@ function scoreDxyMacro(dxy, dxyTrend, dxyChange) {
 // + Trade levels (SL/TP/R:R) + Derivatives + Macro context + Multi-timeframe
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, interval = '1h', derivativesData = null, macroData = null, preloadedCandles = null) {
+async function generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, interval = '1h', derivativesData = null, macroData = null, preloadedCandles = null, strategyConfig = null) {
+  // Merge strategy config with defaults
+  const { mergeConfig } = require('./strategyConfig');
+  const cfg = mergeConfig(strategyConfig);
+
   try {
     // Fetch candles - 168 for 1h (7 days), more for lower timeframes
     // If preloadedCandles provided (backtesting), use those instead of fetching
@@ -888,16 +897,16 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
     const prices = ohlcvData.map(d => d.close);
 
     // ─── CALCULATE ALL INDICATORS ──────────────────────────────────
-    const rsi = calculateRSI(prices, 14);
-    const rsiSeries = calculateRSISeries(prices, 14);
-    const macd = calculateMACD(prices, 12, 26, 9);
-    const bollinger = calculateBollingerBands(prices, 20, 2);
-    const adx = calculateADX(ohlcvData, 14);
+    const rsi = calculateRSI(prices, cfg.rsiPeriod);
+    const rsiSeries = calculateRSISeries(prices, cfg.rsiPeriod);
+    const macd = calculateMACD(prices, cfg.macdFast, cfg.macdSlow, cfg.macdSignal);
+    const bollinger = calculateBollingerBands(prices, cfg.bbPeriod, cfg.bbStdDev);
+    const adx = calculateADX(ohlcvData, cfg.adxPeriod);
     const emaTrend = detectEMATrend(prices);
-    const divergence = detectRSIDivergence(prices, rsiSeries, 20);
-    const volumeProfile = analyzeVolumeProfile(ohlcvData, 14);
-    const bbSqueeze = detectBBSqueeze(prices, 20);
-    const atr = calculateATR(ohlcvData, 14);
+    const divergence = detectRSIDivergence(prices, rsiSeries, cfg.divergenceLookback);
+    const volumeProfile = analyzeVolumeProfile(ohlcvData, cfg.volumeLookback);
+    const bbSqueeze = detectBBSqueeze(prices, cfg.bbPeriod);
+    const atr = calculateATR(ohlcvData, cfg.atrPeriod);
     const atrPercent = currentPrice > 0 ? (atr / currentPrice) * 100 : 0;
 
     // Support/Resistance from actual H/L
@@ -922,19 +931,19 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
     // ─── 1. TREND CONTEXT (Most important - determines trading bias) ───
     // Weight: up to ±25 score, up to 20 confidence
     if (emaTrend.trend === 'strong_up') {
-      score += 20;
+      score += cfg.trendScoreStrong;
       confidence += 15;
       signals.push(`Strong uptrend (EMA 9>21>50)`);
     } else if (emaTrend.trend === 'strong_down') {
-      score -= 20;
+      score -= cfg.trendScoreStrong;
       confidence += 15;
       signals.push(`Strong downtrend (EMA 9<21<50)`);
     } else if (emaTrend.trend === 'up') {
-      score += 10;
+      score += cfg.trendScoreModerate;
       confidence += 8;
       signals.push('Moderate uptrend');
     } else if (emaTrend.trend === 'down') {
-      score -= 10;
+      score -= cfg.trendScoreModerate;
       confidence += 8;
       signals.push('Moderate downtrend');
     } else {
@@ -946,15 +955,15 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
     // If ADX < 20, market is ranging → reduce confidence in all signals
     // Weight: modifier only
     let adxMultiplier = 1.0;
-    if (adx.adx >= 30) {
+    if (adx.adx >= cfg.adxStrongThreshold) {
       confidence += 10;
-      adxMultiplier = 1.2; // Strong trend = amplify directional signals
+      adxMultiplier = cfg.adxStrongMultiplier;
       signals.push(`ADX strong trend (${adx.adx})`);
-    } else if (adx.adx >= 20) {
+    } else if (adx.adx >= cfg.adxModerateThreshold) {
       confidence += 5;
       adxMultiplier = 1.0;
     } else {
-      adxMultiplier = 0.6; // Weak trend = reduce all directional signals
+      adxMultiplier = cfg.adxWeakMultiplier;
       signals.push(`ADX weak trend (${adx.adx}) - caution`);
     }
 
@@ -962,18 +971,18 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
     // In uptrend: RSI 40-50 is "bullish pullback", not neutral
     // In downtrend: RSI 50-60 is "bearish rally", not neutral
     // Weight: up to ±20 score, up to 12 confidence
-    if (rsi < 20) {
-      score += 18 * adxMultiplier;
+    if (rsi < cfg.rsiExtremeOversold) {
+      score += cfg.rsiExtremeScore * adxMultiplier;
       confidence += 12;
       signals.push(`RSI extremely oversold (${rsi.toFixed(1)})`);
-    } else if (rsi < 30) {
-      score += 12 * adxMultiplier;
+    } else if (rsi < cfg.rsiOversold) {
+      score += cfg.rsiStrongScore * adxMultiplier;
       confidence += 10;
       signals.push(`RSI oversold (${rsi.toFixed(1)})`);
-    } else if (rsi < 40) {
+    } else if (rsi < cfg.rsiPullbackZone) {
       // Only bullish if in uptrend context
       if (emaTrend.trend.includes('up')) {
-        score += 8 * adxMultiplier;
+        score += cfg.rsiPullbackScore * adxMultiplier;
         confidence += 6;
         signals.push(`RSI bullish pullback in uptrend (${rsi.toFixed(1)})`);
       } else {
@@ -981,17 +990,17 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
         confidence += 3;
         signals.push(`RSI leaning bullish (${rsi.toFixed(1)})`);
       }
-    } else if (rsi > 80) {
-      score -= 18 * adxMultiplier;
+    } else if (rsi > cfg.rsiExtremeOverbought) {
+      score -= cfg.rsiExtremeScore * adxMultiplier;
       confidence += 12;
       signals.push(`RSI extremely overbought (${rsi.toFixed(1)})`);
-    } else if (rsi > 70) {
-      score -= 12 * adxMultiplier;
+    } else if (rsi > cfg.rsiOverbought) {
+      score -= cfg.rsiStrongScore * adxMultiplier;
       confidence += 10;
       signals.push(`RSI overbought (${rsi.toFixed(1)})`);
-    } else if (rsi > 60) {
+    } else if (rsi > cfg.rsiPullbackZoneHigh) {
       if (emaTrend.trend.includes('down')) {
-        score -= 8 * adxMultiplier;
+        score -= cfg.rsiPullbackScore * adxMultiplier;
         confidence += 6;
         signals.push(`RSI bearish rally in downtrend (${rsi.toFixed(1)})`);
       } else {
@@ -1007,14 +1016,14 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
     // ─── 4. MACD ANALYSIS (with histogram momentum) ─────────────────
     // Weight: up to ±15 score, up to 10 confidence
     if (macd.histogram > 0 && macd.macd > macd.signal) {
-      const macdScore = macd.histogramTrend === 'growing' ? 15 : 8;
+      const macdScore = macd.histogramTrend === 'growing' ? cfg.macdStrongScore : cfg.macdWeakScore;
       score += macdScore * adxMultiplier;
       confidence += macd.histogramTrend === 'growing' ? 10 : 6;
       signals.push(macd.histogramTrend === 'growing'
         ? 'MACD bullish crossover (accelerating)'
         : 'MACD bullish (decelerating)');
     } else if (macd.histogram < 0 && macd.macd < macd.signal) {
-      const macdScore = macd.histogramTrend === 'shrinking' ? -8 : -15;
+      const macdScore = macd.histogramTrend === 'shrinking' ? -cfg.macdWeakScore : -cfg.macdStrongScore;
       score += macdScore * adxMultiplier;
       confidence += macd.histogramTrend === 'growing' ? 6 : 10;
       signals.push(macd.histogramTrend === 'growing'
@@ -1031,11 +1040,11 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
     // ─── 5. DIVERGENCE DETECTION (Powerful reversal signal) ──────────
     // Weight: up to ±20 score, up to 15 confidence
     if (divergence.type === 'bullish') {
-      score += Math.min(20, 10 + divergence.strength);
+      score += Math.min(cfg.divergenceMaxScore, cfg.divergenceBaseScore + divergence.strength);
       confidence += 12;
       signals.push(`Bullish RSI divergence detected (strength: ${divergence.strength.toFixed(1)})`);
     } else if (divergence.type === 'bearish') {
-      score -= Math.min(20, 10 + divergence.strength);
+      score -= Math.min(cfg.divergenceMaxScore, cfg.divergenceBaseScore + divergence.strength);
       confidence += 12;
       signals.push(`Bearish RSI divergence detected (strength: ${divergence.strength.toFixed(1)})`);
     }
@@ -1052,19 +1061,19 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
         signals.push('BB squeeze → breakout likely downward');
       }
     } else if (bollinger.percentB <= 0) {
-      score += 10;
+      score += cfg.bbOuterScore;
       confidence += 7;
       signals.push('Price below lower Bollinger Band');
     } else if (bollinger.percentB >= 1) {
-      score -= 10;
+      score -= cfg.bbOuterScore;
       confidence += 7;
       signals.push('Price above upper Bollinger Band');
     } else if (bollinger.percentB < 0.2) {
-      score += 5;
+      score += cfg.bbNearScore;
       confidence += 4;
       signals.push('Price near lower Bollinger Band');
     } else if (bollinger.percentB > 0.8) {
-      score -= 5;
+      score -= cfg.bbNearScore;
       confidence += 4;
       signals.push('Price near upper Bollinger Band');
     }
@@ -1097,11 +1106,11 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
     const distToResistance = (supportResistance.resistance - currentPrice) / currentPrice;
 
     if (distToSupport < 0.02 && distToSupport > -0.01) {
-      score += 8;
+      score += cfg.srScore;
       confidence += 5;
       signals.push('At support level');
     } else if (distToResistance < 0.02 && distToResistance > -0.01) {
-      score -= 8;
+      score -= cfg.srScore;
       confidence += 5;
       signals.push('At resistance level');
     }
@@ -1110,18 +1119,18 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
     // Weight: up to ±8 score (reduced from ±10 - momentum is a lagging signal)
     if (change24h > 10) {
       // Very strong up momentum - but could be overbought
-      score += 5;
+      score += cfg.momentumScore;
       confidence += 3;
       signals.push(`Strong 24h momentum (+${change24h.toFixed(1)}%)`);
     } else if (change24h > 5) {
-      score += 4;
+      score += Math.round(cfg.momentumScore * 0.8);
       confidence += 2;
     } else if (change24h < -10) {
-      score -= 5;
+      score -= cfg.momentumScore;
       confidence += 3;
       signals.push(`Strong 24h selling (${change24h.toFixed(1)}%)`);
     } else if (change24h < -5) {
-      score -= 4;
+      score -= Math.round(cfg.momentumScore * 0.8);
       confidence += 2;
     }
 
@@ -1130,14 +1139,14 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
     // Now it's a minor modifier (+/- 3 score max) that only matters at extremes
     // Weight: up to ±3 score, up to 3 confidence
     if (fearGreed < 10) {
-      score += 3;
+      score += cfg.fearGreedScore;
       confidence += 3;
       signals.push(`Extreme fear index (${fearGreed}) - contrarian`);
     } else if (fearGreed < 25) {
       score += 1;
       confidence += 1;
     } else if (fearGreed > 90) {
-      score -= 3;
+      score -= cfg.fearGreedScore;
       confidence += 3;
       signals.push(`Extreme greed index (${fearGreed}) - caution`);
     } else if (fearGreed > 75) {
@@ -1194,10 +1203,10 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
 
     // Conflicting signals reduce confidence
     if (bullishFactors >= 2 && bearishFactors >= 2) {
-      confidence -= 10;
+      confidence -= cfg.conflictPenalty;
       signals.push('Mixed signals - conflicting indicators');
     } else if (bullishFactors >= 4 || bearishFactors >= 4) {
-      confidence += 10;
+      confidence += cfg.multiFactorBonus;
       signals.push(bullishFactors >= 4 ? 'Strong multi-factor bullish alignment' : 'Strong multi-factor bearish alignment');
     }
 
@@ -1211,23 +1220,23 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
     // SELL: score <= -20
     // This means the system needs REAL conviction, not just slight tilts
     let action = 'HOLD';
-    if (score >= 25) action = 'BUY';
-    else if (score >= 15 && confidence >= 40) action = 'BUY'; // Lower score OK with high confidence
-    else if (score <= -25) action = 'SELL';
-    else if (score <= -15 && confidence >= 40) action = 'SELL';
+    if (score >= cfg.buyThreshold) action = 'BUY';
+    else if (score >= cfg.buyWeakThreshold && confidence >= cfg.weakConfidenceMin) action = 'BUY';
+    else if (score <= cfg.sellThreshold) action = 'SELL';
+    else if (score <= cfg.sellWeakThreshold && confidence >= cfg.weakConfidenceMin) action = 'SELL';
 
-    // Cap confidence at 85% (never claim near-certainty in crypto)
-    confidence = Math.max(0, Math.min(85, Math.round(confidence)));
+    // Cap confidence (never claim near-certainty in crypto)
+    confidence = Math.max(0, Math.min(cfg.confidenceCap, Math.round(confidence)));
 
     // ─── SIGNAL STRENGTH LABEL ──────────────────────────────────────
     let strengthLabel = '';
     if (action === 'BUY') {
-      if (score >= 50 && confidence >= 60) strengthLabel = 'STRONG BUY';
-      else if (score >= 35 && confidence >= 45) strengthLabel = 'BUY';
+      if (score >= cfg.strongBuyMinScore && confidence >= cfg.strongBuyMinConf) strengthLabel = 'STRONG BUY';
+      else if (score >= cfg.buyMinScore && confidence >= cfg.buyMinConf) strengthLabel = 'BUY';
       else strengthLabel = 'WEAK BUY';
     } else if (action === 'SELL') {
-      if (score <= -50 && confidence >= 60) strengthLabel = 'STRONG SELL';
-      else if (score <= -35 && confidence >= 45) strengthLabel = 'SELL';
+      if (score <= -cfg.strongBuyMinScore && confidence >= cfg.strongBuyMinConf) strengthLabel = 'STRONG SELL';
+      else if (score <= -cfg.buyMinScore && confidence >= cfg.buyMinConf) strengthLabel = 'SELL';
       else strengthLabel = 'WEAK SELL';
     } else {
       strengthLabel = 'HOLD';
@@ -1237,7 +1246,10 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
     const tradeLevels = calculateTradeLevels(
       action, currentPrice,
       supportResistance.support, supportResistance.resistance,
-      supportResistance.pivot, atr
+      supportResistance.pivot, atr,
+      { atrStopMult: cfg.atrStopMult, atrTP2Mult: cfg.atrTP2Mult,
+        atrTrailingMult: cfg.atrTrailingMult, atrTrailingActivation: cfg.atrTrailingActivation,
+        minRiskReward: cfg.minRiskReward }
     );
 
     if (tradeLevels && !tradeLevels.riskRewardOk) {
@@ -1329,15 +1341,19 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
  * @param {Object|null} derivativesData
  * @returns {Promise<Object>} Merged signal with confluence data
  */
-async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volume, fearGreed, derivativesData = null, macroData = null, preloadedCandlesMap = null) {
+async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volume, fearGreed, derivativesData = null, macroData = null, preloadedCandlesMap = null, strategyConfig = null) {
+  // Merge strategy config with defaults for confluence parameters
+  const { mergeConfig } = require('./strategyConfig');
+  const cfg = mergeConfig(strategyConfig);
+
   // Run all three timeframes in parallel
   // Pass derivatives only to 1h (primary) to avoid triple-counting
   // Pass macroData only to 1h to avoid triple-counting macro impact
   // If preloadedCandlesMap provided (backtesting), pass candles per timeframe
   const [signal4h, signal1h, signal15m] = await Promise.all([
-    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '4h', null, null, preloadedCandlesMap?.['4h'] || null),
-    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '1h', derivativesData, macroData, preloadedCandlesMap?.['1h'] || null),
-    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '15m', null, null, preloadedCandlesMap?.['15m'] || null)
+    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '4h', null, null, preloadedCandlesMap?.['4h'] || null, strategyConfig),
+    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '1h', derivativesData, macroData, preloadedCandlesMap?.['1h'] || null, strategyConfig),
+    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '15m', null, null, preloadedCandlesMap?.['15m'] || null, strategyConfig)
   ]);
 
   // Classify each timeframe's direction
@@ -1363,24 +1379,24 @@ async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volu
   else if (bullishCount >= 1 && bearishCount >= 1) confluence = 'conflicting';
   else confluence = 'weak';
 
-  // Weighted merge: 4h = 40%, 1h = 40%, 15m = 20%
-  let mergedRawScore = (signal4h.rawScore * 0.40) +
-                       (signal1h.rawScore * 0.40) +
-                       (signal15m.rawScore * 0.20);
+  // Weighted merge: configurable timeframe weights
+  let mergedRawScore = (signal4h.rawScore * cfg.tf4hWeight) +
+                       (signal1h.rawScore * cfg.tf1hWeight) +
+                       (signal15m.rawScore * cfg.tf15mWeight);
 
   // Confluence adjustments
   let confidenceBonus = 0;
   const confluenceReasons = [];
 
   if (confluence === 'strong') {
-    mergedRawScore *= 1.15;
+    mergedRawScore *= cfg.strongConfluenceMult;
     confidenceBonus = 15;
     confluenceReasons.push('STRONG confluence - all timeframes aligned');
   } else if (confluence === 'moderate') {
-    confidenceBonus = 5;
+    confidenceBonus = cfg.moderateConfluenceBonus;
     confluenceReasons.push('Moderate confluence - 2/3 timeframes agree');
   } else if (confluence === 'conflicting') {
-    mergedRawScore *= 0.7;
+    mergedRawScore *= cfg.conflictingMult;
     confidenceBonus = -10;
     confluenceReasons.push('CONFLICTING timeframes - reduced conviction');
   } else {
@@ -1389,41 +1405,41 @@ async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volu
 
   // 4h is the "governor" - don't fight the macro trend
   if (trends['4h'] === 'bearish' && mergedRawScore > 0) {
-    mergedRawScore *= 0.5;
+    mergedRawScore *= cfg.governorMult;
     confidenceBonus -= 5;
     confluenceReasons.push('4H bearish governs - dampened bullish signal');
   } else if (trends['4h'] === 'bullish' && mergedRawScore < 0) {
-    mergedRawScore *= 0.5;
+    mergedRawScore *= cfg.governorMult;
     confidenceBonus -= 5;
     confluenceReasons.push('4H bullish governs - dampened bearish signal');
   }
 
   mergedRawScore = Math.max(-100, Math.min(100, Math.round(mergedRawScore)));
 
-  let mergedConfidence = (signal4h.confidence * 0.40) +
-                         (signal1h.confidence * 0.40) +
-                         (signal15m.confidence * 0.20) +
+  let mergedConfidence = (signal4h.confidence * cfg.tf4hWeight) +
+                         (signal1h.confidence * cfg.tf1hWeight) +
+                         (signal15m.confidence * cfg.tf15mWeight) +
                          confidenceBonus;
-  mergedConfidence = Math.max(0, Math.min(85, Math.round(mergedConfidence)));
+  mergedConfidence = Math.max(0, Math.min(cfg.confidenceCap, Math.round(mergedConfidence)));
 
   const displayScore = Math.round(Math.max(0, Math.min(100, (mergedRawScore + 100) / 2)));
 
   // Determine action
   let action = 'HOLD';
-  if (mergedRawScore >= 25) action = 'BUY';
-  else if (mergedRawScore >= 15 && mergedConfidence >= 40) action = 'BUY';
-  else if (mergedRawScore <= -25) action = 'SELL';
-  else if (mergedRawScore <= -15 && mergedConfidence >= 40) action = 'SELL';
+  if (mergedRawScore >= cfg.buyThreshold) action = 'BUY';
+  else if (mergedRawScore >= cfg.buyWeakThreshold && mergedConfidence >= cfg.weakConfidenceMin) action = 'BUY';
+  else if (mergedRawScore <= cfg.sellThreshold) action = 'SELL';
+  else if (mergedRawScore <= cfg.sellWeakThreshold && mergedConfidence >= cfg.weakConfidenceMin) action = 'SELL';
 
   // Strength label
   let strengthLabel = 'HOLD';
   if (action === 'BUY') {
-    if (mergedRawScore >= 50 && mergedConfidence >= 60) strengthLabel = 'STRONG BUY';
-    else if (mergedRawScore >= 35 && mergedConfidence >= 45) strengthLabel = 'BUY';
+    if (mergedRawScore >= cfg.strongBuyMinScore && mergedConfidence >= cfg.strongBuyMinConf) strengthLabel = 'STRONG BUY';
+    else if (mergedRawScore >= cfg.buyMinScore && mergedConfidence >= cfg.buyMinConf) strengthLabel = 'BUY';
     else strengthLabel = 'WEAK BUY';
   } else if (action === 'SELL') {
-    if (mergedRawScore <= -50 && mergedConfidence >= 60) strengthLabel = 'STRONG SELL';
-    else if (mergedRawScore <= -35 && mergedConfidence >= 45) strengthLabel = 'SELL';
+    if (mergedRawScore <= -cfg.strongBuyMinScore && mergedConfidence >= cfg.strongBuyMinConf) strengthLabel = 'STRONG SELL';
+    else if (mergedRawScore <= -cfg.buyMinScore && mergedConfidence >= cfg.buyMinConf) strengthLabel = 'SELL';
     else strengthLabel = 'WEAK SELL';
   }
 
@@ -1448,7 +1464,10 @@ async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volu
         signal1h.tradeLevels.support,
         signal1h.tradeLevels.resistance,
         signal1h.tradeLevels.pivot,
-        signal1h.tradeLevels.atrValue
+        signal1h.tradeLevels.atrValue,
+        { atrStopMult: cfg.atrStopMult, atrTP2Mult: cfg.atrTP2Mult,
+          atrTrailingMult: cfg.atrTrailingMult, atrTrailingActivation: cfg.atrTrailingActivation,
+          minRiskReward: cfg.minRiskReward }
       )
     : null;
 

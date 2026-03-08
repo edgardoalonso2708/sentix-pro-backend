@@ -453,17 +453,24 @@ async function runBacktest(options, onProgress = null) {
     cooldownBars = 6,
     fearGreed = 50,
     derivativesData = null,
-    macroData = null
+    macroData = null,
+    strategyConfig = null,
+    preloadedCandles = null  // For optimizer: skip re-fetching
   } = options;
 
   const startTime = Date.now();
 
   logger.info('Starting backtest', { asset, days, stepInterval, capital });
 
-  // ─── 1. Fetch historical data ────────────────────────────────────────
-  if (onProgress) onProgress({ phase: 'fetching', message: 'Descargando datos históricos...' });
-
-  const allCandles = await fetchAllTimeframes(asset, days);
+  // ─── 1. Fetch historical data (or use preloaded for optimizer) ───────
+  let allCandles;
+  if (preloadedCandles) {
+    allCandles = preloadedCandles;
+    logger.info('Using preloaded candles for backtest', { asset });
+  } else {
+    if (onProgress) onProgress({ phase: 'fetching', message: 'Descargando datos históricos...' });
+    allCandles = await fetchAllTimeframes(asset, days);
+  }
 
   const candles1h = allCandles['1h'];
   const candles4h = allCandles['4h'];
@@ -600,7 +607,8 @@ async function runBacktest(options, onProgress = null) {
       const signal = await generateMultiTimeframeSignal(
         asset, currentPrice, change24h, vol, fearGreed,
         derivativesData, macroData,
-        { '4h': window4h, '1h': window1h, '15m': window15m }
+        { '4h': window4h, '1h': window1h, '15m': window15m },
+        strategyConfig
       );
 
       // ── Evaluate for trade ──────────────────────────────────────
@@ -731,7 +739,7 @@ async function runBacktest(options, onProgress = null) {
   }));
 
   return {
-    config: { asset, days, stepInterval, capital, riskPerTrade, maxOpenPositions, minConfluence, minRR, allowedStrength, cooldownBars },
+    config: { asset, days, stepInterval, capital, riskPerTrade, maxOpenPositions, minConfluence, minRR, allowedStrength, cooldownBars, strategyConfig },
     metrics,
     trades: cleanTrades,
     equityCurve,
