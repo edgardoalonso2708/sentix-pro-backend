@@ -9,11 +9,11 @@ const { logger } = require('./logger');
 const { classifyAxiosError, Provider } = require('./errors');
 
 // Binance Public API endpoints (in priority order)
-// api.binance.com is the primary, but returns 451 in some regions (US, etc.)
-// data-api.binance.vision is the geo-unrestricted mirror for market data
+// data-api.binance.vision is geo-unrestricted (primary for cloud deploys)
+// api.binance.com returns 451 in US/restricted regions
 const BINANCE_ENDPOINTS = [
-  'https://api.binance.com',
   'https://data-api.binance.vision',
+  'https://api.binance.com',
   'https://api.binance.us'
 ];
 

@@ -61,6 +61,9 @@ async function fetchHistoricalCandles(asset, interval, days) {
     totalCandles, batches: Math.ceil(totalCandles / batchSize)
   });
 
+  let retryCount = 0;
+  const MAX_RETRIES = 3;
+
   while (currentStart < now) {
     try {
       const candles = await fetchKlines(symbol, interval, batchSize, currentStart, now);
@@ -68,6 +71,7 @@ async function fetchHistoricalCandles(asset, interval, days) {
       if (!candles || candles.length === 0) break;
 
       allCandles = allCandles.concat(candles);
+      retryCount = 0; // Reset on success
 
       // Move start to after the last candle
       const lastTimestamp = candles[candles.length - 1].timestamp;
@@ -78,11 +82,27 @@ async function fetchHistoricalCandles(asset, interval, days) {
         await new Promise(r => setTimeout(r, 700));
       }
     } catch (err) {
-      if (err.message.includes('Rate limited')) {
+      const msg = err.message || '';
+      const status = err.response?.status;
+
+      if (msg.includes('Rate limited') || status === 429) {
         logger.warn('Rate limited during historical fetch, waiting 10s');
         await new Promise(r => setTimeout(r, 10000));
         continue; // Retry same batch
       }
+
+      // Geo-block (451) or all endpoints unavailable — retry with backoff
+      if (status === 451 || status === 403 || msg.includes('unavailable') || msg.includes('451')) {
+        retryCount++;
+        if (retryCount <= MAX_RETRIES) {
+          const waitMs = retryCount * 5000;
+          logger.warn(`Binance fetch failed (${status || msg}), retry ${retryCount}/${MAX_RETRIES} in ${waitMs / 1000}s`);
+          await new Promise(r => setTimeout(r, waitMs));
+          continue;
+        }
+        logger.error('Binance fetch failed after max retries', { asset, interval, retryCount });
+      }
+
       throw err;
     }
   }
