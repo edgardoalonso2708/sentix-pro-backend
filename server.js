@@ -1880,6 +1880,9 @@ app.post('/api/paper/close/:tradeId', async (req, res) => {
 // BACKTEST API ROUTES
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// In-memory backtest store (for when Supabase is unavailable)
+const backtestStore = new Map();
+
 // ─── Launch a backtest ───────────────────────────────────────────────────────
 app.post('/api/backtest/run', async (req, res) => {
   try {
@@ -1902,100 +1905,121 @@ app.post('/api/backtest/run', async (req, res) => {
     if (capital < 100) return res.status(400).json({ error: 'capital must be at least 100' });
     if (!['1h', '4h'].includes(stepInterval)) return res.status(400).json({ error: 'stepInterval must be 1h or 4h' });
 
-    // Create backtest record with status='running'
-    const { data: record, error: insertError } = await supabase
-      .from('backtest_results')
-      .insert({
-        user_id: userId,
-        asset,
-        days,
-        step_interval: stepInterval,
-        initial_capital: capital,
-        risk_per_trade: riskPerTrade,
-        max_open_positions: maxOpenPositions,
-        min_confluence: minConfluence,
-        min_rr_ratio: minRR,
-        allowed_strength: allowedStrength,
-        status: 'running',
-        progress: 0
-      })
-      .select()
-      .single();
+    // Try to create record in Supabase first
+    let recordId = null;
+    let useDB = false;
 
-    if (insertError) {
-      logger.error('Failed to create backtest record', { error: insertError.message });
-      return res.status(500).json({ error: 'Failed to create backtest record' });
+    try {
+      const { data: record, error: insertError } = await supabase
+        .from('backtest_results')
+        .insert({
+          user_id: userId,
+          asset, days, step_interval: stepInterval, initial_capital: capital,
+          risk_per_trade: riskPerTrade, max_open_positions: maxOpenPositions,
+          min_confluence: minConfluence, min_rr_ratio: minRR,
+          allowed_strength: allowedStrength, status: 'running', progress: 0
+        })
+        .select()
+        .single();
+
+      if (!insertError && record) {
+        recordId = record.id;
+        useDB = true;
+      }
+    } catch (dbErr) {
+      logger.warn('Supabase unavailable, running backtest in memory mode', { error: dbErr.message });
     }
 
-    // Return immediately, run backtest in background
-    res.json({ id: record.id, status: 'running' });
+    // Generate a local ID if DB unavailable
+    if (!recordId) {
+      recordId = `local-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+    }
+
+    // Store initial state in memory
+    backtestStore.set(recordId, {
+      id: recordId, user_id: userId, asset, days, step_interval: stepInterval,
+      initial_capital: capital, status: 'running', progress: 0,
+      created_at: new Date().toISOString()
+    });
+
+    // Return immediately
+    res.json({ id: recordId, status: 'running' });
 
     // Execute backtest asynchronously
     (async () => {
       try {
         const result = await runBacktest({
-          asset,
-          days,
-          interval: stepInterval,
-          capital,
-          riskPerTrade,
-          maxOpenPositions,
-          minConfluence,
-          minRR,
-          allowedStrength,
-          cooldownBars,
-          fearGreed: 50,
-          derivativesData: null,
-          macroData: null
+          asset, days, interval: stepInterval, capital, riskPerTrade,
+          maxOpenPositions, minConfluence, minRR, allowedStrength,
+          cooldownBars, fearGreed: 50, derivativesData: null, macroData: null
         }, async (progress) => {
-          // Update progress in DB
-          await supabase
-            .from('backtest_results')
-            .update({ progress })
-            .eq('id', record.id);
+          // Update progress in memory
+          const entry = backtestStore.get(recordId);
+          if (entry) entry.progress = typeof progress === 'object' ? Math.round((progress.current / progress.total) * 100) : progress;
+
+          // Also try DB if available
+          if (useDB) {
+            try {
+              await supabase.from('backtest_results').update({ progress: entry?.progress || 0 }).eq('id', recordId);
+            } catch (_) { /* ignore */ }
+          }
         });
 
-        // Save completed results
-        await supabase
-          .from('backtest_results')
-          .update({
-            status: 'completed',
-            progress: 100,
-            total_trades: result.totalTrades,
-            win_count: result.winCount,
-            loss_count: result.lossCount,
-            win_rate: result.winRate,
-            total_pnl: result.totalPnl,
-            total_pnl_percent: result.totalPnlPercent,
-            max_drawdown: result.maxDrawdown,
-            max_drawdown_percent: result.maxDrawdownPercent,
-            profit_factor: result.profitFactor,
-            sharpe_ratio: result.sharpeRatio,
-            avg_holding_hours: result.avgHoldingHours,
-            trades: result.trades,
-            equity_curve: result.equityCurve,
-            metrics: result,
-            completed_at: new Date().toISOString()
-          })
-          .eq('id', record.id);
+        // Build completed result
+        const metrics = result.metrics || result;
+        const completed = {
+          id: recordId, user_id: userId, asset, days, step_interval: stepInterval,
+          initial_capital: capital, status: 'completed', progress: 100,
+          total_trades: metrics.totalTrades, win_count: metrics.winCount,
+          loss_count: metrics.lossCount, win_rate: metrics.winRate,
+          total_pnl: metrics.totalPnl, total_pnl_percent: metrics.totalPnlPercent,
+          max_drawdown: metrics.maxDrawdown, max_drawdown_percent: metrics.maxDrawdownPercent,
+          profit_factor: metrics.profitFactor, sharpe_ratio: metrics.sharpeRatio,
+          avg_holding_hours: metrics.avgHoldingBars, trades: result.trades,
+          equity_curve: result.equityCurve, metrics: metrics,
+          completed_at: new Date().toISOString(), created_at: backtestStore.get(recordId)?.created_at
+        };
 
-        logger.info(`Backtest completed: ${record.id}`, {
-          asset, days, trades: result.totalTrades, pnl: result.totalPnl
+        // Save to memory
+        backtestStore.set(recordId, completed);
+
+        // Try to save to DB
+        if (useDB) {
+          try {
+            await supabase.from('backtest_results').update({
+              status: 'completed', progress: 100,
+              total_trades: metrics.totalTrades, win_count: metrics.winCount,
+              loss_count: metrics.lossCount, win_rate: metrics.winRate,
+              total_pnl: metrics.totalPnl, total_pnl_percent: metrics.totalPnlPercent,
+              max_drawdown: metrics.maxDrawdown, max_drawdown_percent: metrics.maxDrawdownPercent,
+              profit_factor: metrics.profitFactor, sharpe_ratio: metrics.sharpeRatio,
+              avg_holding_hours: metrics.avgHoldingBars, trades: result.trades,
+              equity_curve: result.equityCurve, metrics: metrics,
+              completed_at: new Date().toISOString()
+            }).eq('id', recordId);
+          } catch (_) { /* saved in memory */ }
+        }
+
+        logger.info(`Backtest completed: ${recordId}`, {
+          asset, days, trades: metrics.totalTrades, pnl: metrics.totalPnl
         });
 
-        // Broadcast via SSE
-        broadcastSSE('backtest_complete', { id: record.id, asset, status: 'completed' });
+        broadcastSSE('backtest_complete', { id: recordId, asset, status: 'completed' });
 
       } catch (err) {
-        logger.error(`Backtest failed: ${record.id}`, { error: err.message });
-        await supabase
-          .from('backtest_results')
-          .update({
-            status: 'failed',
-            error_message: err.message,
-            completed_at: new Date().toISOString()
-          })
-          .eq('id', record.id);
+        logger.error(`Backtest failed: ${recordId}`, { error: err.message });
+        backtestStore.set(recordId, {
+          ...backtestStore.get(recordId), status: 'failed',
+          error_message: err.message, completed_at: new Date().toISOString()
+        });
+        if (useDB) {
+          try {
+            await supabase.from('backtest_results').update({
+              status: 'failed', error_message: err.message,
+              completed_at: new Date().toISOString()
+            }).eq('id', recordId);
+          } catch (_) { /* ignore */ }
+        }
       }
     })();
 
@@ -2008,15 +2032,22 @@ app.post('/api/backtest/run', async (req, res) => {
 // ─── Get backtest results by ID ──────────────────────────────────────────────
 app.get('/api/backtest/results/:id', async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('backtest_results')
-      .select('*')
-      .eq('id', req.params.id)
-      .single();
+    // Check in-memory store first
+    const memResult = backtestStore.get(req.params.id);
+    if (memResult) return res.json(memResult);
 
-    if (error || !data) return res.status(404).json({ error: 'Backtest not found' });
+    // Try Supabase
+    try {
+      const { data, error } = await supabase
+        .from('backtest_results')
+        .select('*')
+        .eq('id', req.params.id)
+        .single();
 
-    res.json(data);
+      if (!error && data) return res.json(data);
+    } catch (_) { /* DB unavailable */ }
+
+    return res.status(404).json({ error: 'Backtest not found' });
   } catch (error) {
     logger.error('Backtest results fetch failed', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
@@ -2026,19 +2057,41 @@ app.get('/api/backtest/results/:id', async (req, res) => {
 // ─── Get backtest history for user ───────────────────────────────────────────
 app.get('/api/backtest/history/:userId', async (req, res) => {
   try {
-    const { data, error } = await supabase
-      .from('backtest_results')
-      .select('id, asset, days, step_interval, initial_capital, status, progress, total_trades, win_rate, total_pnl, total_pnl_percent, max_drawdown_percent, profit_factor, sharpe_ratio, error_message, started_at, completed_at, created_at')
-      .eq('user_id', req.params.userId)
-      .order('created_at', { ascending: false })
-      .limit(20);
+    let results = [];
 
-    if (error) {
-      logger.error('Backtest history fetch failed', { error: error.message });
-      return res.status(500).json({ error: 'Failed to fetch history' });
+    // Try Supabase first
+    try {
+      const { data, error } = await supabase
+        .from('backtest_results')
+        .select('id, asset, days, step_interval, initial_capital, status, progress, total_trades, win_rate, total_pnl, total_pnl_percent, max_drawdown_percent, profit_factor, sharpe_ratio, error_message, started_at, completed_at, created_at')
+        .eq('user_id', req.params.userId)
+        .order('created_at', { ascending: false })
+        .limit(20);
+
+      if (!error && data) results = data;
+    } catch (_) { /* DB unavailable */ }
+
+    // Merge in-memory results
+    const memResults = Array.from(backtestStore.values())
+      .filter(r => r.user_id === req.params.userId)
+      .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+    // Add memory results that aren't already in DB results
+    const dbIds = new Set(results.map(r => r.id));
+    for (const mr of memResults) {
+      if (!dbIds.has(mr.id)) {
+        results.unshift({
+          id: mr.id, asset: mr.asset, days: mr.days, step_interval: mr.step_interval,
+          initial_capital: mr.initial_capital, status: mr.status, progress: mr.progress,
+          total_trades: mr.total_trades, win_rate: mr.win_rate, total_pnl: mr.total_pnl,
+          total_pnl_percent: mr.total_pnl_percent, max_drawdown_percent: mr.max_drawdown_percent,
+          profit_factor: mr.profit_factor, sharpe_ratio: mr.sharpe_ratio,
+          error_message: mr.error_message, completed_at: mr.completed_at, created_at: mr.created_at
+        });
+      }
     }
 
-    res.json(data || []);
+    res.json(results.slice(0, 20));
   } catch (error) {
     logger.error('Backtest history failed', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
