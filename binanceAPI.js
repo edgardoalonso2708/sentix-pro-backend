@@ -536,6 +536,115 @@ async function fetchDerivativesData(coinGeckoId) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// ORDER BOOK DEPTH (Spot)
+// Bid/Ask walls, imbalance ratio, spread analysis
+// Weight: 5 per call (limit=20), fits well within rate budget
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Fetch order book depth for a CoinGecko asset ID.
+ * Returns bids/asks with aggregated metrics: imbalance ratio, spread, walls.
+ *
+ * @param {string} coinGeckoId - CoinGecko asset ID (e.g. 'bitcoin')
+ * @param {number} [limit=20] - Depth levels (5, 10, 20, 50, 100, 500, 1000)
+ * @returns {Promise<Object|null>} Order book data or null if unavailable
+ *
+ * Returned object:
+ * {
+ *   bidTotal, askTotal,        // Summed volume on each side
+ *   imbalanceRatio,            // bidTotal / askTotal (>1 = more buy support)
+ *   spreadPercent,             // (bestAsk - bestBid) / midPrice * 100
+ *   bestBid, bestAsk,
+ *   bidWall, askWall,          // Largest single level
+ *   wallImbalance,             // bidWall.qty / askWall.qty
+ *   depthLevels                // Number of levels fetched
+ * }
+ */
+async function fetchOrderBookDepth(coinGeckoId, limit = 20) {
+  const symbol = SYMBOL_MAP[coinGeckoId];
+  if (!symbol) return null;
+
+  if (!checkRateLimit()) {
+    logger.warn('Rate limited - skipping order book', { coinGeckoId });
+    return null;
+  }
+
+  const endpointsToTry = [activeBinanceBase, ...BINANCE_ENDPOINTS.filter(e => e !== activeBinanceBase)];
+
+  for (const endpoint of endpointsToTry) {
+    try {
+      const response = await binanceClient.get('/api/v3/depth', {
+        params: { symbol: symbol.toUpperCase(), limit },
+        baseURL: endpoint
+      });
+
+      if (endpoint !== activeBinanceBase) {
+        logger.info(`Binance endpoint switched: ${activeBinanceBase} → ${endpoint}`);
+        activeBinanceBase = endpoint;
+      }
+
+      const { bids, asks } = response.data;
+
+      if (!bids || !asks || bids.length === 0 || asks.length === 0) {
+        logger.warn('Empty order book', { symbol });
+        return null;
+      }
+
+      // Parse price/qty arrays: [[price, qty], ...]
+      const parsedBids = bids.map(([p, q]) => ({ price: parseFloat(p), qty: parseFloat(q) }));
+      const parsedAsks = asks.map(([p, q]) => ({ price: parseFloat(p), qty: parseFloat(q) }));
+
+      // Aggregated volumes
+      const bidTotal = parsedBids.reduce((sum, b) => sum + b.qty, 0);
+      const askTotal = parsedAsks.reduce((sum, a) => sum + a.qty, 0);
+      const imbalanceRatio = askTotal > 0 ? Math.round((bidTotal / askTotal) * 1000) / 1000 : 1;
+
+      // Spread
+      const bestBid = parsedBids[0].price;
+      const bestAsk = parsedAsks[0].price;
+      const midPrice = (bestBid + bestAsk) / 2;
+      const spreadPercent = midPrice > 0 ? Math.round(((bestAsk - bestBid) / midPrice) * 10000) / 100 : 0;
+
+      // Walls: largest single level on each side
+      const bidWall = parsedBids.reduce((max, b) => b.qty > max.qty ? b : max, parsedBids[0]);
+      const askWall = parsedAsks.reduce((max, a) => a.qty > max.qty ? a : max, parsedAsks[0]);
+      const wallImbalance = askWall.qty > 0 ? Math.round((bidWall.qty / askWall.qty) * 1000) / 1000 : 1;
+
+      logger.debug('Order book fetched', {
+        symbol, levels: limit, bidTotal: bidTotal.toFixed(2), askTotal: askTotal.toFixed(2),
+        imbalance: imbalanceRatio, spread: spreadPercent
+      });
+
+      return {
+        bidTotal: Math.round(bidTotal * 100) / 100,
+        askTotal: Math.round(askTotal * 100) / 100,
+        imbalanceRatio,
+        spreadPercent,
+        bestBid,
+        bestAsk,
+        bidWall: { price: bidWall.price, qty: Math.round(bidWall.qty * 100) / 100 },
+        askWall: { price: askWall.price, qty: Math.round(askWall.qty * 100) / 100 },
+        wallImbalance,
+        depthLevels: limit,
+        timestamp: new Date().toISOString()
+      };
+
+    } catch (error) {
+      const status = error.response?.status;
+      if (status === 451 || status === 403) {
+        logger.warn(`Binance endpoint ${endpoint} returned ${status} for depth, trying next...`);
+        continue;
+      }
+      logger.warn('Order book fetch failed', { symbol, error: error.message });
+      return null;
+    }
+  }
+
+  logger.warn('All Binance endpoints failed for order book', { coinGeckoId });
+  return null;
+}
+
 module.exports = {
   fetchKlines,
   fetchOHLCVForAsset,
@@ -546,6 +655,7 @@ module.exports = {
   fetchOpenInterest,
   fetchLongShortRatio,
   fetchDerivativesData,
+  fetchOrderBookDepth,
   SYMBOL_MAP,
   FUTURES_SYMBOL_MAP,
   VALID_INTERVALS

@@ -40,6 +40,7 @@ const DEFAULT_STRATEGY_CONFIG = {
   derivativesScore: 15,     // Extreme funding rate score
   btcDomScore: 10,          // BTC dominance regime score
   dxyScore: 10,             // DXY macro score
+  orderBookScore: 12,       // Order book imbalance score
 
   // ─── ADX Thresholds & Multipliers ───────────────────────────────
   adxStrongThreshold: 30,   // ADX >= this = strong trend
@@ -171,6 +172,11 @@ const PARAM_RANGES = {
     min: 0.5, max: 0.9, step: 0.1,
     label: 'Conflicting TF Multiplier',
     description: 'Score reduction when timeframes disagree'
+  },
+  orderBookScore: {
+    min: 5, max: 20, step: 5,
+    label: 'Order Book Weight',
+    description: 'Score contribution from order book bid/ask imbalance'
   },
   confidenceCap: {
     min: 70, max: 95, step: 5,

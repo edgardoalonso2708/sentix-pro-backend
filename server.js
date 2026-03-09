@@ -14,7 +14,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { SilentTelegramBot, setupTelegramCommands } = require('./telegramBot');
 const { fetchMetalsPricesSafe } = require('./metalsAPI');
 const { generateSignalWithRealData, generateMultiTimeframeSignal } = require('./technicalAnalysis');
-const { fetchDerivativesData } = require('./binanceAPI');
+const { fetchDerivativesData, fetchOrderBookDepth } = require('./binanceAPI');
 const {
   upload,
   parsePortfolioCSV,
@@ -574,15 +574,19 @@ async function generateSignals() {
         continue;
       }
 
-      // Fetch derivatives data (funding rate, OI, L/S ratio)
+      // Fetch derivatives data (funding rate, OI, L/S ratio) + order book depth
       let derivativesData = null;
+      let orderBookData = null;
       try {
-        derivativesData = await fetchDerivativesData(assetId);
+        [derivativesData, orderBookData] = await Promise.all([
+          fetchDerivativesData(assetId).catch(() => null),
+          fetchOrderBookDepth(assetId).catch(() => null)
+        ]);
       } catch (e) {
-        logger.debug('Derivatives unavailable', { asset: assetId });
+        logger.debug('Derivatives/OrderBook unavailable', { asset: assetId });
       }
 
-      // Multi-timeframe analysis (4H + 1H + 15M confluence) + macro context
+      // Multi-timeframe analysis (4H + 1H + 15M confluence) + macro + order book
       const signal = await generateMultiTimeframeSignal(
         assetId,
         data.price,
@@ -590,7 +594,10 @@ async function generateSignals() {
         data.volume24h,
         fearGreed,
         derivativesData,
-        macroData
+        macroData,
+        null,  // preloadedCandlesMap
+        null,  // strategyConfig
+        orderBookData
       );
 
       signal.assetClass = 'crypto';
@@ -894,76 +901,110 @@ async function processAlerts() {
     let telegramCount = 0;
     let emailCount = 0;
 
-    // Alert thresholds: BUY/SELL with confidence >= 55, or STRONG signals >= 45
-    const ALERT_MIN_CONFIDENCE = 55;
-    const STRONG_SIGNAL_CONFIDENCE = 45;
+    // Load per-user alert filters (fallback to defaults if table doesn't exist)
+    let alertFilters = null;
+    try {
+      const { data, error } = await supabase
+        .from('alert_filters')
+        .select('*')
+        .eq('enabled', true);
+      if (!error && data) alertFilters = data;
+    } catch (e) {
+      logger.debug('alert_filters table not available, using defaults');
+    }
+
+    // Default filter (used when no per-user filters exist)
+    const DEFAULT_FILTER = {
+      assets: [],
+      actions: ['BUY', 'SELL', 'STRONG BUY', 'STRONG SELL'],
+      min_confidence: 45,
+      min_score: 25,
+      telegram_enabled: true,
+      email_enabled: true,
+      cooldown_minutes: 20
+    };
+
+    // Use first user's filter if available, otherwise defaults
+    // (Single-user system for now; multi-user would iterate filters)
+    const filter = (alertFilters && alertFilters.length > 0) ? alertFilters[0] : DEFAULT_FILTER;
 
     for (const signal of signals) {
-      const isActionable = signal.action === 'BUY' || signal.action === 'SELL';
-      const isHighConfidence = signal.confidence >= ALERT_MIN_CONFIDENCE;
-      const isStrongSignal = signal.confidence >= STRONG_SIGNAL_CONFIDENCE &&
-        (signal.strengthLabel?.includes('STRONG') || Math.abs(signal.rawScore || 0) >= 40);
-
-      if (isActionable && (isHighConfidence || isStrongSignal)) {
-        // Deduplicate: only alert once per asset+action per cycle
-        const alertKey = `${signal.asset}-${signal.action}`;
-        if (recentAlertKeys.has(alertKey)) continue;
-
-        // Save to database (alerts table)
-        try {
-          const { error } = await supabase
-            .from('alerts')
-            .insert({
-              asset: signal.asset,
-              action: signal.action,
-              score: signal.score,
-              confidence: signal.confidence,
-              reasons: signal.reasons,
-              price: signal.price
-            });
-
-          if (error) {
-            if (error.code === '42P01') {
-              logger.debug('Alerts table not yet created - skipping DB save');
-            } else {
-              logger.warn('Alert save failed', { error: error.message });
-            }
-          } else {
-            savedCount++;
-          }
-        } catch (dbError) {
-          logger.warn('Alert DB save error', { error: dbError.message });
-        }
-
-        // Send via Telegram to all subscribers
-        if (bot.isActive()) {
-          const result = await bot.broadcastAlert(signal);
-          if (result.sent > 0) {
-            telegramCount += result.sent;
-            logger.info('Telegram alert sent', {
-              asset: signal.asset,
-              action: signal.action,
-              confidence: signal.confidence,
-              sent: result.sent,
-              total: result.total
-            });
-          }
-        }
-
-        // Send via email
-        if (resend) {
-          const emailResult = await sendEmailAlert(
-            ALERT_EMAIL,
-            `${signal.action === 'BUY' ? '🟢' : '🔴'} SENTIX PRO: ${signal.action} ${signal.asset} (${signal.confidence}%)`,
-            buildSignalEmailHTML(signal)
-          );
-          if (emailResult.success) emailCount++;
-        }
-
-        // Mark as recently sent (clear after 20 minutes for faster re-alerting)
-        recentAlertKeys.add(alertKey);
-        setTimeout(() => recentAlertKeys.delete(alertKey), 20 * 60 * 1000);
+      // ─── Apply user filters ───
+      // Check if asset is in allowed list (empty = all)
+      if (filter.assets && filter.assets.length > 0) {
+        if (!filter.assets.includes(signal.asset)) continue;
       }
+
+      // Check if action/strengthLabel matches allowed actions
+      const signalActions = [signal.action, signal.strengthLabel].filter(Boolean);
+      const matchesAction = filter.actions.some(a => signalActions.includes(a));
+      if (!matchesAction) continue;
+
+      // Check minimum confidence
+      if (signal.confidence < (filter.min_confidence || 0)) continue;
+
+      // Check minimum score
+      if (Math.abs(signal.rawScore || 0) < (filter.min_score || 0)) continue;
+
+      // Deduplicate: only alert once per asset+action per cooldown period
+      const alertKey = `${signal.asset}-${signal.action}`;
+      if (recentAlertKeys.has(alertKey)) continue;
+
+      // Save to database (alerts table) - always save regardless of delivery prefs
+      try {
+        const { error } = await supabase
+          .from('alerts')
+          .insert({
+            asset: signal.asset,
+            action: signal.action,
+            score: signal.score,
+            confidence: signal.confidence,
+            reasons: signal.reasons,
+            price: signal.price
+          });
+
+        if (error) {
+          if (error.code === '42P01') {
+            logger.debug('Alerts table not yet created - skipping DB save');
+          } else {
+            logger.warn('Alert save failed', { error: error.message });
+          }
+        } else {
+          savedCount++;
+        }
+      } catch (dbError) {
+        logger.warn('Alert DB save error', { error: dbError.message });
+      }
+
+      // Send via Telegram (if user enabled)
+      if (filter.telegram_enabled !== false && bot.isActive()) {
+        const result = await bot.broadcastAlert(signal);
+        if (result.sent > 0) {
+          telegramCount += result.sent;
+          logger.info('Telegram alert sent', {
+            asset: signal.asset,
+            action: signal.action,
+            confidence: signal.confidence,
+            sent: result.sent,
+            total: result.total
+          });
+        }
+      }
+
+      // Send via email (if user enabled)
+      if (filter.email_enabled !== false && resend) {
+        const emailResult = await sendEmailAlert(
+          ALERT_EMAIL,
+          `${signal.action === 'BUY' ? '🟢' : '🔴'} SENTIX PRO: ${signal.action} ${signal.asset} (${signal.confidence}%)`,
+          buildSignalEmailHTML(signal)
+        );
+        if (emailResult.success) emailCount++;
+      }
+
+      // Mark as recently sent (cooldown from filter, default 20 min)
+      const cooldownMs = (filter.cooldown_minutes || 20) * 60 * 1000;
+      recentAlertKeys.add(alertKey);
+      setTimeout(() => recentAlertKeys.delete(alertKey), cooldownMs);
     }
 
     logger.info('Alerts processed', {
@@ -1271,6 +1312,107 @@ app.post('/api/send-alert', async (req, res) => {
     message: 'Test alert processed',
     delivery: results
   });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ALERT FILTER ENDPOINTS
+// Per-user customizable alert preferences
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/alert-filters/:userId - Get user's alert filter preferences
+app.get('/api/alert-filters/:userId', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+
+    const { data, error } = await supabase
+      .from('alert_filters')
+      .select('*')
+      .eq('user_id', userId)
+      .single();
+
+    if (error && error.code === 'PGRST116') {
+      // No row found - return defaults
+      return res.json({
+        user_id: userId,
+        assets: [],
+        actions: ['BUY', 'SELL', 'STRONG BUY', 'STRONG SELL'],
+        min_confidence: 50,
+        min_score: 25,
+        telegram_enabled: true,
+        email_enabled: true,
+        quiet_start: null,
+        quiet_end: null,
+        cooldown_minutes: 20,
+        enabled: true
+      });
+    }
+
+    if (error) throw error;
+    res.json(data);
+  } catch (error) {
+    logger.error('Failed to fetch alert filters', { error: error.message });
+    res.status(500).json({ error: 'Failed to fetch alert filters' });
+  }
+});
+
+// PUT /api/alert-filters/:userId - Create or update alert filter preferences
+app.put('/api/alert-filters/:userId', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+
+    const {
+      assets, actions, min_confidence, min_score,
+      telegram_enabled, email_enabled,
+      quiet_start, quiet_end, cooldown_minutes, enabled
+    } = req.body;
+
+    // Validate
+    if (min_confidence !== undefined && (min_confidence < 0 || min_confidence > 100)) {
+      return res.status(400).json({ error: 'min_confidence must be 0-100' });
+    }
+    if (min_score !== undefined && (min_score < 0 || min_score > 100)) {
+      return res.status(400).json({ error: 'min_score must be 0-100' });
+    }
+    if (cooldown_minutes !== undefined && (cooldown_minutes < 1 || cooldown_minutes > 1440)) {
+      return res.status(400).json({ error: 'cooldown_minutes must be 1-1440' });
+    }
+
+    const payload = {
+      user_id: userId,
+      updated_at: new Date().toISOString()
+    };
+
+    // Only include fields that were sent
+    if (assets !== undefined) payload.assets = assets;
+    if (actions !== undefined) payload.actions = actions;
+    if (min_confidence !== undefined) payload.min_confidence = min_confidence;
+    if (min_score !== undefined) payload.min_score = min_score;
+    if (telegram_enabled !== undefined) payload.telegram_enabled = telegram_enabled;
+    if (email_enabled !== undefined) payload.email_enabled = email_enabled;
+    if (quiet_start !== undefined) payload.quiet_start = quiet_start;
+    if (quiet_end !== undefined) payload.quiet_end = quiet_end;
+    if (cooldown_minutes !== undefined) payload.cooldown_minutes = cooldown_minutes;
+    if (enabled !== undefined) payload.enabled = enabled;
+
+    const { data, error } = await supabase
+      .from('alert_filters')
+      .upsert(payload, { onConflict: 'user_id' })
+      .select()
+      .single();
+
+    if (error) throw error;
+    logger.info('Alert filters updated', { userId });
+    res.json(data);
+  } catch (error) {
+    logger.error('Failed to update alert filters', { error: error.message });
+    res.status(500).json({ error: 'Failed to update alert filters' });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -863,12 +863,92 @@ function scoreDxyMacro(dxy, dxyTrend, dxyChange) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// ORDER BOOK DEPTH SCORING (Factor #14)
+// Analyzes bid/ask imbalance, walls, and spread for directional bias
+// Weight: up to ±12 score, up to 4 confidence
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Score order book depth data for directional signal.
+ * Uses imbalance ratio (bid vol / ask vol), wall analysis, and spread.
+ *
+ * @param {Object|null} orderBook - From fetchOrderBookDepth()
+ * @param {Object} cfg - Strategy config (needs orderBookScore weight)
+ * @returns {{ scoreModifier: number, confidenceModifier: number, signals: string[], pressure: string }}
+ */
+function scoreOrderBook(orderBook, cfg = {}) {
+  if (!orderBook) return { scoreModifier: 0, confidenceModifier: 0, signals: [], pressure: 'unavailable' };
+
+  const weight = cfg.orderBookScore || 12;
+  let scoreModifier = 0;
+  let confidenceModifier = 0;
+  const signals = [];
+  let pressure = 'neutral';
+
+  const { imbalanceRatio, wallImbalance, spreadPercent } = orderBook;
+
+  // ─── Imbalance Ratio Analysis ───
+  // > 1.5 = strong buy support (bids outweigh asks significantly)
+  // < 0.67 = strong sell pressure (asks outweigh bids)
+  if (imbalanceRatio >= 2.0) {
+    scoreModifier += weight;
+    confidenceModifier += 4;
+    pressure = 'strong_buy_support';
+    signals.push(`Order book heavy bid side (${imbalanceRatio.toFixed(2)}x) - strong buy support`);
+  } else if (imbalanceRatio >= 1.5) {
+    scoreModifier += Math.round(weight * 0.6);
+    confidenceModifier += 2;
+    pressure = 'buy_support';
+    signals.push(`Order book bid-leaning (${imbalanceRatio.toFixed(2)}x)`);
+  } else if (imbalanceRatio <= 0.5) {
+    scoreModifier -= weight;
+    confidenceModifier += 4;
+    pressure = 'strong_sell_pressure';
+    signals.push(`Order book heavy ask side (${imbalanceRatio.toFixed(2)}x) - strong sell pressure`);
+  } else if (imbalanceRatio <= 0.67) {
+    scoreModifier -= Math.round(weight * 0.6);
+    confidenceModifier += 2;
+    pressure = 'sell_pressure';
+    signals.push(`Order book ask-leaning (${imbalanceRatio.toFixed(2)}x)`);
+  }
+
+  // ─── Wall Analysis ───
+  // Large bid wall = support; large ask wall = resistance
+  if (wallImbalance >= 3.0) {
+    scoreModifier += Math.round(weight * 0.3);
+    signals.push(`Bid wall ${wallImbalance.toFixed(1)}x larger than ask wall`);
+  } else if (wallImbalance <= 0.33) {
+    scoreModifier -= Math.round(weight * 0.3);
+    signals.push(`Ask wall ${(1 / wallImbalance).toFixed(1)}x larger than bid wall`);
+  }
+
+  // ─── Spread Analysis ───
+  // Wide spread = low liquidity → reduce confidence
+  // Tight spread = high liquidity → slight confidence boost
+  if (spreadPercent > 0.1) {
+    confidenceModifier -= 2;
+    signals.push(`Wide spread (${spreadPercent.toFixed(2)}%) - low liquidity`);
+  } else if (spreadPercent < 0.02) {
+    confidenceModifier += 1;
+  }
+
+  // Default pressure label
+  if (pressure === 'neutral') {
+    if (imbalanceRatio > 1.1) pressure = 'slight_buy';
+    else if (imbalanceRatio < 0.9) pressure = 'slight_sell';
+    else pressure = 'balanced';
+  }
+
+  return { scoreModifier, confidenceModifier, signals, pressure };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // SIGNAL GENERATION ENGINE v4.5
 // Strategy: Multi-factor weighted scoring with trend context
 // + Trade levels (SL/TP/R:R) + Derivatives + Macro context + Multi-timeframe
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, interval = '1h', derivativesData = null, macroData = null, preloadedCandles = null, strategyConfig = null) {
+async function generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, interval = '1h', derivativesData = null, macroData = null, preloadedCandles = null, strategyConfig = null, orderBookData = null) {
   // Merge strategy config with defaults
   const { mergeConfig } = require('./strategyConfig');
   const cfg = mergeConfig(strategyConfig);
@@ -1181,6 +1261,16 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
       signals.push(...dxyScoring.signals);
     }
 
+    // ─── 14. ORDER BOOK DEPTH ─────────────────────────────────────────
+    // Weight: up to ±12 score, up to 4 confidence
+    let orderBookScoring = { scoreModifier: 0, confidenceModifier: 0, signals: [], pressure: 'unavailable' };
+    if (orderBookData) {
+      orderBookScoring = scoreOrderBook(orderBookData, cfg);
+      score += orderBookScoring.scoreModifier;
+      confidence += orderBookScoring.confidenceModifier;
+      signals.push(...orderBookScoring.signals);
+    }
+
     // ─── SIGNAL AGREEMENT ANALYSIS ──────────────────────────────────
     // Count how many factors agree vs disagree
     const bullishFactors = [
@@ -1300,6 +1390,15 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
         dxy: macroData.dxy,
         dxyRegime: dxyScoring.regime
       } : null,
+      orderBook: orderBookData ? {
+        imbalanceRatio: orderBookData.imbalanceRatio,
+        spreadPercent: orderBookData.spreadPercent,
+        bidTotal: orderBookData.bidTotal,
+        askTotal: orderBookData.askTotal,
+        bidWall: orderBookData.bidWall,
+        askWall: orderBookData.askWall,
+        pressure: orderBookScoring.pressure
+      } : null,
       dataSource: 'Binance OHLCV',
       interval,
       candlesAnalyzed: ohlcvData.length,
@@ -1341,7 +1440,7 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
  * @param {Object|null} derivativesData
  * @returns {Promise<Object>} Merged signal with confluence data
  */
-async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volume, fearGreed, derivativesData = null, macroData = null, preloadedCandlesMap = null, strategyConfig = null) {
+async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volume, fearGreed, derivativesData = null, macroData = null, preloadedCandlesMap = null, strategyConfig = null, orderBookData = null) {
   // Merge strategy config with defaults for confluence parameters
   const { mergeConfig } = require('./strategyConfig');
   const cfg = mergeConfig(strategyConfig);
@@ -1349,11 +1448,12 @@ async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volu
   // Run all three timeframes in parallel
   // Pass derivatives only to 1h (primary) to avoid triple-counting
   // Pass macroData only to 1h to avoid triple-counting macro impact
+  // Pass orderBookData only to 1h to avoid triple-counting
   // If preloadedCandlesMap provided (backtesting), pass candles per timeframe
   const [signal4h, signal1h, signal15m] = await Promise.all([
-    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '4h', null, null, preloadedCandlesMap?.['4h'] || null, strategyConfig),
-    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '1h', derivativesData, macroData, preloadedCandlesMap?.['1h'] || null, strategyConfig),
-    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '15m', null, null, preloadedCandlesMap?.['15m'] || null, strategyConfig)
+    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '4h', null, null, preloadedCandlesMap?.['4h'] || null, strategyConfig, null),
+    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '1h', derivativesData, macroData, preloadedCandlesMap?.['1h'] || null, strategyConfig, orderBookData),
+    generateSignalWithRealData(asset, currentPrice, change24h, volume, fearGreed, '15m', null, null, preloadedCandlesMap?.['15m'] || null, strategyConfig, null)
   ]);
 
   // Classify each timeframe's direction
@@ -1485,6 +1585,7 @@ async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volu
     tradeLevels,
     derivatives: signal1h.derivatives || null,
     macroContext: signal1h.macroContext || null,
+    orderBook: signal1h.orderBook || null,
     dataSource: 'Binance OHLCV (Multi-TF)',
     interval: 'multi',
     candlesAnalyzed: (signal4h.candlesAnalyzed || 0) + (signal1h.candlesAnalyzed || 0) + (signal15m.candlesAnalyzed || 0),
@@ -1535,6 +1636,7 @@ module.exports = {
   scoreDerivatives,
   scoreBtcDominance,
   scoreDxyMacro,
+  scoreOrderBook,
   generateSignalWithRealData,
   generateMultiTimeframeSignal
 };

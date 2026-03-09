@@ -10,7 +10,8 @@ const {
   calculateTradeLevels,
   scoreDerivatives,
   scoreBtcDominance,
-  scoreDxyMacro
+  scoreDxyMacro,
+  scoreOrderBook
 } = require('../technicalAnalysis');
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -762,6 +763,122 @@ describe('scoreDxyMacro', () => {
     expect(result).toHaveProperty('confidenceModifier');
     expect(result).toHaveProperty('signals');
     expect(result).toHaveProperty('regime');
+    expect(Array.isArray(result.signals)).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// scoreOrderBook Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('scoreOrderBook', () => {
+  test('null order book → zero modifiers, pressure unavailable', () => {
+    const result = scoreOrderBook(null);
+    expect(result.scoreModifier).toBe(0);
+    expect(result.confidenceModifier).toBe(0);
+    expect(result.signals).toHaveLength(0);
+    expect(result.pressure).toBe('unavailable');
+  });
+
+  test('strong bid imbalance (2x+) → full positive score + strong_buy_support', () => {
+    const result = scoreOrderBook({
+      imbalanceRatio: 2.5, wallImbalance: 1.0, spreadPercent: 0.05
+    });
+    expect(result.scoreModifier).toBe(12); // default weight
+    expect(result.confidenceModifier).toBe(4);
+    expect(result.pressure).toBe('strong_buy_support');
+  });
+
+  test('moderate bid imbalance (1.5x) → partial positive score + buy_support', () => {
+    const result = scoreOrderBook({
+      imbalanceRatio: 1.5, wallImbalance: 1.0, spreadPercent: 0.05
+    });
+    expect(result.scoreModifier).toBe(Math.round(12 * 0.6)); // 7
+    expect(result.confidenceModifier).toBe(2);
+    expect(result.pressure).toBe('buy_support');
+  });
+
+  test('strong ask imbalance (0.5x-) → full negative score + strong_sell_pressure', () => {
+    const result = scoreOrderBook({
+      imbalanceRatio: 0.4, wallImbalance: 1.0, spreadPercent: 0.05
+    });
+    expect(result.scoreModifier).toBe(-12);
+    expect(result.confidenceModifier).toBe(4);
+    expect(result.pressure).toBe('strong_sell_pressure');
+  });
+
+  test('moderate ask imbalance (0.67x) → partial negative + sell_pressure', () => {
+    const result = scoreOrderBook({
+      imbalanceRatio: 0.6, wallImbalance: 1.0, spreadPercent: 0.05
+    });
+    expect(result.scoreModifier).toBe(-Math.round(12 * 0.6)); // -7
+    expect(result.pressure).toBe('sell_pressure');
+  });
+
+  test('bid wall 3x larger → additional positive score', () => {
+    const result = scoreOrderBook({
+      imbalanceRatio: 1.0, wallImbalance: 4.0, spreadPercent: 0.05
+    });
+    expect(result.scoreModifier).toBe(Math.round(12 * 0.3)); // 4
+  });
+
+  test('ask wall 3x larger → additional negative score', () => {
+    const result = scoreOrderBook({
+      imbalanceRatio: 1.0, wallImbalance: 0.2, spreadPercent: 0.05
+    });
+    expect(result.scoreModifier).toBe(-Math.round(12 * 0.3)); // -4
+  });
+
+  test('wide spread (>0.1%) → reduces confidence', () => {
+    const result = scoreOrderBook({
+      imbalanceRatio: 1.0, wallImbalance: 1.0, spreadPercent: 0.15
+    });
+    expect(result.confidenceModifier).toBe(-2);
+    expect(result.signals.some(s => s.includes('Wide spread'))).toBe(true);
+  });
+
+  test('tight spread (<0.02%) → slight confidence boost', () => {
+    const result = scoreOrderBook({
+      imbalanceRatio: 1.0, wallImbalance: 1.0, spreadPercent: 0.01
+    });
+    expect(result.confidenceModifier).toBe(1);
+  });
+
+  test('balanced book → pressure is "balanced"', () => {
+    const result = scoreOrderBook({
+      imbalanceRatio: 1.0, wallImbalance: 1.0, spreadPercent: 0.05
+    });
+    expect(result.pressure).toBe('balanced');
+  });
+
+  test('slight bid lean (1.1-1.5) → pressure is "slight_buy"', () => {
+    const result = scoreOrderBook({
+      imbalanceRatio: 1.2, wallImbalance: 1.0, spreadPercent: 0.05
+    });
+    expect(result.pressure).toBe('slight_buy');
+  });
+
+  test('slight ask lean (0.67-0.9) → pressure is "slight_sell"', () => {
+    const result = scoreOrderBook({
+      imbalanceRatio: 0.8, wallImbalance: 1.0, spreadPercent: 0.05
+    });
+    expect(result.pressure).toBe('slight_sell');
+  });
+
+  test('custom weight from cfg.orderBookScore', () => {
+    const result = scoreOrderBook(
+      { imbalanceRatio: 2.5, wallImbalance: 1.0, spreadPercent: 0.05 },
+      { orderBookScore: 20 }
+    );
+    expect(result.scoreModifier).toBe(20);
+  });
+
+  test('returns all required fields', () => {
+    const result = scoreOrderBook({ imbalanceRatio: 1.0, wallImbalance: 1.0, spreadPercent: 0.05 });
+    expect(result).toHaveProperty('scoreModifier');
+    expect(result).toHaveProperty('confidenceModifier');
+    expect(result).toHaveProperty('signals');
+    expect(result).toHaveProperty('pressure');
     expect(Array.isArray(result.signals)).toBe(true);
   });
 });
