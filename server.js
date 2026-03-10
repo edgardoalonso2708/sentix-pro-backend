@@ -2489,7 +2489,11 @@ app.get('/api/optimize/history', (req, res) => {
     bestValue: j.result?.bestValue ?? null,
     bestSharpe: j.result?.bestSharpe ?? null,
     improvement: j.result?.improvement ?? null,
-    duration: j.result?.duration ?? null
+    duration: j.result?.duration ?? null,
+    // Walk-forward validation summary
+    validationEnabled: j.result?.validation?.enabled ?? false,
+    bestOosSharpe: j.result?.validation?.bestOosSharpe ?? null,
+    overfitWarning: j.result?.validation?.overfitWarning ?? false
   }));
   res.json(summary);
 });

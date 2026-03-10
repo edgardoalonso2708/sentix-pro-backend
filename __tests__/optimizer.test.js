@@ -4,6 +4,9 @@ const {
   getJobStatus,
   getAllJobs,
   cleanupJobs,
+  splitCandlesByTimestamp,
+  computeValidationSplit,
+  computeOverfitMetrics,
   PARAM_RANGES
 } = require('../optimizer');
 const { DEFAULT_STRATEGY_CONFIG } = require('../strategyConfig');
@@ -207,5 +210,230 @@ describe('PARAM_RANGES export from optimizer', () => {
     for (const key of Object.keys(PARAM_RANGES)) {
       expect(DEFAULT_STRATEGY_CONFIG).toHaveProperty(key);
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Walk-Forward Validation: splitCandlesByTimestamp Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('splitCandlesByTimestamp', () => {
+  const HOUR_MS = 3600000;
+  const BASE_TS = 1700000000000;
+
+  const makeCandles = (count, intervalMs, startTs = BASE_TS) =>
+    Array.from({ length: count }, (_, i) => ({
+      timestamp: startTs + i * intervalMs,
+      open: 100, high: 101, low: 99, close: 100, volume: 1000
+    }));
+
+  test('splits candles correctly at given timestamp', () => {
+    const candles = {
+      '1h': makeCandles(100, HOUR_MS),
+      '4h': makeCandles(25, HOUR_MS * 4),
+      '15m': makeCandles(400, HOUR_MS / 4)
+    };
+    const splitTs = BASE_TS + 70 * HOUR_MS; // ~70% through 1h candles
+
+    const { train, test, splitInfo } = splitCandlesByTimestamp(candles, splitTs);
+
+    // Train should contain candles up to and including splitTs
+    expect(train['1h'].length).toBe(71); // indices 0..70 inclusive
+    expect(train['1h'].every(c => c.timestamp <= splitTs)).toBe(true);
+    expect(train['1h'][train['1h'].length - 1].timestamp).toBe(splitTs);
+
+    // Test should contain ALL candles (for warm-up)
+    expect(test['1h'].length).toBe(100);
+    expect(test['1h']).toBe(candles['1h']); // same reference
+
+    // 4h timeframe should also be split
+    expect(train['4h'].length).toBeGreaterThan(0);
+    expect(train['4h'].every(c => c.timestamp <= splitTs)).toBe(true);
+
+    // splitInfo should have accurate counts
+    expect(splitInfo['1h'].total).toBe(100);
+    expect(splitInfo['1h'].trainCount).toBe(71);
+    expect(splitInfo['4h'].total).toBe(25);
+  });
+
+  test('handles splitTs before first candle — train is empty', () => {
+    const candles = {
+      '1h': makeCandles(10, HOUR_MS),
+      '4h': makeCandles(3, HOUR_MS * 4),
+      '15m': makeCandles(40, HOUR_MS / 4)
+    };
+    const { train, splitInfo } = splitCandlesByTimestamp(candles, BASE_TS - 1);
+
+    expect(train['1h'].length).toBe(0);
+    expect(train['4h'].length).toBe(0);
+    expect(train['15m'].length).toBe(0);
+    expect(splitInfo['1h'].trainCount).toBe(0);
+  });
+
+  test('handles splitTs after last candle — all candles in train', () => {
+    const candles = {
+      '1h': makeCandles(10, HOUR_MS),
+      '4h': makeCandles(3, HOUR_MS * 4),
+      '15m': makeCandles(40, HOUR_MS / 4)
+    };
+    const lastTs = BASE_TS + 9 * HOUR_MS;
+    const { train, splitInfo } = splitCandlesByTimestamp(candles, lastTs + 999999);
+
+    expect(train['1h'].length).toBe(10);
+    expect(train['4h'].length).toBe(3);
+    expect(splitInfo['1h'].trainCount).toBe(10);
+  });
+
+  test('handles empty timeframe arrays gracefully', () => {
+    const candles = { '1h': [], '4h': [], '15m': [] };
+    const { train, test, splitInfo } = splitCandlesByTimestamp(candles, BASE_TS);
+
+    expect(train['1h'].length).toBe(0);
+    expect(test['1h'].length).toBe(0);
+    expect(splitInfo['1h'].total).toBe(0);
+    expect(splitInfo['1h'].trainCount).toBe(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Walk-Forward Validation: computeValidationSplit Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('computeValidationSplit', () => {
+  test('disables validation for days < 30', () => {
+    const result = computeValidationSplit(20);
+    expect(result.validationEnabled).toBe(false);
+    expect(result.trainDays).toBe(20);
+    expect(result.testDays).toBe(0);
+    expect(result.reason).toBeDefined();
+  });
+
+  test('enables validation for days >= 30 with 70/30 split', () => {
+    const result = computeValidationSplit(60);
+    expect(result.validationEnabled).toBe(true);
+    expect(result.trainDays).toBe(42); // round(60 * 0.7)
+    expect(result.testDays).toBe(18);  // 60 - 42
+    expect(result.splitTimestamp).toBeDefined();
+    expect(result.trainRatio).toBe(0.7);
+  });
+
+  test('splitTimestamp is approximately testDays before now', () => {
+    const now = Date.now();
+    const result = computeValidationSplit(90);
+    const expectedSplit = now - (result.testDays * 24 * 60 * 60 * 1000);
+    // Allow 2s tolerance for test execution time
+    expect(Math.abs(result.splitTimestamp - expectedSplit)).toBeLessThan(2000);
+  });
+
+  test('respects custom trainRatio', () => {
+    const result = computeValidationSplit(100, 0.8);
+    expect(result.trainDays).toBe(80);
+    expect(result.testDays).toBe(20);
+    expect(result.trainRatio).toBe(0.8);
+  });
+
+  test('disables validation if train period too short', () => {
+    // trainRatio 0.5, 30 days → 15 train days (< 20 minimum)
+    const result = computeValidationSplit(30, 0.5);
+    expect(result.validationEnabled).toBe(false);
+    expect(result.reason).toContain('corto');
+  });
+
+  test('edge case: exactly 30 days with default ratio', () => {
+    const result = computeValidationSplit(30);
+    expect(result.validationEnabled).toBe(true);
+    expect(result.trainDays).toBe(21); // round(30 * 0.7)
+    expect(result.testDays).toBe(9);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Walk-Forward Validation: computeOverfitMetrics Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('computeOverfitMetrics', () => {
+  test('returns warning for high degradation', () => {
+    const results = [
+      { value: 1, inSample: { sharpe: 2.0 }, outOfSample: { sharpe: 0.5 } },
+      { value: 2, inSample: { sharpe: 1.5 }, outOfSample: { sharpe: 0.3 } },
+      { value: 3, inSample: { sharpe: 1.8 }, outOfSample: { sharpe: 0.4 } }
+    ];
+    const metrics = computeOverfitMetrics(results);
+    expect(metrics.overfitWarning).toBe(true);
+    expect(metrics.avgDegradation).toBeGreaterThan(0.5);
+    expect(['high', 'moderate']).toContain(metrics.overfitSeverity);
+  });
+
+  test('returns no warning when OOS matches IS', () => {
+    const results = [
+      { value: 1, inSample: { sharpe: 1.5 }, outOfSample: { sharpe: 1.4 } },
+      { value: 2, inSample: { sharpe: 1.0 }, outOfSample: { sharpe: 0.95 } },
+      { value: 3, inSample: { sharpe: 0.8 }, outOfSample: { sharpe: 0.75 } }
+    ];
+    const metrics = computeOverfitMetrics(results);
+    expect(metrics.overfitWarning).toBe(false);
+    expect(metrics.avgDegradation).toBeLessThan(0.2);
+    expect(metrics.overfitSeverity).toBe('low');
+  });
+
+  test('rank correlation is positive when rankings align', () => {
+    const results = [
+      { value: 1, inSample: { sharpe: 3.0 }, outOfSample: { sharpe: 2.8 } },
+      { value: 2, inSample: { sharpe: 2.0 }, outOfSample: { sharpe: 1.9 } },
+      { value: 3, inSample: { sharpe: 1.0 }, outOfSample: { sharpe: 0.9 } }
+    ];
+    const metrics = computeOverfitMetrics(results);
+    expect(metrics.rankCorrelation).toBeGreaterThan(0.8);
+  });
+
+  test('handles empty results gracefully', () => {
+    const metrics = computeOverfitMetrics([]);
+    expect(metrics.avgDegradation).toBeNull();
+    expect(metrics.rankCorrelation).toBeNull();
+    expect(metrics.overfitWarning).toBe(false);
+  });
+
+  test('ignores results with -999 sharpe (errored backtests)', () => {
+    const results = [
+      { value: 1, inSample: { sharpe: -999 }, outOfSample: { sharpe: 0.5 } },
+      { value: 2, inSample: { sharpe: 1.5 }, outOfSample: { sharpe: 1.3 } }
+    ];
+    const metrics = computeOverfitMetrics(results);
+    // Should only use value=2 (value=1 has IS sharpe < 0)
+    expect(metrics.avgDegradation).toBeDefined();
+    expect(metrics.avgDegradation).not.toBeNull();
+  });
+
+  test('handles zero/negative IS sharpe without NaN', () => {
+    const results = [
+      { value: 1, inSample: { sharpe: 0 }, outOfSample: { sharpe: 0.5 } },
+      { value: 2, inSample: { sharpe: -0.5 }, outOfSample: { sharpe: -0.3 } }
+    ];
+    const metrics = computeOverfitMetrics(results);
+    // Both have IS sharpe <= 0, so valid array is empty
+    expect(metrics.avgDegradation).toBeNull();
+    expect(isNaN(metrics.avgDegradation)).toBe(false);
+  });
+
+  test('ignores results with OOS error', () => {
+    const results = [
+      { value: 1, inSample: { sharpe: 2.0 }, outOfSample: { sharpe: 1.5 } },
+      { value: 2, inSample: { sharpe: 1.5 }, outOfSample: { sharpe: -999, error: 'failed' } }
+    ];
+    const metrics = computeOverfitMetrics(results);
+    // Should only use value=1
+    expect(metrics.avgDegradation).toBeDefined();
+    expect(metrics.rankCorrelation).toBeDefined();
+  });
+
+  test('rank correlation is negative when rankings are inverted', () => {
+    const results = [
+      { value: 1, inSample: { sharpe: 3.0 }, outOfSample: { sharpe: 0.5 } },
+      { value: 2, inSample: { sharpe: 2.0 }, outOfSample: { sharpe: 1.5 } },
+      { value: 3, inSample: { sharpe: 1.0 }, outOfSample: { sharpe: 2.5 } }
+    ];
+    const metrics = computeOverfitMetrics(results);
+    expect(metrics.rankCorrelation).toBeLessThan(0);
+    expect(metrics.overfitWarning).toBe(true); // low rank correlation
   });
 });
