@@ -18,6 +18,23 @@ function safeFloat(value, field = 'unknown') {
   return n;
 }
 
+// Transform raw Binance kline array to internal candle format
+function parseKlines(data) {
+  return data.map(k => ({
+    timestamp: k[0],
+    open: safeFloat(k[1], 'kline.open'),
+    high: safeFloat(k[2], 'kline.high'),
+    low: safeFloat(k[3], 'kline.low'),
+    close: safeFloat(k[4], 'kline.close'),
+    volume: safeFloat(k[5], 'kline.volume'),
+    closeTime: k[6],
+    quoteVolume: safeFloat(k[7], 'kline.quoteVolume'),
+    trades: k[8],
+    takerBuyBaseVolume: safeFloat(k[9], 'kline.takerBuyBaseVolume'),
+    takerBuyQuoteVolume: safeFloat(k[10], 'kline.takerBuyQuoteVolume')
+  }));
+}
+
 // Binance Public API endpoints (in priority order)
 // data-api.binance.vision is geo-unrestricted (primary for cloud deploys)
 // api.binance.com returns 451 in US/restricted regions
@@ -187,20 +204,7 @@ async function fetchKlines(symbol, interval = '1h', limit = 100, startTime = nul
         activeBinanceBase = endpoint;
       }
 
-      // Transform to our internal format (safeFloat prevents NaN propagation)
-      const candles = response.data.map(k => ({
-        timestamp: k[0],               // Open time
-        open: safeFloat(k[1], 'kline.open'),
-        high: safeFloat(k[2], 'kline.high'),
-        low: safeFloat(k[3], 'kline.low'),
-        close: safeFloat(k[4], 'kline.close'),
-        volume: safeFloat(k[5], 'kline.volume'),
-        closeTime: k[6],
-        quoteVolume: safeFloat(k[7], 'kline.quoteVolume'),
-        trades: k[8],
-        takerBuyBaseVolume: safeFloat(k[9], 'kline.takerBuyBaseVolume'),
-        takerBuyQuoteVolume: safeFloat(k[10], 'kline.takerBuyQuoteVolume')
-      }));
+      const candles = parseKlines(response.data);
 
       logger.debug('Binance klines fetched', {
         symbol, interval, endpoint,
@@ -228,15 +232,7 @@ async function fetchKlines(symbol, interval = '1h', limit = 100, startTime = nul
         await new Promise(r => setTimeout(r, 2000));
         try {
           const retryResponse = await binanceClient.get('/api/v3/klines', { params, baseURL: endpoint });
-          const candles = retryResponse.data.map(k => ({
-            timestamp: k[0], open: safeFloat(k[1], 'kline.open'), high: safeFloat(k[2], 'kline.high'),
-            low: safeFloat(k[3], 'kline.low'), close: safeFloat(k[4], 'kline.close'),
-            volume: safeFloat(k[5], 'kline.volume'), closeTime: k[6],
-            quoteVolume: safeFloat(k[7], 'kline.quoteVolume'), trades: k[8],
-            takerBuyBaseVolume: safeFloat(k[9], 'kline.takerBuyBaseVolume'),
-            takerBuyQuoteVolume: safeFloat(k[10], 'kline.takerBuyQuoteVolume')
-          }));
-          return candles;
+          return parseKlines(retryResponse.data);
         } catch (retryErr) {
           logger.warn(`Binance retry also failed on ${endpoint}`);
           lastError = retryErr;
@@ -347,7 +343,12 @@ async function fetchMultiple24hTickers(symbols) {
 
   for (const endpoint of endpointsToTry) {
     try {
-      const response = await binanceClient.get('/api/v3/ticker/24hr', { baseURL: endpoint });
+      // Request only needed symbols (avoids downloading 2000+ tickers)
+      const upperSymbols = symbols.map(s => s.toUpperCase());
+      const params = upperSymbols.length <= 20
+        ? { symbols: JSON.stringify(upperSymbols) }
+        : {}; // Fallback to full list for very large requests
+      const response = await binanceClient.get('/api/v3/ticker/24hr', { baseURL: endpoint, params });
 
       if (endpoint !== activeBinanceBase) {
         logger.info(`Binance endpoint switched: ${activeBinanceBase} → ${endpoint}`);

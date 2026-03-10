@@ -4,10 +4,9 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const { logger } = require('./logger');
+const { SLIPPAGE, COMMISSION } = require('./constants');
 
 // ─── EXECUTION SIMULATION ───────────────────────────────────────────────────
-const SLIPPAGE = 0.001;    // 0.1% spread/slippage per trade
-const COMMISSION = 0.001;  // 0.1% exchange fee per side (Binance default)
 
 function applySlippage(price, isBuy) {
   // BUY: fill higher (worse), SELL: fill lower (worse)
@@ -77,6 +76,11 @@ async function updateCapitalAtomic(supabase, userId, delta) {
     }
   }).catch(err => {
     logger.error('Atomic capital update failed', { userId, delta, error: err.message });
+  }).finally(() => {
+    // Clean up queue entry once the chain resolves (prevents memory leak)
+    if (capitalUpdateQueue.get(userId) === next) {
+      capitalUpdateQueue.delete(userId);
+    }
   });
   capitalUpdateQueue.set(userId, next);
   return next;

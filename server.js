@@ -93,6 +93,19 @@ app.use(express.json({ limit: '1mb' }));
 // Rate limiting — MUST be registered BEFORE route definitions
 app.use('/api/', createRateLimiter(60000, 100));
 
+// Request logging middleware (skip SSE stream to avoid noise)
+app.use((req, res, next) => {
+  if (req.path === '/api/stream') return next();
+  const start = Date.now();
+  res.on('finish', () => {
+    const duration = Date.now() - start;
+    if (duration > 1000 || res.statusCode >= 400) {
+      logger.info('HTTP request', { method: req.method, path: req.path, status: res.statusCode, durationMs: duration });
+    }
+  });
+  next();
+});
+
 // ─── CONFIGURATION ─────────────────────────────────────────────────────────
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
@@ -203,6 +216,15 @@ let lastSuccessfulCrypto = {}; // Preserve last known good crypto data
 
 // ─── SSE (Server-Sent Events) CLIENTS ──────────────────────────────────────
 const sseClients = new Set();
+const MAX_SSE_CLIENTS = 100;
+
+// ─── CRON OVERLAP GUARDS ─────────────────────────────────────────────────────
+let isUpdatingMarketData = false;
+let isProcessingAlerts = false;
+
+// ─── SERVER REFERENCE (for graceful shutdown) ────────────────────────────────
+let httpServer = null;
+const cronTasks = [];
 
 // ─── CRYPTO ASSETS TO TRACK ───────────────────────────────────────────────
 const CRYPTO_ASSETS = {
@@ -1078,6 +1100,51 @@ app.get('/', (req, res) => {
   });
 });
 
+// Deep health check — probes actual service connectivity
+app.get('/api/health', async (req, res) => {
+  const checks = {};
+  let healthy = true;
+
+  // 1. Supabase connectivity
+  try {
+    const start = Date.now();
+    const { error } = await Promise.race([
+      supabase.from('paper_config').select('user_id').limit(1),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+    ]);
+    checks.database = { status: error ? 'degraded' : 'ok', latencyMs: Date.now() - start };
+    if (error) healthy = false;
+  } catch (err) {
+    checks.database = { status: 'down', error: err.message };
+    healthy = false;
+  }
+
+  // 2. Market data freshness
+  const lastUpdate = cachedMarketData?.lastUpdate;
+  const staleThresholdMs = 5 * 60 * 1000; // 5 minutes
+  if (lastUpdate) {
+    const ageMs = Date.now() - new Date(lastUpdate).getTime();
+    checks.marketData = { status: ageMs < staleThresholdMs ? 'ok' : 'stale', ageSeconds: Math.round(ageMs / 1000) };
+    if (ageMs >= staleThresholdMs) healthy = false;
+  } else {
+    checks.marketData = { status: 'unavailable' };
+    healthy = false;
+  }
+
+  // 3. SSE clients
+  checks.sse = { clients: sseClients.size, maxClients: MAX_SSE_CLIENTS };
+
+  // 4. Services
+  checks.telegram = bot.isActive() ? 'active' : 'disabled';
+  checks.email = resend ? 'active' : 'disabled';
+
+  res.status(healthy ? 200 : 503).json({
+    status: healthy ? 'healthy' : 'degraded',
+    uptime: Math.round(process.uptime()),
+    checks
+  });
+});
+
 app.get('/api/market', (req, res) => {
   if (!cachedMarketData) {
     return res.status(503).json({ error: 'Market data not yet available' });
@@ -1107,6 +1174,11 @@ app.get('/api/signals', async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 app.get('/api/stream', (req, res) => {
+  // Reject if too many SSE clients
+  if (sseClients.size >= MAX_SSE_CLIENTS) {
+    return res.status(503).json({ error: 'Too many SSE clients connected' });
+  }
+
   // Set headers for SSE
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -1996,8 +2068,8 @@ app.get('/api/paper/history/:userId', async (req, res) => {
     const options = {
       status: req.query.status || undefined,
       asset: req.query.asset || undefined,
-      limit: parseInt(req.query.limit) || 50,
-      offset: parseInt(req.query.offset) || 0
+      limit: Math.min(Math.max(parseInt(req.query.limit) || 50, 1), 200),
+      offset: Math.max(parseInt(req.query.offset) || 0, 0)
     };
     const { trades, total, error } = await getTradeHistory(supabase, userId, options);
     if (error) return res.status(500).json({ error: error.message || 'Failed to get history' });
@@ -2522,13 +2594,31 @@ if (bot.isActive()) {
 // CRON JOBS
 // ═══════════════════════════════════════════════════════════════════════════════
 
-cron.schedule('*/1 * * * *', async () => {
-  await updateMarketData();
-});
+cronTasks.push(cron.schedule('*/1 * * * *', async () => {
+  if (isUpdatingMarketData) {
+    logger.debug('Skipping updateMarketData — previous cycle still running');
+    return;
+  }
+  isUpdatingMarketData = true;
+  try {
+    await updateMarketData();
+  } finally {
+    isUpdatingMarketData = false;
+  }
+}));
 
-cron.schedule('*/5 * * * *', async () => {
-  await processAlerts();
-});
+cronTasks.push(cron.schedule('*/5 * * * *', async () => {
+  if (isProcessingAlerts) {
+    logger.debug('Skipping processAlerts — previous cycle still running');
+    return;
+  }
+  isProcessingAlerts = true;
+  try {
+    await processAlerts();
+  } finally {
+    isProcessingAlerts = false;
+  }
+}));
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SERVER STARTUP
@@ -2541,7 +2631,7 @@ validateEnvironment();
 
 // Export app for testing, only listen when run directly
 if (require.main === module) {
-  app.listen(PORT, async () => {
+  httpServer = app.listen(PORT, async () => {
     logger.info('SENTIX PRO Backend v3.0 started', {
       port: PORT,
       env: process.env.NODE_ENV || 'development',
@@ -2632,14 +2722,52 @@ async function removeTelegramSubscriber(chatId) {
 
 module.exports = app;
 
-process.on('SIGTERM', () => {
-  logger.info('SIGTERM received, shutting down gracefully');
+// ─── GRACEFUL SHUTDOWN ───────────────────────────────────────────────────────
+function gracefulShutdown(signal) {
+  logger.info(`${signal} received, shutting down gracefully`);
+
+  // 1. Stop cron jobs
+  for (const task of cronTasks) {
+    try { task.stop(); } catch (_) {}
+  }
+
+  // 2. Close SSE clients
+  for (const client of sseClients) {
+    try {
+      client.res.write('data: {"type":"shutdown"}\n\n');
+      client.res.end();
+    } catch (_) {}
+  }
+  sseClients.clear();
+
+  // 3. Stop Telegram bot
   bot.stop();
-  process.exit(0);
+
+  // 4. Close HTTP server (stop accepting new connections, drain in-flight)
+  if (httpServer) {
+    httpServer.close(() => {
+      logger.info('HTTP server closed');
+      process.exit(0);
+    });
+    // Force exit after 10s if draining takes too long
+    setTimeout(() => {
+      logger.warn('Forced shutdown after timeout');
+      process.exit(1);
+    }, 10000);
+  } else {
+    process.exit(0);
+  }
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// ─── UNHANDLED ERROR HANDLERS ────────────────────────────────────────────────
+process.on('unhandledRejection', (reason) => {
+  logger.error('Unhandled promise rejection', { reason: reason?.message || String(reason) });
 });
 
-process.on('SIGINT', () => {
-  logger.info('SIGINT received, shutting down gracefully');
-  bot.stop();
-  process.exit(0);
+process.on('uncaughtException', (err) => {
+  logger.error('Uncaught exception — shutting down', { error: err.message, stack: err.stack });
+  process.exit(1);
 });

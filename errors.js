@@ -10,8 +10,9 @@ const ErrorType = Object.freeze({
   RATE_LIMIT: 'RATE_LIMIT',         // 429 Too Many Requests
   TIMEOUT: 'TIMEOUT',               // Request timed out (ECONNABORTED, ETIMEDOUT)
   SERVER_ERROR: 'SERVER_ERROR',      // 5xx responses
-  CLIENT_ERROR: 'CLIENT_ERROR',      // 4xx (non-429)
+  CLIENT_ERROR: 'CLIENT_ERROR',      // 4xx (non-429, non-451)
   NETWORK_ERROR: 'NETWORK_ERROR',    // DNS, connection refused, reset
+  GEO_BLOCK: 'GEO_BLOCK',           // 451 geo-restricted (retryable with different endpoint)
   INVALID_RESPONSE: 'INVALID_RESPONSE', // Unexpected payload shape
   AUTH_ERROR: 'AUTH_ERROR',          // 401/403
   UNKNOWN: 'UNKNOWN'
@@ -50,7 +51,7 @@ class ProviderError extends Error {
   }
 
   toJSON() {
-    return {
+    const json = {
       name: this.name,
       provider: this.provider,
       type: this.type,
@@ -60,6 +61,11 @@ class ProviderError extends Error {
       retryable: this.retryable,
       timestamp: this.timestamp
     };
+    // Include stack trace in development for debugging
+    if (process.env.NODE_ENV === 'development') {
+      json.stack = this.stack;
+    }
+    return json;
   }
 }
 
@@ -72,6 +78,7 @@ function isRetryable(type) {
     case ErrorType.TIMEOUT:
     case ErrorType.SERVER_ERROR:
     case ErrorType.NETWORK_ERROR:
+    case ErrorType.GEO_BLOCK:
       return true;
     case ErrorType.CLIENT_ERROR:
     case ErrorType.AUTH_ERROR:
@@ -92,9 +99,10 @@ function isRetryable(type) {
 function classifyAxiosError(error, provider, endpoint) {
   const status = error.response?.status;
   const code = error.code; // ECONNABORTED, ETIMEDOUT, ECONNREFUSED, etc.
+  const message = error?.message || 'Unknown error';
 
   // Timeout
-  if (code === 'ECONNABORTED' || code === 'ETIMEDOUT' || error.message?.includes('timeout')) {
+  if (code === 'ECONNABORTED' || code === 'ETIMEDOUT' || message.includes('timeout')) {
     return new ProviderError(provider, ErrorType.TIMEOUT, `Request timed out: ${error.message}`, {
       statusCode: null, endpoint, retryable: true
     });
@@ -104,6 +112,13 @@ function classifyAxiosError(error, provider, endpoint) {
   if (!error.response && (code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'ERR_NETWORK' || code === 'ECONNRESET')) {
     return new ProviderError(provider, ErrorType.NETWORK_ERROR, `Network error: ${error.message}`, {
       statusCode: null, endpoint, retryable: true
+    });
+  }
+
+  // Geo-block (451 Unavailable For Legal Reasons)
+  if (status === 451) {
+    return new ProviderError(provider, ErrorType.GEO_BLOCK, `Geo-blocked (451)`, {
+      statusCode: 451, endpoint, retryable: true
     });
   }
 
@@ -136,7 +151,7 @@ function classifyAxiosError(error, provider, endpoint) {
   }
 
   // Unknown
-  return new ProviderError(provider, ErrorType.UNKNOWN, error.message || 'Unknown error', {
+  return new ProviderError(provider, ErrorType.UNKNOWN, message, {
     endpoint, retryable: false
   });
 }

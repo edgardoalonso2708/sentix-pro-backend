@@ -85,7 +85,7 @@ async function runOptimization(options) {
   });
 
   // ─── 2. Run backtest for each parameter value ─────────────────────────
-  const results = [];
+  let results = [];
   const baseStrategyConfig = mergeConfig(baseConfig);
 
   for (let i = 0; i < testValues.length; i++) {

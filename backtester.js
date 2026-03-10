@@ -8,6 +8,7 @@ const axios = require('axios');
 const { fetchKlines, SYMBOL_MAP, FUTURES_SYMBOL_MAP } = require('./binanceAPI');
 const { generateMultiTimeframeSignal } = require('./technicalAnalysis');
 const { evaluateSignalForTrade, calculatePositionSize, DEFAULT_CONFIG } = require('./paperTrading');
+const { SLIPPAGE, COMMISSION, TOTAL_COST } = require('./constants');
 
 // ─── CONSTANTS ──────────────────────────────────────────────────────────────
 
@@ -17,10 +18,6 @@ const INTERVAL_MS = {
   '4h': 4 * 60 * 60 * 1000,
   '1d': 24 * 60 * 60 * 1000
 };
-
-const SLIPPAGE = 0.001;    // 0.1% spread/slippage
-const COMMISSION = 0.001;  // 0.1% exchange fee per side (Binance default)
-const TOTAL_COST = SLIPPAGE + COMMISSION; // Combined per-side execution cost
 
 // Minimum candles needed for indicator calculation
 const MIN_LOOKBACK = {
@@ -121,11 +118,15 @@ async function fetchHistoricalCandles(asset, interval, days) {
   // Sort by timestamp
   allCandles.sort((a, b) => a.timestamp - b.timestamp);
 
-  logger.info('Historical candles fetched', {
-    asset, interval, candles: allCandles.length,
-    from: new Date(allCandles[0]?.timestamp).toISOString(),
-    to: new Date(allCandles[allCandles.length - 1]?.timestamp).toISOString()
-  });
+  if (allCandles.length > 0) {
+    logger.info('Historical candles fetched', {
+      asset, interval, candles: allCandles.length,
+      from: new Date(allCandles[0].timestamp).toISOString(),
+      to: new Date(allCandles[allCandles.length - 1].timestamp).toISOString()
+    });
+  } else {
+    logger.warn('No historical candles returned', { asset, interval });
+  }
 
   return allCandles;
 }

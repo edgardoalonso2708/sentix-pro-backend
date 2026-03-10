@@ -103,6 +103,9 @@ const DEFAULT_STRATEGY_CONFIG = {
   buyMinConf: 45,
 };
 
+// Freeze to prevent accidental mutation by any module
+Object.freeze(DEFAULT_STRATEGY_CONFIG);
+
 /**
  * Optimizable parameter ranges for grid search.
  * Each entry: { min, max, step, label, description }
@@ -194,7 +197,14 @@ const PARAM_RANGES = {
  * Merge user config with defaults (user values override defaults)
  */
 function mergeConfig(userConfig = {}) {
-  return { ...DEFAULT_STRATEGY_CONFIG, ...userConfig };
+  const config = userConfig || {};
+  // Warn about unknown keys (likely typos)
+  for (const key of Object.keys(config)) {
+    if (!(key in DEFAULT_STRATEGY_CONFIG)) {
+      console.warn(`[strategyConfig] Unknown config key: "${key}" — possible typo`);
+    }
+  }
+  return { ...DEFAULT_STRATEGY_CONFIG, ...config };
 }
 
 module.exports = {

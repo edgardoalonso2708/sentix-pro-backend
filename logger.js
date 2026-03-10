@@ -31,11 +31,16 @@ function isSecretKey(key) {
 function sanitizeData(data) {
   if (!data || typeof data !== 'object') return data;
 
+  // Handle arrays recursively
+  if (Array.isArray(data)) {
+    return data.map(item => (typeof item === 'object' && item !== null) ? sanitizeData(item) : item);
+  }
+
   const sanitized = {};
   for (const [key, value] of Object.entries(data)) {
     if (isSecretKey(key) && typeof value === 'string') {
       sanitized[key] = maskValue(value);
-    } else if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+    } else if (typeof value === 'object' && value !== null) {
       sanitized[key] = sanitizeData(value);
     } else {
       sanitized[key] = value;
@@ -45,7 +50,7 @@ function sanitizeData(data) {
 }
 
 /**
- * Logger levels
+ * Logger levels with numeric hierarchy for filtering
  */
 const Level = Object.freeze({
   DEBUG: 'debug',
@@ -54,6 +59,18 @@ const Level = Object.freeze({
   ERROR: 'error'
 });
 
+const LEVEL_PRIORITY = { debug: 0, info: 1, warn: 2, error: 3 };
+
+/**
+ * Get the current minimum log level from environment
+ * LOG_LEVEL env: 'debug' | 'info' | 'warn' | 'error' (default: 'debug' in dev, 'info' in prod)
+ */
+function getMinLevel() {
+  const envLevel = (process.env.LOG_LEVEL || '').toLowerCase();
+  if (envLevel in LEVEL_PRIORITY) return LEVEL_PRIORITY[envLevel];
+  return process.env.NODE_ENV === 'development' ? LEVEL_PRIORITY.debug : LEVEL_PRIORITY.info;
+}
+
 /**
  * Create a structured log entry and output it
  * @param {string} level - Log level
@@ -61,6 +78,9 @@ const Level = Object.freeze({
  * @param {Object} [data] - Additional structured data
  */
 function log(level, message, data) {
+  // Level filtering: skip if below minimum
+  if ((LEVEL_PRIORITY[level] ?? 0) < getMinLevel()) return;
+
   const entry = {
     ts: new Date().toISOString(),
     level,
@@ -79,11 +99,6 @@ function log(level, message, data) {
       break;
     case Level.WARN:
       console.warn(JSON.stringify(entry));
-      break;
-    case Level.DEBUG:
-      if (process.env.NODE_ENV === 'development' || process.env.LOG_LEVEL === 'debug') {
-        console.log(JSON.stringify(entry));
-      }
       break;
     default:
       console.log(JSON.stringify(entry));
