@@ -2128,6 +2128,77 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
+ * Calculate dynamic timeframe weights based on 4h ADX (market regime).
+ * Trending markets → 4h dominates; Ranging markets → 15m dominates.
+ * Interpolates linearly between trending and ranging weight sets.
+ * @param {number} adx4h - ADX value from the 4h timeframe
+ * @param {Object} cfg - Strategy config with dynamic weight keys
+ * @returns {Object} { tf4h, tf1h, tf15m, regime, adx4h, interpolationFactor }
+ */
+function calculateDynamicTFWeights(adx4h, cfg = {}) {
+  // Fallback to static weights if disabled or invalid
+  if (!cfg.dynamicTFWeightsEnabled) {
+    return {
+      tf4h: cfg.tf4hWeight || 0.40,
+      tf1h: cfg.tf1hWeight || 0.40,
+      tf15m: cfg.tf15mWeight || 0.20,
+      regime: 'static',
+      adx4h: adx4h || 0,
+      interpolationFactor: -1
+    };
+  }
+
+  const adx = typeof adx4h === 'number' && !isNaN(adx4h) ? adx4h : 0;
+  const lo = cfg.adxModerateThreshold || 20;
+  const hi = cfg.adxStrongThreshold || 30;
+
+  // Interpolation factor: 0 = ranging, 1 = trending
+  let t = 0;
+  if (hi > lo) {
+    t = Math.max(0, Math.min(1, (adx - lo) / (hi - lo)));
+  }
+
+  // Trending weights (high ADX → 4h dominates)
+  const t4h = cfg.tfTrending4hWeight || 0.55;
+  const t1h = cfg.tfTrending1hWeight || 0.30;
+  const t15m = cfg.tfTrending15mWeight || 0.15;
+
+  // Ranging weights (low ADX → 15m dominates)
+  const r4h = cfg.tfRanging4hWeight || 0.25;
+  const r1h = cfg.tfRanging1hWeight || 0.35;
+  const r15m = cfg.tfRanging15mWeight || 0.40;
+
+  // Linear interpolation
+  let w4h = r4h + t * (t4h - r4h);
+  let w1h = r1h + t * (t1h - r1h);
+  let w15m = r15m + t * (t15m - r15m);
+
+  // Normalize to sum = 1.0
+  const sum = w4h + w1h + w15m;
+  if (sum > 0) {
+    w4h /= sum;
+    w1h /= sum;
+    w15m /= sum;
+  } else {
+    w4h = 0.40; w1h = 0.40; w15m = 0.20;
+  }
+
+  // Regime label
+  let regime = 'mixed';
+  if (t >= 0.8) regime = 'trending';
+  else if (t <= 0.2) regime = 'ranging';
+
+  return {
+    tf4h: +w4h.toFixed(4),
+    tf1h: +w1h.toFixed(4),
+    tf15m: +w15m.toFixed(4),
+    regime,
+    adx4h: adx,
+    interpolationFactor: +t.toFixed(4)
+  };
+}
+
+/**
  * Generate a multi-timeframe confluent signal.
  * Runs analysis on 4h, 1h, and 15m candles, then merges with weighted scoring.
  * 4h = macro trend (40%), 1h = signal (40%), 15m = entry timing (20%)
@@ -2179,10 +2250,17 @@ async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volu
   else if (bullishCount >= 1 && bearishCount >= 1) confluence = 'conflicting';
   else confluence = 'weak';
 
-  // Weighted merge: configurable timeframe weights
-  let mergedRawScore = (signal4h.rawScore * cfg.tf4hWeight) +
-                       (signal1h.rawScore * cfg.tf1hWeight) +
-                       (signal15m.rawScore * cfg.tf15mWeight);
+  // Dynamic TF weights based on 4h ADX (market regime)
+  const adx4h = parseFloat(signal4h.indicators?.adx) || 0;
+  const dynamicWeights = calculateDynamicTFWeights(adx4h, cfg);
+  const w4h = dynamicWeights.tf4h;
+  const w1h = dynamicWeights.tf1h;
+  const w15m = dynamicWeights.tf15m;
+
+  // Weighted merge: dynamic timeframe weights
+  let mergedRawScore = (signal4h.rawScore * w4h) +
+                       (signal1h.rawScore * w1h) +
+                       (signal15m.rawScore * w15m);
 
   // Confluence adjustments
   let confidenceBonus = 0;
@@ -2216,9 +2294,9 @@ async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volu
 
   mergedRawScore = Math.max(-100, Math.min(100, Math.round(mergedRawScore)));
 
-  let mergedConfidence = (signal4h.confidence * cfg.tf4hWeight) +
-                         (signal1h.confidence * cfg.tf1hWeight) +
-                         (signal15m.confidence * cfg.tf15mWeight) +
+  let mergedConfidence = (signal4h.confidence * w4h) +
+                         (signal1h.confidence * w1h) +
+                         (signal15m.confidence * w15m) +
                          confidenceBonus;
   mergedConfidence = Math.max(0, Math.min(cfg.confidenceCap, Math.round(mergedConfidence)));
 
@@ -2313,7 +2391,8 @@ async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volu
         confidence: signal15m.confidence,
         action: signal15m.action
       },
-      confluence
+      confluence,
+      dynamicWeights
     }
   };
 }
@@ -2339,6 +2418,7 @@ module.exports = {
   calculateVWAP,
   calculateFibonacciRetracement,
   analyzeMarketStructure,
+  calculateDynamicTFWeights,
   calculateTradeLevels,
   scoreDerivatives,
   scoreBtcDominance,

@@ -110,6 +110,15 @@ const DEFAULT_STRATEGY_CONFIG = {
   conflictingMult: 0.70,       // Score multiplier when TFs conflict
   governorMult: 0.50,          // 4H disagrees with merged signal
 
+  // ─── Dynamic TF Weights (ADX-based) ──────────────────────────────
+  dynamicTFWeightsEnabled: 1,       // 1 = enabled, 0 = use static weights
+  tfTrending4hWeight: 0.55,         // 4h weight when ADX is strong (trending)
+  tfTrending1hWeight: 0.30,         // 1h weight when trending
+  tfTrending15mWeight: 0.15,        // 15m weight when trending
+  tfRanging4hWeight: 0.25,          // 4h weight when ADX is low (ranging)
+  tfRanging1hWeight: 0.35,          // 1h weight when ranging
+  tfRanging15mWeight: 0.40,         // 15m weight when ranging
+
   // ─── Position Sizing ────────────────────────────────────────────
   riskPerTrade: 0.02,       // 2% of capital per trade
   maxPositionPct: 0.30,     // Max 30% of capital in single position
@@ -246,6 +255,21 @@ const PARAM_RANGES = {
     min: 6, max: 18, step: 6,
     label: 'Market Structure Weight',
     description: 'Score contribution from HH/HL/LH/LL pattern detection'
+  },
+  dynamicTFWeightsEnabled: {
+    min: 0, max: 1, step: 1,
+    label: 'Dynamic TF Weights',
+    description: 'Enable (1) or disable (0) ADX-based dynamic timeframe weights'
+  },
+  tfTrending4hWeight: {
+    min: 0.40, max: 0.65, step: 0.05,
+    label: '4h Weight (Trending)',
+    description: '4h timeframe weight when market is strongly trending (high ADX)'
+  },
+  tfRanging15mWeight: {
+    min: 0.25, max: 0.50, step: 0.05,
+    label: '15m Weight (Ranging)',
+    description: '15m timeframe weight when market is ranging (low ADX)'
   },
 };
 

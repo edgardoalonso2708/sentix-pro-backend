@@ -13,6 +13,7 @@ const {
   calculateVWAP,
   calculateFibonacciRetracement,
   analyzeMarketStructure,
+  calculateDynamicTFWeights,
   scoreDerivatives,
   scoreBtcDominance,
   scoreDxyMacro,
@@ -1504,5 +1505,126 @@ describe('analyzeMarketStructure', () => {
     const result = analyzeMarketStructure(candles);
     // Flat data = no real swings, or very few
     expect(['insufficient_data', 'ranging', 'neutral']).toContain(result.signal);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// calculateDynamicTFWeights Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('calculateDynamicTFWeights', () => {
+  const defaultCfg = {
+    dynamicTFWeightsEnabled: 1,
+    tf4hWeight: 0.40, tf1hWeight: 0.40, tf15mWeight: 0.20,
+    adxModerateThreshold: 20, adxStrongThreshold: 30,
+    tfTrending4hWeight: 0.55, tfTrending1hWeight: 0.30, tfTrending15mWeight: 0.15,
+    tfRanging4hWeight: 0.25, tfRanging1hWeight: 0.35, tfRanging15mWeight: 0.40
+  };
+
+  test('ADX=0 (extreme ranging) → ranging weights', () => {
+    const result = calculateDynamicTFWeights(0, defaultCfg);
+    expect(result.tf4h).toBeCloseTo(0.25, 2);
+    expect(result.tf15m).toBeCloseTo(0.40, 2);
+    expect(result.regime).toBe('ranging');
+  });
+
+  test('ADX=20 (boundary) → ranging weights', () => {
+    const result = calculateDynamicTFWeights(20, defaultCfg);
+    expect(result.tf4h).toBeCloseTo(0.25, 2);
+    expect(result.tf15m).toBeCloseTo(0.40, 2);
+    expect(result.interpolationFactor).toBeCloseTo(0, 2);
+  });
+
+  test('ADX=30 (boundary trending) → trending weights', () => {
+    const result = calculateDynamicTFWeights(30, defaultCfg);
+    expect(result.tf4h).toBeCloseTo(0.55, 2);
+    expect(result.tf15m).toBeCloseTo(0.15, 2);
+    expect(result.interpolationFactor).toBeCloseTo(1, 2);
+  });
+
+  test('ADX=50 (extreme trending) → clamped at trending', () => {
+    const result = calculateDynamicTFWeights(50, defaultCfg);
+    expect(result.tf4h).toBeCloseTo(0.55, 2);
+    expect(result.tf15m).toBeCloseTo(0.15, 2);
+    expect(result.regime).toBe('trending');
+  });
+
+  test('ADX=25 (midpoint) → 50% interpolation', () => {
+    const result = calculateDynamicTFWeights(25, defaultCfg);
+    // Midpoint between 0.25 and 0.55 = 0.40
+    expect(result.tf4h).toBeCloseTo(0.40, 2);
+    expect(result.interpolationFactor).toBeCloseTo(0.5, 2);
+    expect(result.regime).toBe('mixed');
+  });
+
+  test('weights always sum to 1.0', () => {
+    for (const adx of [0, 5, 15, 20, 22, 25, 28, 30, 35, 50, 100]) {
+      const result = calculateDynamicTFWeights(adx, defaultCfg);
+      const sum = result.tf4h + result.tf1h + result.tf15m;
+      expect(sum).toBeCloseTo(1.0, 4);
+    }
+  });
+
+  test('dynamicTFWeightsEnabled=0 → static weights', () => {
+    const cfg = { ...defaultCfg, dynamicTFWeightsEnabled: 0 };
+    const result = calculateDynamicTFWeights(50, cfg);
+    expect(result.tf4h).toBe(0.40);
+    expect(result.tf1h).toBe(0.40);
+    expect(result.tf15m).toBe(0.20);
+    expect(result.regime).toBe('static');
+    expect(result.interpolationFactor).toBe(-1);
+  });
+
+  test('regime labels are correct', () => {
+    expect(calculateDynamicTFWeights(10, defaultCfg).regime).toBe('ranging');
+    expect(calculateDynamicTFWeights(25, defaultCfg).regime).toBe('mixed');
+    expect(calculateDynamicTFWeights(40, defaultCfg).regime).toBe('trending');
+  });
+
+  test('interpolationFactor between 0 and 1', () => {
+    for (const adx of [0, 10, 20, 25, 30, 40, 100]) {
+      const result = calculateDynamicTFWeights(adx, defaultCfg);
+      expect(result.interpolationFactor).toBeGreaterThanOrEqual(0);
+      expect(result.interpolationFactor).toBeLessThanOrEqual(1);
+    }
+  });
+
+  test('NaN ADX → fallback to ranging weights', () => {
+    const result = calculateDynamicTFWeights(NaN, defaultCfg);
+    expect(result.tf4h).toBeCloseTo(0.25, 2);
+    expect(result.regime).toBe('ranging');
+  });
+
+  test('null ADX → fallback to ranging weights', () => {
+    const result = calculateDynamicTFWeights(null, defaultCfg);
+    expect(result.tf4h).toBeCloseTo(0.25, 2);
+  });
+
+  test('custom config overrides', () => {
+    const cfg = { ...defaultCfg, tfTrending4hWeight: 0.70, tfRanging15mWeight: 0.50 };
+    const result = calculateDynamicTFWeights(30, cfg);
+    // Trending: 0.70, 0.30, 0.15 → normalized
+    const sum = 0.70 + 0.30 + 0.15;
+    expect(result.tf4h).toBeCloseTo(0.70 / sum, 2);
+  });
+
+  test('adx4h field is returned in result', () => {
+    const result = calculateDynamicTFWeights(28.5, defaultCfg);
+    expect(result.adx4h).toBe(28.5);
+  });
+
+  test('all weights are positive', () => {
+    for (const adx of [0, 15, 25, 50]) {
+      const result = calculateDynamicTFWeights(adx, defaultCfg);
+      expect(result.tf4h).toBeGreaterThan(0);
+      expect(result.tf1h).toBeGreaterThan(0);
+      expect(result.tf15m).toBeGreaterThan(0);
+    }
+  });
+
+  test('empty cfg uses defaults gracefully', () => {
+    const result = calculateDynamicTFWeights(25, {});
+    // Should not throw; returns static since dynamicTFWeightsEnabled is falsy
+    expect(result.regime).toBe('static');
   });
 });

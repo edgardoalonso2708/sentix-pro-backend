@@ -118,6 +118,9 @@ describe('DEFAULT_STRATEGY_CONFIG', () => {
     // Multi-timeframe
     'tf4hWeight', 'tf1hWeight', 'tf15mWeight', 'strongConfluenceMult',
     'moderateConfluenceBonus', 'conflictingMult', 'governorMult',
+    // Dynamic TF weights
+    'dynamicTFWeightsEnabled', 'tfTrending4hWeight', 'tfTrending1hWeight',
+    'tfTrending15mWeight', 'tfRanging4hWeight', 'tfRanging1hWeight', 'tfRanging15mWeight',
     // Position sizing
     'riskPerTrade', 'maxPositionPct', 'maxOpenPositions', 'dailyLossLimit',
     // Macro thresholds
