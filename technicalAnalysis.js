@@ -722,6 +722,400 @@ function detectBBSqueeze(prices, period = 20) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// ICHIMOKU CLOUD
+// Tenkan-sen, Kijun-sen, Senkou Span A/B, Cloud position
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Calculate Ichimoku Cloud components and generate signal
+ * @param {Array} candles - OHLCV data [{high, low, close, ...}]
+ * @param {Object} cfg - Strategy config with ichimoku* keys
+ * @returns {Object} Ichimoku analysis
+ */
+function calculateIchimoku(candles, cfg = {}) {
+  const tenkanPeriod = cfg.ichimokuTenkanPeriod || 9;
+  const kijunPeriod = cfg.ichimokuKijunPeriod || 26;
+  const senkouBPeriod = cfg.ichimokuSenkouBPeriod || 52;
+
+  const insufficient = {
+    tenkan: 0, kijun: 0, senkouA: 0, senkouB: 0,
+    cloudTop: 0, cloudBottom: 0,
+    priceVsCloud: 'unknown', tkCross: 'none',
+    cloudColor: 'neutral', signal: 'insufficient_data'
+  };
+
+  if (!candles || candles.length < senkouBPeriod + 1) return insufficient;
+
+  // Midpoint helper: (highest high + lowest low) / 2 over period
+  const midpoint = (data, end, period) => {
+    const slice = data.slice(Math.max(0, end - period), end);
+    if (slice.length === 0) return 0;
+    let hi = -Infinity, lo = Infinity;
+    for (const c of slice) {
+      if (c.high > hi) hi = c.high;
+      if (c.low < lo) lo = c.low;
+    }
+    return (hi + lo) / 2;
+  };
+
+  const len = candles.length;
+  const tenkan = midpoint(candles, len, tenkanPeriod);
+  const kijun = midpoint(candles, len, kijunPeriod);
+
+  // Previous values for TK cross detection
+  const prevTenkan = midpoint(candles, len - 1, tenkanPeriod);
+  const prevKijun = midpoint(candles, len - 1, kijunPeriod);
+
+  // Senkou A = (tenkan + kijun) / 2 projected 26 bars ahead (use current for scoring)
+  const senkouA = (tenkan + kijun) / 2;
+
+  // Senkou B = midpoint of senkouBPeriod, projected 26 bars ahead
+  const senkouB = midpoint(candles, len, senkouBPeriod);
+
+  const cloudTop = Math.max(senkouA, senkouB);
+  const cloudBottom = Math.min(senkouA, senkouB);
+
+  const currentPrice = candles[len - 1].close;
+
+  // Price vs Cloud
+  let priceVsCloud = 'inside';
+  if (currentPrice > cloudTop) priceVsCloud = 'above';
+  else if (currentPrice < cloudBottom) priceVsCloud = 'below';
+
+  // TK Cross: Tenkan crosses above/below Kijun
+  let tkCross = 'none';
+  if (prevTenkan <= prevKijun && tenkan > kijun) tkCross = 'bullish';
+  else if (prevTenkan >= prevKijun && tenkan < kijun) tkCross = 'bearish';
+
+  // Cloud color: bullish if senkouA > senkouB
+  let cloudColor = 'neutral';
+  if (senkouA > senkouB) cloudColor = 'bullish';
+  else if (senkouA < senkouB) cloudColor = 'bearish';
+
+  // Overall signal
+  let signal = 'neutral';
+  if (priceVsCloud === 'above') signal = 'bullish';
+  else if (priceVsCloud === 'below') signal = 'bearish';
+
+  return {
+    tenkan: +tenkan.toFixed(2),
+    kijun: +kijun.toFixed(2),
+    senkouA: +senkouA.toFixed(2),
+    senkouB: +senkouB.toFixed(2),
+    cloudTop: +cloudTop.toFixed(2),
+    cloudBottom: +cloudBottom.toFixed(2),
+    priceVsCloud,
+    tkCross,
+    cloudColor,
+    signal
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// VWAP (Volume-Weighted Average Price)
+// Session VWAP with standard deviation bands
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Calculate VWAP and standard deviation bands
+ * @param {Array} candles - OHLCV data [{high, low, close, volume, ...}]
+ * @param {number} sessionLength - Number of candles for VWAP session
+ * @returns {Object} VWAP analysis
+ */
+function calculateVWAP(candles, sessionLength = 24) {
+  const insufficient = {
+    vwap: 0, upperBand1: 0, lowerBand1: 0, upperBand2: 0, lowerBand2: 0,
+    priceVsVwap: 'unknown', distancePercent: 0, signal: 'insufficient_data'
+  };
+
+  if (!candles || candles.length < 5) return insufficient;
+
+  const session = candles.slice(-Math.min(sessionLength, candles.length));
+
+  let cumTPV = 0; // cumulative TP * Volume
+  let cumVol = 0; // cumulative Volume
+
+  const tpArray = [];
+
+  for (const c of session) {
+    const tp = (c.high + c.low + c.close) / 3;
+    const vol = c.volume || 0;
+    cumTPV += tp * vol;
+    cumVol += vol;
+    tpArray.push(tp);
+  }
+
+  // Fallback if zero volume
+  if (cumVol === 0) {
+    const avgTP = tpArray.reduce((a, b) => a + b, 0) / tpArray.length;
+    return { ...insufficient, vwap: +avgTP.toFixed(2), signal: 'insufficient_data' };
+  }
+
+  const vwap = cumTPV / cumVol;
+
+  // Standard deviation of TP from VWAP, weighted by volume
+  let cumWeightedVar = 0;
+  let cumVolForVar = 0;
+  for (const c of session) {
+    const tp = (c.high + c.low + c.close) / 3;
+    const vol = c.volume || 0;
+    cumWeightedVar += vol * Math.pow(tp - vwap, 2);
+    cumVolForVar += vol;
+  }
+
+  const stdDev = cumVolForVar > 0 ? Math.sqrt(cumWeightedVar / cumVolForVar) : 0;
+
+  const upperBand1 = vwap + stdDev;
+  const lowerBand1 = vwap - stdDev;
+  const upperBand2 = vwap + 2 * stdDev;
+  const lowerBand2 = vwap - 2 * stdDev;
+
+  const currentPrice = candles[candles.length - 1].close;
+  const distancePercent = vwap > 0 ? ((currentPrice - vwap) / vwap) * 100 : 0;
+
+  // Price position vs VWAP
+  let priceVsVwap = 'at_vwap';
+  if (currentPrice > upperBand2) priceVsVwap = 'above_2sigma';
+  else if (currentPrice > upperBand1) priceVsVwap = 'above';
+  else if (currentPrice < lowerBand2) priceVsVwap = 'below_2sigma';
+  else if (currentPrice < lowerBand1) priceVsVwap = 'below';
+
+  // Signal
+  let signal = 'neutral';
+  if (priceVsVwap === 'above_2sigma') signal = 'overbought';
+  else if (priceVsVwap === 'above') signal = 'bullish';
+  else if (priceVsVwap === 'below') signal = 'bearish';
+  else if (priceVsVwap === 'below_2sigma') signal = 'oversold';
+
+  return {
+    vwap: +vwap.toFixed(2),
+    upperBand1: +upperBand1.toFixed(2),
+    lowerBand1: +lowerBand1.toFixed(2),
+    upperBand2: +upperBand2.toFixed(2),
+    lowerBand2: +lowerBand2.toFixed(2),
+    priceVsVwap,
+    distancePercent: +distancePercent.toFixed(2),
+    signal
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FIBONACCI RETRACEMENT
+// Swing high/low detection + 7 Fibonacci levels
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Calculate Fibonacci retracement levels from recent swing high/low
+ * @param {Array} candles - OHLCV data [{high, low, close, ...}]
+ * @param {number} lookback - Number of candles to find swing high/low
+ * @param {number} currentPrice - Current market price
+ * @returns {Object} Fibonacci analysis
+ */
+function calculateFibonacciRetracement(candles, lookback = 50, currentPrice = 0) {
+  const insufficient = {
+    swingHigh: 0, swingLow: 0, levels: [],
+    trendDirection: 'unknown', nearestLevel: null, nearestRatio: 0,
+    distanceToNearest: Infinity, goldenRatio: false,
+    signal: 'insufficient_data'
+  };
+
+  if (!candles || candles.length < 10) return insufficient;
+
+  const slice = candles.slice(-Math.min(lookback, candles.length));
+  if (currentPrice <= 0) currentPrice = slice[slice.length - 1].close;
+
+  // Find swing high and swing low with their indices
+  let swingHigh = -Infinity, swingLow = Infinity;
+  let swingHighIdx = 0, swingLowIdx = 0;
+  for (let i = 0; i < slice.length; i++) {
+    if (slice[i].high > swingHigh) { swingHigh = slice[i].high; swingHighIdx = i; }
+    if (slice[i].low < swingLow) { swingLow = slice[i].low; swingLowIdx = i; }
+  }
+
+  const range = swingHigh - swingLow;
+  if (range <= 0) return insufficient;
+
+  // Trend direction: if high came after low → uptrend, else downtrend
+  let trendDirection = 'unknown';
+  if (swingHighIdx > swingLowIdx) trendDirection = 'uptrend';
+  else if (swingLowIdx > swingHighIdx) trendDirection = 'downtrend';
+
+  // 7 standard Fibonacci levels
+  const ratios = [
+    { ratio: 0, label: '0%' },
+    { ratio: 0.236, label: '23.6%' },
+    { ratio: 0.382, label: '38.2%' },
+    { ratio: 0.5, label: '50%' },
+    { ratio: 0.618, label: '61.8%' },
+    { ratio: 0.786, label: '78.6%' },
+    { ratio: 1, label: '100%' }
+  ];
+
+  // In uptrend: levels go from high down; in downtrend: levels go from low up
+  const levels = ratios.map(r => ({
+    ratio: r.ratio,
+    price: +(swingHigh - r.ratio * range).toFixed(2),
+    label: r.label
+  }));
+
+  // Find nearest level to current price
+  let nearestLevel = null;
+  let nearestRatio = 0;
+  let distanceToNearest = Infinity;
+  for (const level of levels) {
+    const dist = Math.abs(currentPrice - level.price);
+    if (dist < distanceToNearest) {
+      distanceToNearest = dist;
+      nearestLevel = level;
+      nearestRatio = level.ratio;
+    }
+  }
+
+  const distancePercent = currentPrice > 0 ? (distanceToNearest / currentPrice) * 100 : Infinity;
+  const goldenRatio = nearestRatio === 0.618 || nearestRatio === 0.382;
+
+  // Signal: price near key retracement in uptrend = bullish dip buy
+  let signal = 'neutral';
+  if (distancePercent < 2) {
+    if (trendDirection === 'uptrend' && (nearestRatio === 0.382 || nearestRatio === 0.5 || nearestRatio === 0.618)) {
+      signal = 'bullish_retracement';
+    } else if (trendDirection === 'downtrend' && (nearestRatio === 0.382 || nearestRatio === 0.5 || nearestRatio === 0.618)) {
+      signal = 'bearish_retracement';
+    }
+  }
+
+  return {
+    swingHigh, swingLow, levels,
+    trendDirection,
+    nearestLevel,
+    nearestRatio,
+    distanceToNearest: +distancePercent.toFixed(2),
+    goldenRatio,
+    signal
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MARKET STRUCTURE ANALYSIS
+// HH/HL (bullish) vs LH/LL (bearish), BOS, CHoCH
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Analyze market structure: swing points, HH/HL/LH/LL patterns, BOS, CHoCH
+ * @param {Array} candles - OHLCV data [{high, low, close, ...}]
+ * @param {Object} cfg - Strategy config with marketStructure* keys
+ * @returns {Object} Market structure analysis
+ */
+function analyzeMarketStructure(candles, cfg = {}) {
+  const lookback = cfg.marketStructureLookback || 60;
+  const minSwings = cfg.marketStructureMinSwings || 4;
+
+  const insufficient = {
+    structure: 'unknown', swingPoints: [], pattern: 'unknown',
+    breakOfStructure: { detected: false, direction: null, price: null },
+    changeOfCharacter: { detected: false, direction: null, price: null },
+    signal: 'insufficient_data'
+  };
+
+  if (!candles || candles.length < 20) return insufficient;
+
+  const slice = candles.slice(-Math.min(lookback, candles.length));
+
+  // Detect swing highs and lows (3-bar pivot: higher/lower than neighbors)
+  const swingPoints = [];
+  for (let i = 1; i < slice.length - 1; i++) {
+    if (slice[i].high > slice[i - 1].high && slice[i].high > slice[i + 1].high) {
+      swingPoints.push({ type: 'high', price: slice[i].high, index: i });
+    }
+    if (slice[i].low < slice[i - 1].low && slice[i].low < slice[i + 1].low) {
+      swingPoints.push({ type: 'low', price: slice[i].low, index: i });
+    }
+  }
+
+  if (swingPoints.length < minSwings) return { ...insufficient, swingPoints };
+
+  // Separate swing highs and lows in order
+  const swingHighs = swingPoints.filter(p => p.type === 'high');
+  const swingLows = swingPoints.filter(p => p.type === 'low');
+
+  if (swingHighs.length < 2 || swingLows.length < 2) return { ...insufficient, swingPoints };
+
+  // Classify recent swing relationships
+  const lastHighs = swingHighs.slice(-3);
+  const lastLows = swingLows.slice(-3);
+
+  let hhCount = 0, llCount = 0, lhCount = 0, hlCount = 0;
+
+  for (let i = 1; i < lastHighs.length; i++) {
+    if (lastHighs[i].price > lastHighs[i - 1].price) hhCount++;
+    else lhCount++;
+  }
+  for (let i = 1; i < lastLows.length; i++) {
+    if (lastLows[i].price > lastLows[i - 1].price) hlCount++;
+    else llCount++;
+  }
+
+  // Pattern classification
+  let pattern = 'mixed';
+  let structure = 'ranging';
+
+  if (hhCount > 0 && hlCount > 0 && lhCount === 0 && llCount === 0) {
+    pattern = 'HH_HL';
+    structure = 'bullish';
+  } else if (lhCount > 0 && llCount > 0 && hhCount === 0 && hlCount === 0) {
+    pattern = 'LH_LL';
+    structure = 'bearish';
+  } else if (hhCount > lhCount && hlCount > llCount) {
+    pattern = 'HH_HL';
+    structure = 'bullish';
+  } else if (lhCount > hhCount && llCount > hlCount) {
+    pattern = 'LH_LL';
+    structure = 'bearish';
+  }
+
+  // Break of Structure (BOS): price breaks the last swing high/low in trend direction
+  const currentPrice = slice[slice.length - 1].close;
+  const lastSwingHigh = swingHighs[swingHighs.length - 1];
+  const lastSwingLow = swingLows[swingLows.length - 1];
+
+  let breakOfStructure = { detected: false, direction: null, price: null };
+  if (structure === 'bullish' && currentPrice > lastSwingHigh.price) {
+    breakOfStructure = { detected: true, direction: 'bullish', price: lastSwingHigh.price };
+  } else if (structure === 'bearish' && currentPrice < lastSwingLow.price) {
+    breakOfStructure = { detected: true, direction: 'bearish', price: lastSwingLow.price };
+  }
+
+  // Change of Character (CHoCH): price breaks against the trend
+  let changeOfCharacter = { detected: false, direction: null, price: null };
+  if (structure === 'bullish' && currentPrice < lastSwingLow.price) {
+    changeOfCharacter = { detected: true, direction: 'bearish', price: lastSwingLow.price };
+  } else if (structure === 'bearish' && currentPrice > lastSwingHigh.price) {
+    changeOfCharacter = { detected: true, direction: 'bullish', price: lastSwingHigh.price };
+  }
+
+  // Signal
+  let signal = 'neutral';
+  if (changeOfCharacter.detected) {
+    signal = changeOfCharacter.direction === 'bullish' ? 'bullish_reversal' : 'bearish_reversal';
+  } else if (breakOfStructure.detected) {
+    signal = breakOfStructure.direction;
+  } else if (structure === 'bullish') {
+    signal = 'bullish';
+  } else if (structure === 'bearish') {
+    signal = 'bearish';
+  }
+
+  return {
+    structure,
+    swingPoints,
+    pattern,
+    breakOfStructure,
+    changeOfCharacter,
+    signal
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // TRADE LEVEL CALCULATOR
 // Entry, Stop-Loss, Take-Profit, and Risk/Reward Ratio
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1168,6 +1562,12 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
       pivot: srLevels.pivot
     };
 
+    // Advanced indicators
+    const ichimoku = calculateIchimoku(ohlcvData, cfg);
+    const vwap = calculateVWAP(ohlcvData, cfg.vwapSessionLength);
+    const fibonacci = calculateFibonacciRetracement(ohlcvData, cfg.fibSwingLookback, currentPrice);
+    const marketStructure = analyzeMarketStructure(ohlcvData, cfg);
+
     // ─── SCORING ENGINE v3 ──────────────────────────────────────────
     // Score: -100 (extreme sell) to +100 (extreme buy). 0 = neutral
     // This prevents the systematic buy bias of the old 50-based system
@@ -1460,6 +1860,106 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
       signals.push(...orderBookScoring.signals);
     }
 
+    // ─── 15. ICHIMOKU CLOUD ────────────────────────────────────────────
+    // Weight: up to ±10 score, up to 6 confidence
+    if (ichimoku.signal !== 'insufficient_data') {
+      const iScore = cfg.ichimokuScore || 10;
+      if (ichimoku.priceVsCloud === 'above') {
+        score += iScore;
+        confidence += 4;
+        signals.push('Ichimoku: price above cloud (bullish)');
+      } else if (ichimoku.priceVsCloud === 'below') {
+        score -= iScore;
+        confidence += 4;
+        signals.push('Ichimoku: price below cloud (bearish)');
+      } else if (ichimoku.priceVsCloud === 'inside') {
+        confidence -= 3;
+        signals.push('Ichimoku: price inside cloud (indecision)');
+      }
+      // TK cross bonus
+      if (ichimoku.tkCross === 'bullish') { score += 4; confidence += 2; }
+      else if (ichimoku.tkCross === 'bearish') { score -= 4; confidence += 2; }
+      // Cloud color confirms
+      if (ichimoku.cloudColor === ichimoku.signal) confidence += 2;
+    }
+
+    // ─── 16. VWAP ───────────────────────────────────────────────────────
+    // Weight: up to ±8 score, up to 3 confidence
+    if (vwap.signal !== 'insufficient_data') {
+      const vScore = cfg.vwapScore || 8;
+      if (vwap.priceVsVwap === 'above_2sigma') {
+        score -= vScore * 0.8;
+        confidence += 3;
+        signals.push('VWAP: overbought (>2σ above)');
+      } else if (vwap.priceVsVwap === 'above') {
+        const gradual = Math.min(1, Math.abs(vwap.distancePercent) / 3);
+        score += vScore * gradual;
+        confidence += 2;
+        signals.push('VWAP: price above VWAP (bullish)');
+      } else if (vwap.priceVsVwap === 'below') {
+        const gradual = Math.min(1, Math.abs(vwap.distancePercent) / 3);
+        score -= vScore * gradual;
+        confidence += 2;
+        signals.push('VWAP: price below VWAP (bearish)');
+      } else if (vwap.priceVsVwap === 'below_2sigma') {
+        score += vScore * 0.8;
+        confidence += 3;
+        signals.push('VWAP: oversold (<2σ below)');
+      }
+    }
+
+    // ─── 17. FIBONACCI RETRACEMENT ──────────────────────────────────────
+    // Weight: up to ±6 score, up to 4 confidence
+    if (fibonacci.signal !== 'insufficient_data') {
+      const fScore = cfg.fibScore || 6;
+      if (fibonacci.signal === 'bullish_retracement') {
+        score += fScore;
+        confidence += 3;
+        signals.push(`Fib: bullish retracement at ${fibonacci.nearestLevel?.label || '?'}`);
+      } else if (fibonacci.signal === 'bearish_retracement') {
+        score -= fScore;
+        confidence += 3;
+        signals.push(`Fib: bearish retracement at ${fibonacci.nearestLevel?.label || '?'}`);
+      }
+      // Golden ratio bonus
+      if (fibonacci.goldenRatio && fibonacci.distanceToNearest < 2) {
+        confidence += cfg.fibGoldenRatioBonus || 2;
+      }
+    }
+
+    // ─── 18. MARKET STRUCTURE ───────────────────────────────────────────
+    // Weight: up to ±12 score, up to 8 confidence
+    if (marketStructure.signal !== 'insufficient_data') {
+      const msScore = cfg.marketStructureScore || 12;
+      if (marketStructure.signal === 'bullish' && marketStructure.breakOfStructure.detected) {
+        score += msScore;
+        confidence += 8;
+        signals.push('Market Structure: bullish BOS (break of structure)');
+      } else if (marketStructure.signal === 'bearish' && marketStructure.breakOfStructure.detected) {
+        score -= msScore;
+        confidence += 8;
+        signals.push('Market Structure: bearish BOS (break of structure)');
+      } else if (marketStructure.signal === 'bullish_reversal') {
+        score += msScore * 0.4;
+        confidence += 6;
+        signals.push('Market Structure: bullish CHoCH (change of character)');
+      } else if (marketStructure.signal === 'bearish_reversal') {
+        score -= msScore * 0.4;
+        confidence += 6;
+        signals.push('Market Structure: bearish CHoCH (change of character)');
+      } else if (marketStructure.signal === 'bullish') {
+        score += msScore * 0.6;
+        confidence += 5;
+        signals.push('Market Structure: HH/HL (bullish)');
+      } else if (marketStructure.signal === 'bearish') {
+        score -= msScore * 0.6;
+        confidence += 5;
+        signals.push('Market Structure: LH/LL (bearish)');
+      } else if (marketStructure.structure === 'ranging') {
+        confidence -= 3;
+      }
+    }
+
     // ─── SIGNAL AGREEMENT ANALYSIS ──────────────────────────────────
     // Count how many factors agree vs disagree
     const bullishFactors = [
@@ -1468,7 +1968,10 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
       macd.histogram > 0,
       divergence.type === 'bullish',
       bollinger.percentB < 0.3,
-      volumeProfile.profile === 'confirming_up' || volumeProfile.buyPressure > 55
+      volumeProfile.profile === 'confirming_up' || volumeProfile.buyPressure > 55,
+      ichimoku.signal === 'bullish',
+      vwap.signal === 'bullish' || vwap.signal === 'oversold',
+      marketStructure.signal === 'bullish' || marketStructure.signal === 'bullish_reversal'
     ].filter(Boolean).length;
 
     const bearishFactors = [
@@ -1477,16 +1980,19 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
       macd.histogram < 0,
       divergence.type === 'bearish',
       bollinger.percentB > 0.7,
-      volumeProfile.profile === 'confirming_down' || volumeProfile.buyPressure < 45
+      volumeProfile.profile === 'confirming_down' || volumeProfile.buyPressure < 45,
+      ichimoku.signal === 'bearish',
+      vwap.signal === 'bearish' || vwap.signal === 'overbought',
+      marketStructure.signal === 'bearish' || marketStructure.signal === 'bearish_reversal'
     ].filter(Boolean).length;
 
     // Conflicting signals reduce confidence
-    if (bullishFactors >= 2 && bearishFactors >= 2) {
+    if (bullishFactors >= 3 && bearishFactors >= 3) {
       confidence -= cfg.conflictPenalty;
       signals.push('Mixed signals - conflicting indicators');
-    } else if (bullishFactors >= 4 || bearishFactors >= 4) {
+    } else if (bullishFactors >= 5 || bearishFactors >= 5) {
       confidence += cfg.multiFactorBonus;
-      signals.push(bullishFactors >= 4 ? 'Strong multi-factor bullish alignment' : 'Strong multi-factor bearish alignment');
+      signals.push(bullishFactors >= 5 ? 'Strong multi-factor bullish alignment' : 'Strong multi-factor bearish alignment');
     }
 
     // ─── DETERMINE ACTION ───────────────────────────────────────────
@@ -1562,7 +2068,11 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
         volumeProfile: volumeProfile.profile,
         buyPressure: volumeProfile.buyPressure,
         bbSqueeze: bbSqueeze.squeeze,
-        atrPercent: atrPercent.toFixed(2)
+        atrPercent: atrPercent.toFixed(2),
+        ichimoku: ichimoku.signal !== 'insufficient_data' ? ichimoku : null,
+        vwap: vwap.signal !== 'insufficient_data' ? vwap : null,
+        fibonacci: fibonacci.signal !== 'insufficient_data' ? fibonacci : null,
+        marketStructure: marketStructure.signal !== 'insufficient_data' ? marketStructure : null
       },
       tradeLevels,
       supportResistanceLevels: srLevels,
@@ -1825,6 +2335,10 @@ module.exports = {
   calculateATR,
   analyzeVolumeProfile,
   detectBBSqueeze,
+  calculateIchimoku,
+  calculateVWAP,
+  calculateFibonacciRetracement,
+  analyzeMarketStructure,
   calculateTradeLevels,
   scoreDerivatives,
   scoreBtcDominance,

@@ -46,6 +46,28 @@ const DEFAULT_STRATEGY_CONFIG = {
   dxyScore: 10,             // DXY macro score
   orderBookScore: 12,       // Order book imbalance score
 
+  // ─── Ichimoku Cloud ──────────────────────────────────────────
+  ichimokuTenkanPeriod: 9,
+  ichimokuKijunPeriod: 26,
+  ichimokuSenkouBPeriod: 52,
+  ichimokuDisplacement: 26,
+  ichimokuScore: 10,
+
+  // ─── VWAP ─────────────────────────────────────────────────────
+  vwapSessionLength: 24,
+  vwapScore: 8,
+  vwapBandStdDev: 2,
+
+  // ─── Fibonacci Retracement ────────────────────────────────────
+  fibSwingLookback: 50,
+  fibScore: 6,
+  fibGoldenRatioBonus: 2,
+
+  // ─── Market Structure ─────────────────────────────────────────
+  marketStructureLookback: 60,
+  marketStructureScore: 12,
+  marketStructureMinSwings: 4,
+
   // ─── ADX Thresholds & Multipliers ───────────────────────────────
   adxStrongThreshold: 30,   // ADX >= this = strong trend
   adxModerateThreshold: 20, // ADX >= this = moderate
@@ -204,6 +226,26 @@ const PARAM_RANGES = {
     min: 3, max: 8, step: 1,
     label: 'S/R Swing Lookback',
     description: 'Bars on each side for swing high/low detection'
+  },
+  ichimokuScore: {
+    min: 5, max: 15, step: 5,
+    label: 'Ichimoku Weight',
+    description: 'Score contribution from Ichimoku Cloud position'
+  },
+  vwapScore: {
+    min: 4, max: 12, step: 4,
+    label: 'VWAP Weight',
+    description: 'Score contribution from VWAP position'
+  },
+  fibScore: {
+    min: 3, max: 9, step: 3,
+    label: 'Fibonacci Weight',
+    description: 'Score contribution from Fibonacci retracement levels'
+  },
+  marketStructureScore: {
+    min: 6, max: 18, step: 6,
+    label: 'Market Structure Weight',
+    description: 'Score contribution from HH/HL/LH/LL pattern detection'
   },
 };
 

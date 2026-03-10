@@ -9,6 +9,10 @@ const {
   detectBBSqueeze,
   calculateTradeLevels,
   findMultiLevelSR,
+  calculateIchimoku,
+  calculateVWAP,
+  calculateFibonacciRetracement,
+  analyzeMarketStructure,
   scoreDerivatives,
   scoreBtcDominance,
   scoreDxyMacro,
@@ -1125,5 +1129,380 @@ describe('calculateTradeLevels with multi-level S/R', () => {
     expect(result).not.toBeNull();
     expect(result.takeProfit1).toBeGreaterThan(result.entry);
     expect(result.stopLoss).toBeLessThan(result.entry);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HELPER: Generate OHLCV candles for testing
+// ═══════════════════════════════════════════════════════════════════════════════
+
+function generateCandles(count, basePrice = 50000, volatility = 0.02, trend = 0) {
+  const candles = [];
+  let price = basePrice;
+  for (let i = 0; i < count; i++) {
+    price *= (1 + trend / count);
+    const noise = (Math.random() - 0.5) * 2 * volatility * price;
+    const open = price + noise * 0.3;
+    const close = price + noise * 0.5;
+    const high = Math.max(open, close) + Math.abs(noise) * 0.3;
+    const low = Math.min(open, close) - Math.abs(noise) * 0.3;
+    candles.push({
+      open, high, low, close,
+      volume: 100 + Math.random() * 900,
+      timestamp: Date.now() - (count - i) * 3600000
+    });
+  }
+  return candles;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// calculateIchimoku Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('calculateIchimoku', () => {
+  test('returns insufficient_data for < 53 candles', () => {
+    const candles = generateCandles(30);
+    const result = calculateIchimoku(candles);
+    expect(result.signal).toBe('insufficient_data');
+  });
+
+  test('returns valid structure with enough candles', () => {
+    const candles = generateCandles(60);
+    const result = calculateIchimoku(candles);
+    expect(result).toHaveProperty('tenkan');
+    expect(result).toHaveProperty('kijun');
+    expect(result).toHaveProperty('senkouA');
+    expect(result).toHaveProperty('senkouB');
+    expect(result).toHaveProperty('cloudTop');
+    expect(result).toHaveProperty('cloudBottom');
+    expect(result).toHaveProperty('priceVsCloud');
+    expect(result).toHaveProperty('tkCross');
+    expect(result).toHaveProperty('cloudColor');
+    expect(result).toHaveProperty('signal');
+    expect(result.signal).not.toBe('insufficient_data');
+  });
+
+  test('cloudTop >= cloudBottom always', () => {
+    const candles = generateCandles(60);
+    const result = calculateIchimoku(candles);
+    expect(result.cloudTop).toBeGreaterThanOrEqual(result.cloudBottom);
+  });
+
+  test('price above cloud returns bullish', () => {
+    // Create candles with strong uptrend so price is above cloud
+    const candles = generateCandles(60, 50000, 0.01, 0.3);
+    const result = calculateIchimoku(candles);
+    if (result.priceVsCloud === 'above') {
+      expect(result.signal).toBe('bullish');
+    }
+  });
+
+  test('price below cloud returns bearish', () => {
+    const candles = generateCandles(60, 50000, 0.01, -0.3);
+    const result = calculateIchimoku(candles);
+    if (result.priceVsCloud === 'below') {
+      expect(result.signal).toBe('bearish');
+    }
+  });
+
+  test('tkCross is one of bullish/bearish/none', () => {
+    const candles = generateCandles(60);
+    const result = calculateIchimoku(candles);
+    expect(['bullish', 'bearish', 'none']).toContain(result.tkCross);
+  });
+
+  test('cloudColor is one of bullish/bearish/neutral', () => {
+    const candles = generateCandles(60);
+    const result = calculateIchimoku(candles);
+    expect(['bullish', 'bearish', 'neutral']).toContain(result.cloudColor);
+  });
+
+  test('handles null candles', () => {
+    const result = calculateIchimoku(null);
+    expect(result.signal).toBe('insufficient_data');
+  });
+
+  test('tenkan and kijun are positive numbers', () => {
+    const candles = generateCandles(60);
+    const result = calculateIchimoku(candles);
+    expect(result.tenkan).toBeGreaterThan(0);
+    expect(result.kijun).toBeGreaterThan(0);
+  });
+
+  test('respects custom config periods', () => {
+    const candles = generateCandles(100);
+    const cfg = { ichimokuTenkanPeriod: 7, ichimokuKijunPeriod: 22, ichimokuSenkouBPeriod: 44 };
+    const result = calculateIchimoku(candles, cfg);
+    expect(result.signal).not.toBe('insufficient_data');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// calculateVWAP Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('calculateVWAP', () => {
+  test('returns insufficient_data for < 5 candles', () => {
+    const candles = generateCandles(3);
+    const result = calculateVWAP(candles);
+    expect(result.signal).toBe('insufficient_data');
+  });
+
+  test('returns valid structure', () => {
+    const candles = generateCandles(30);
+    const result = calculateVWAP(candles);
+    expect(result).toHaveProperty('vwap');
+    expect(result).toHaveProperty('upperBand1');
+    expect(result).toHaveProperty('lowerBand1');
+    expect(result).toHaveProperty('upperBand2');
+    expect(result).toHaveProperty('lowerBand2');
+    expect(result).toHaveProperty('priceVsVwap');
+    expect(result).toHaveProperty('distancePercent');
+    expect(result).toHaveProperty('signal');
+  });
+
+  test('bands are ordered: lowerBand2 < lowerBand1 < vwap < upperBand1 < upperBand2', () => {
+    const candles = generateCandles(30, 50000, 0.03);
+    const result = calculateVWAP(candles);
+    if (result.signal !== 'insufficient_data') {
+      expect(result.lowerBand2).toBeLessThanOrEqual(result.lowerBand1);
+      expect(result.lowerBand1).toBeLessThanOrEqual(result.vwap);
+      expect(result.vwap).toBeLessThanOrEqual(result.upperBand1);
+      expect(result.upperBand1).toBeLessThanOrEqual(result.upperBand2);
+    }
+  });
+
+  test('vwap is positive', () => {
+    const candles = generateCandles(30);
+    const result = calculateVWAP(candles);
+    expect(result.vwap).toBeGreaterThan(0);
+  });
+
+  test('distancePercent is a finite number', () => {
+    const candles = generateCandles(30);
+    const result = calculateVWAP(candles);
+    expect(Number.isFinite(result.distancePercent)).toBe(true);
+  });
+
+  test('priceVsVwap is valid enum', () => {
+    const candles = generateCandles(30);
+    const result = calculateVWAP(candles);
+    expect(['above_2sigma', 'above', 'at_vwap', 'below', 'below_2sigma', 'unknown']).toContain(result.priceVsVwap);
+  });
+
+  test('signal matches priceVsVwap', () => {
+    const candles = generateCandles(30);
+    const result = calculateVWAP(candles);
+    if (result.priceVsVwap === 'above_2sigma') expect(result.signal).toBe('overbought');
+    if (result.priceVsVwap === 'above') expect(result.signal).toBe('bullish');
+    if (result.priceVsVwap === 'below') expect(result.signal).toBe('bearish');
+    if (result.priceVsVwap === 'below_2sigma') expect(result.signal).toBe('oversold');
+  });
+
+  test('handles zero-volume candles gracefully', () => {
+    const candles = generateCandles(10).map(c => ({ ...c, volume: 0 }));
+    const result = calculateVWAP(candles);
+    // Should not throw, returns fallback
+    expect(result.vwap).toBeGreaterThan(0);
+  });
+
+  test('handles null candles', () => {
+    const result = calculateVWAP(null);
+    expect(result.signal).toBe('insufficient_data');
+  });
+
+  test('respects sessionLength param', () => {
+    const candles = generateCandles(100);
+    const r10 = calculateVWAP(candles, 10);
+    const r50 = calculateVWAP(candles, 50);
+    // Both should work, but VWAP values may differ
+    expect(r10.vwap).toBeGreaterThan(0);
+    expect(r50.vwap).toBeGreaterThan(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// calculateFibonacciRetracement Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('calculateFibonacciRetracement', () => {
+  test('returns insufficient_data for < 10 candles', () => {
+    const candles = generateCandles(5);
+    const result = calculateFibonacciRetracement(candles, 50, 50000);
+    expect(result.signal).toBe('insufficient_data');
+  });
+
+  test('returns exactly 7 Fibonacci levels', () => {
+    const candles = generateCandles(60);
+    const result = calculateFibonacciRetracement(candles, 50, candles[candles.length - 1].close);
+    expect(result.levels.length).toBe(7);
+  });
+
+  test('levels include standard ratios', () => {
+    const candles = generateCandles(60);
+    const result = calculateFibonacciRetracement(candles, 50, candles[candles.length - 1].close);
+    const ratios = result.levels.map(l => l.ratio);
+    expect(ratios).toEqual([0, 0.236, 0.382, 0.5, 0.618, 0.786, 1]);
+  });
+
+  test('swingHigh > swingLow', () => {
+    const candles = generateCandles(60, 50000, 0.03);
+    const result = calculateFibonacciRetracement(candles, 50, candles[candles.length - 1].close);
+    if (result.signal !== 'insufficient_data') {
+      expect(result.swingHigh).toBeGreaterThan(result.swingLow);
+    }
+  });
+
+  test('trendDirection is valid enum', () => {
+    const candles = generateCandles(60);
+    const result = calculateFibonacciRetracement(candles, 50, candles[candles.length - 1].close);
+    expect(['uptrend', 'downtrend', 'unknown']).toContain(result.trendDirection);
+  });
+
+  test('nearestLevel is one of the 7 levels', () => {
+    const candles = generateCandles(60);
+    const price = candles[candles.length - 1].close;
+    const result = calculateFibonacciRetracement(candles, 50, price);
+    if (result.nearestLevel) {
+      const levelPrices = result.levels.map(l => l.price);
+      expect(levelPrices).toContain(result.nearestLevel.price);
+    }
+  });
+
+  test('goldenRatio is true only for 38.2% or 61.8%', () => {
+    const candles = generateCandles(60);
+    const price = candles[candles.length - 1].close;
+    const result = calculateFibonacciRetracement(candles, 50, price);
+    if (result.goldenRatio) {
+      expect([0.382, 0.618]).toContain(result.nearestRatio);
+    }
+  });
+
+  test('distanceToNearest is non-negative', () => {
+    const candles = generateCandles(60);
+    const price = candles[candles.length - 1].close;
+    const result = calculateFibonacciRetracement(candles, 50, price);
+    expect(result.distanceToNearest).toBeGreaterThanOrEqual(0);
+  });
+
+  test('handles null candles', () => {
+    const result = calculateFibonacciRetracement(null, 50, 50000);
+    expect(result.signal).toBe('insufficient_data');
+  });
+
+  test('flat data returns insufficient_data (zero range)', () => {
+    const candles = Array.from({ length: 20 }, (_, i) => ({
+      open: 100, high: 100, low: 100, close: 100,
+      volume: 50, timestamp: Date.now() - (20 - i) * 3600000
+    }));
+    const result = calculateFibonacciRetracement(candles, 50, 100);
+    expect(result.signal).toBe('insufficient_data');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// analyzeMarketStructure Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('analyzeMarketStructure', () => {
+  test('returns insufficient_data for < 20 candles', () => {
+    const candles = generateCandles(10);
+    const result = analyzeMarketStructure(candles);
+    expect(result.signal).toBe('insufficient_data');
+  });
+
+  test('returns valid structure with enough candles', () => {
+    const candles = generateCandles(80);
+    const result = analyzeMarketStructure(candles);
+    expect(result).toHaveProperty('structure');
+    expect(result).toHaveProperty('swingPoints');
+    expect(result).toHaveProperty('pattern');
+    expect(result).toHaveProperty('breakOfStructure');
+    expect(result).toHaveProperty('changeOfCharacter');
+    expect(result).toHaveProperty('signal');
+  });
+
+  test('detects HH/HL in uptrend', () => {
+    // Create clear uptrend: each candle higher than previous
+    const candles = [];
+    for (let i = 0; i < 60; i++) {
+      const base = 100 + i * 2;
+      // Create zigzag: odd candles dip slightly
+      const isOdd = i % 4 >= 2;
+      const price = isOdd ? base - 3 : base + 3;
+      candles.push({
+        open: price - 1, high: price + 2, low: price - 2, close: price,
+        volume: 100, timestamp: Date.now() - (60 - i) * 3600000
+      });
+    }
+    const result = analyzeMarketStructure(candles);
+    // With clear uptrend, should detect bullish or HH_HL
+    if (result.swingPoints.length >= 4) {
+      expect(['bullish', 'ranging']).toContain(result.structure);
+    }
+  });
+
+  test('detects LH/LL in downtrend', () => {
+    const candles = [];
+    for (let i = 0; i < 60; i++) {
+      const base = 200 - i * 2;
+      const isOdd = i % 4 >= 2;
+      const price = isOdd ? base + 3 : base - 3;
+      candles.push({
+        open: price + 1, high: price + 2, low: price - 2, close: price,
+        volume: 100, timestamp: Date.now() - (60 - i) * 3600000
+      });
+    }
+    const result = analyzeMarketStructure(candles);
+    if (result.swingPoints.length >= 4) {
+      expect(['bearish', 'ranging']).toContain(result.structure);
+    }
+  });
+
+  test('structure is valid enum', () => {
+    const candles = generateCandles(80);
+    const result = analyzeMarketStructure(candles);
+    expect(['bullish', 'bearish', 'ranging', 'unknown']).toContain(result.structure);
+  });
+
+  test('pattern is valid enum', () => {
+    const candles = generateCandles(80);
+    const result = analyzeMarketStructure(candles);
+    expect(['HH_HL', 'LH_LL', 'mixed', 'unknown']).toContain(result.pattern);
+  });
+
+  test('breakOfStructure has correct shape', () => {
+    const candles = generateCandles(80);
+    const result = analyzeMarketStructure(candles);
+    expect(result.breakOfStructure).toHaveProperty('detected');
+    expect(typeof result.breakOfStructure.detected).toBe('boolean');
+  });
+
+  test('changeOfCharacter has correct shape', () => {
+    const candles = generateCandles(80);
+    const result = analyzeMarketStructure(candles);
+    expect(result.changeOfCharacter).toHaveProperty('detected');
+    expect(typeof result.changeOfCharacter.detected).toBe('boolean');
+  });
+
+  test('signal is valid enum', () => {
+    const candles = generateCandles(80);
+    const result = analyzeMarketStructure(candles);
+    expect(['bullish', 'bearish', 'bullish_reversal', 'bearish_reversal', 'neutral', 'insufficient_data']).toContain(result.signal);
+  });
+
+  test('handles null candles', () => {
+    const result = analyzeMarketStructure(null);
+    expect(result.signal).toBe('insufficient_data');
+  });
+
+  test('flat data returns insufficient or ranging', () => {
+    const candles = Array.from({ length: 30 }, (_, i) => ({
+      open: 100, high: 100.01, low: 99.99, close: 100,
+      volume: 50, timestamp: Date.now() - (30 - i) * 3600000
+    }));
+    const result = analyzeMarketStructure(candles);
+    // Flat data = no real swings, or very few
+    expect(['insufficient_data', 'ranging', 'neutral']).toContain(result.signal);
   });
 });

@@ -93,6 +93,16 @@ describe('DEFAULT_STRATEGY_CONFIG', () => {
     'divergenceMaxScore', 'bbOuterScore', 'bbNearScore', 'srScore',
     'srClusterThreshold', 'srSwingLookback', 'srMaxLevels', 'srZoneStrengthBonus',
     'momentumScore', 'fearGreedScore', 'derivativesScore', 'btcDomScore', 'dxyScore',
+    'orderBookScore',
+    // Ichimoku
+    'ichimokuTenkanPeriod', 'ichimokuKijunPeriod', 'ichimokuSenkouBPeriod',
+    'ichimokuDisplacement', 'ichimokuScore',
+    // VWAP
+    'vwapSessionLength', 'vwapScore', 'vwapBandStdDev',
+    // Fibonacci
+    'fibSwingLookback', 'fibScore', 'fibGoldenRatioBonus',
+    // Market Structure
+    'marketStructureLookback', 'marketStructureScore', 'marketStructureMinSwings',
     // ADX thresholds
     'adxStrongThreshold', 'adxModerateThreshold', 'adxStrongMultiplier', 'adxWeakMultiplier',
     // RSI thresholds
