@@ -23,6 +23,37 @@ const DEFAULT_CONFIG = {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// ATOMIC CAPITAL UPDATE (prevents race conditions on concurrent trade closes)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const capitalUpdateQueue = new Map();
+
+async function updateCapitalAtomic(supabase, userId, delta) {
+  const prev = capitalUpdateQueue.get(userId) || Promise.resolve();
+  const next = prev.then(async () => {
+    const { data: configData } = await supabase
+      .from('paper_config')
+      .select('current_capital, daily_pnl')
+      .eq('user_id', userId)
+      .single();
+
+    if (configData) {
+      await supabase
+        .from('paper_config')
+        .update({
+          current_capital: parseFloat(configData.current_capital) + delta,
+          daily_pnl: parseFloat(configData.daily_pnl) + delta
+        })
+        .eq('user_id', userId);
+    }
+  }).catch(err => {
+    logger.error('Atomic capital update failed', { userId, delta, error: err.message });
+  });
+  capitalUpdateQueue.set(userId, next);
+  return next;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // PRICE RESOLUTION
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -288,6 +319,9 @@ function checkPriceAgainstLevels(trade, currentPrice) {
   const trailingActive = trade.trailing_active;
 
   if (isLong) {
+    // Save previous peak BEFORE updating — needed for trailing stop check
+    const previousPeak = result.peakPrice;
+
     // Update peak price
     if (currentPrice > result.peakPrice) {
       result.peakPrice = currentPrice;
@@ -323,13 +357,17 @@ function checkPriceAgainstLevels(trade, currentPrice) {
     }
 
     // Update trailing stop if active and price made new high
-    if (trailingActive && trailingInitial && currentPrice > result.peakPrice) {
+    // FIX: compare against previousPeak (before this tick's update)
+    if (trailingActive && trailingInitial && currentPrice > previousPeak) {
       const trailingDistance = Math.abs(entryPrice - trailingInitial);
       result.newTrailingStop = currentPrice - trailingDistance;
     }
 
   } else {
     // SHORT - everything inverted
+    // Save previous peak BEFORE updating
+    const previousPeak = result.peakPrice;
+
     // Update peak (for short, peak is lowest price)
     if (currentPrice < result.peakPrice || result.peakPrice >= entryPrice) {
       result.peakPrice = Math.min(result.peakPrice, currentPrice);
@@ -365,7 +403,8 @@ function checkPriceAgainstLevels(trade, currentPrice) {
     }
 
     // Update trailing stop for short (price made new low)
-    if (trailingActive && trailingInitial && currentPrice < result.peakPrice) {
+    // FIX: compare against previousPeak (before this tick's update)
+    if (trailingActive && trailingInitial && currentPrice < previousPeak) {
       const trailingDistance = Math.abs(trailingInitial - entryPrice);
       result.newTrailingStop = currentPrice + trailingDistance;
     }
@@ -562,29 +601,8 @@ async function executePartialClose(supabase, trade, closePrice) {
       return { updatedTrade: null, pnl: 0, error };
     }
 
-    // Update capital
-    await supabase
-      .from('paper_config')
-      .update({
-        current_capital: supabase.rpc ? undefined : undefined
-      })
-      .eq('user_id', trade.user_id);
-
-    // Use raw SQL update for capital increment
-    const { data: configData } = await supabase
-      .from('paper_config')
-      .select('current_capital, daily_pnl')
-      .eq('user_id', trade.user_id)
-      .single();
-
-    if (configData) {
-      const newCapital = parseFloat(configData.current_capital) + pnl;
-      const newDailyPnl = parseFloat(configData.daily_pnl) + pnl;
-      await supabase
-        .from('paper_config')
-        .update({ current_capital: newCapital, daily_pnl: newDailyPnl })
-        .eq('user_id', trade.user_id);
-    }
+    // Update capital atomically (serialized to prevent race conditions)
+    await updateCapitalAtomic(supabase, trade.user_id, pnl);
 
     logger.info('Paper trade partial close', {
       asset: trade.asset,
@@ -636,22 +654,9 @@ async function executeFullClose(supabase, trade, closePrice, exitReason) {
       return { closedTrade: null, pnl: 0, error };
     }
 
-    // Update capital and daily P&L
-    const { data: configData } = await supabase
-      .from('paper_config')
-      .select('current_capital, daily_pnl')
-      .eq('user_id', trade.user_id)
-      .single();
-
-    if (configData) {
-      const capitalDelta = finalPnl; // Only the remaining portion P&L (partial already accounted)
-      const newCapital = parseFloat(configData.current_capital) + capitalDelta;
-      const newDailyPnl = parseFloat(configData.daily_pnl) + capitalDelta;
-      await supabase
-        .from('paper_config')
-        .update({ current_capital: newCapital, daily_pnl: newDailyPnl })
-        .eq('user_id', trade.user_id);
-    }
+    // Update capital atomically (serialized to prevent race conditions)
+    // Only the remaining portion P&L (partial close already accounted for)
+    await updateCapitalAtomic(supabase, trade.user_id, finalPnl);
 
     logger.info('Paper trade closed', {
       asset: trade.asset,

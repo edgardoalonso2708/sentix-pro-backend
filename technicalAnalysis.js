@@ -95,7 +95,8 @@ async function fetchHistoricalData(coinId, days = 30) {
   if (result.length > 0) {
     historicalCache.set(cacheKey, { data: result, ts: Date.now() });
   } else if (cached) {
-    logger.warn('Using stale historical cache', { coinId });
+    const staleMins = Math.round((Date.now() - cached.ts) / 60000);
+    logger.warn('Using stale historical cache', { coinId, staleMinutes: staleMins });
     return cached.data;
   }
 
@@ -121,33 +122,27 @@ async function fetchOHLCVCandles(coinId, interval = '1h', limit = 100) {
       return candles;
     }
   } catch (error) {
-    logger.warn('Binance OHLCV failed, trying fallback', { coinId, error: error.message });
+    logger.warn('Binance OHLCV failed', { coinId, error: error.message });
   }
 
-  try {
-    const dailyData = await fetchHistoricalData(coinId, limit);
-    candles = dailyData.map(d => ({
-      timestamp: d.timestamp,
-      open: d.price,
-      high: d.price * 1.005,
-      low: d.price * 0.995,
-      close: d.price,
-      volume: d.volume
-    }));
-
-    if (candles.length > 0) {
-      historicalCache.set(cacheKey, { data: candles, ts: Date.now() });
-      return candles;
-    }
-  } catch (fallbackError) {
-    logger.error('All OHLCV sources failed', { coinId, error: fallbackError.message });
-  }
-
+  // FIX: Prefer stale cache (real OHLCV data) over fabricated data.
+  // Stale cache has real high/low/volume from Binance — far better than synthetic candles.
   if (cached) {
-    logger.warn('Using stale OHLCV cache', { coinId, age: Date.now() - cached.ts });
+    const staleMins = Math.round((Date.now() - cached.ts) / 60000);
+    const MAX_STALE_MINUTES = 30;
+    if (staleMins <= MAX_STALE_MINUTES) {
+      logger.warn('Using stale OHLCV cache (real data)', { coinId, staleMinutes: staleMins });
+      return cached.data;
+    }
+    // Even beyond max stale, real data is better than fabricated
+    logger.warn('Using very stale OHLCV cache (real data preferred over synthetic)', { coinId, staleMinutes: staleMins });
     return cached.data;
   }
 
+  // No cache available — log error and return empty.
+  // Returning empty is safer than fabricating fake OHLCV data, which produces
+  // misleading ATR, ADX, Bollinger, and S/R calculations.
+  logger.error('No OHLCV data available (no cache, Binance down)', { coinId, interval });
   return [];
 }
 
@@ -1103,12 +1098,14 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
         ? 'MACD bullish crossover (accelerating)'
         : 'MACD bullish (decelerating)');
     } else if (macd.histogram < 0 && macd.macd < macd.signal) {
-      const macdScore = macd.histogramTrend === 'shrinking' ? -cfg.macdWeakScore : -cfg.macdStrongScore;
+      // FIX: 'shrinking' = histogram becoming more negative = bearish ACCELERATING = strong score
+      //      'growing'   = histogram becoming less negative  = bearish WEAKENING   = weak score
+      const macdScore = macd.histogramTrend === 'shrinking' ? -cfg.macdStrongScore : -cfg.macdWeakScore;
       score += macdScore * adxMultiplier;
-      confidence += macd.histogramTrend === 'growing' ? 6 : 10;
-      signals.push(macd.histogramTrend === 'growing'
-        ? 'MACD bearish (weakening)'
-        : 'MACD bearish crossover (accelerating)');
+      confidence += macd.histogramTrend === 'shrinking' ? 10 : 6;
+      signals.push(macd.histogramTrend === 'shrinking'
+        ? 'MACD bearish crossover (accelerating)'
+        : 'MACD bearish (weakening)');
     } else if (macd.histogram > 0) {
       score += 4;
       confidence += 3;
