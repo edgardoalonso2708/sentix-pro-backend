@@ -8,6 +8,7 @@ const {
   analyzeVolumeProfile,
   detectBBSqueeze,
   calculateTradeLevels,
+  findMultiLevelSR,
   scoreDerivatives,
   scoreBtcDominance,
   scoreDxyMacro,
@@ -880,5 +881,249 @@ describe('scoreOrderBook', () => {
     expect(result).toHaveProperty('signals');
     expect(result).toHaveProperty('pressure');
     expect(Array.isArray(result.signals)).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// findMultiLevelSR Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('findMultiLevelSR', () => {
+  // Helper: generate a zigzag candle pattern
+  function makeZigzagCandles(count, basePrice = 50000) {
+    const candles = [];
+    for (let i = 0; i < count; i++) {
+      // Create a zigzag: peaks at even multiples of 10, valleys at odd multiples of 10
+      const cycle = Math.sin(i * 0.3) * 2000;
+      const price = basePrice + cycle;
+      candles.push({
+        timestamp: Date.now() - (count - i) * 3600000,
+        open: price - 50,
+        high: price + 200,
+        low: price - 200,
+        close: price + 50,
+        volume: 1000
+      });
+    }
+    return candles;
+  }
+
+  function makeFlatCandles(count, price = 50000) {
+    return Array.from({ length: count }, (_, i) => ({
+      timestamp: Date.now() - (count - i) * 3600000,
+      open: price, high: price + 10, low: price - 10, close: price, volume: 1000
+    }));
+  }
+
+  test('returns fallback with insufficient candles', () => {
+    const candles = makeFlatCandles(5, 50000);
+    const result = findMultiLevelSR(candles, 50000);
+
+    expect(result).toHaveProperty('supports');
+    expect(result).toHaveProperty('resistances');
+    expect(result).toHaveProperty('pivot');
+    expect(result).toHaveProperty('nearestSupport');
+    expect(result).toHaveProperty('nearestResistance');
+    expect(result.supports.length).toBe(1);
+    expect(result.resistances.length).toBe(1);
+  });
+
+  test('detects swing highs and lows in zigzag pattern', () => {
+    const candles = makeZigzagCandles(100, 50000);
+    const currentPrice = 50000;
+    const result = findMultiLevelSR(candles, currentPrice);
+
+    expect(result.supports.length).toBeGreaterThanOrEqual(1);
+    expect(result.resistances.length).toBeGreaterThanOrEqual(1);
+    // All supports should be below current price
+    for (const s of result.supports) {
+      expect(s.price).toBeLessThan(currentPrice);
+    }
+    // All resistances should be above current price
+    for (const r of result.resistances) {
+      expect(r.price).toBeGreaterThan(currentPrice);
+    }
+  });
+
+  test('clusters nearby levels', () => {
+    // Create candles with multiple swing highs at very similar prices
+    const candles = [];
+    for (let i = 0; i < 60; i++) {
+      let high, low;
+      // Create swing highs at ~52000 on multiple occasions
+      if (i % 15 === 7) {
+        high = 52000 + (i % 3) * 50; // 52000, 52050, 52100 — within 0.8%
+        low = 49000;
+      } else if (i % 15 === 0) {
+        high = 50500;
+        low = 47900 + (i % 3) * 30; // swing lows near 47900
+      } else {
+        high = 50500;
+        low = 49500;
+      }
+      candles.push({
+        timestamp: Date.now() - (60 - i) * 3600000,
+        open: 50000, high, low, close: 50000, volume: 1000
+      });
+    }
+
+    const result = findMultiLevelSR(candles, 50000);
+    // Should have clustered nearby levels rather than listing each individually
+    expect(result.resistances.length).toBeLessThanOrEqual(3);
+    expect(result.supports.length).toBeLessThanOrEqual(3);
+  });
+
+  test('max levels per side respects srMaxLevels', () => {
+    const candles = makeZigzagCandles(200, 50000);
+    const result = findMultiLevelSR(candles, 50000, { srMaxLevels: 2 });
+    expect(result.supports.length).toBeLessThanOrEqual(2);
+    expect(result.resistances.length).toBeLessThanOrEqual(2);
+  });
+
+  test('supports are sorted closest-first', () => {
+    const candles = makeZigzagCandles(100, 50000);
+    const result = findMultiLevelSR(candles, 50000);
+
+    if (result.supports.length >= 2) {
+      // First support should have smaller distance (closer to price)
+      expect(result.supports[0].distancePercent).toBeLessThanOrEqual(result.supports[1].distancePercent);
+    }
+  });
+
+  test('resistances are sorted closest-first', () => {
+    const candles = makeZigzagCandles(100, 50000);
+    const result = findMultiLevelSR(candles, 50000);
+
+    if (result.resistances.length >= 2) {
+      expect(result.resistances[0].distancePercent).toBeLessThanOrEqual(result.resistances[1].distancePercent);
+    }
+  });
+
+  test('distancePercent is positive for all levels', () => {
+    const candles = makeZigzagCandles(100, 50000);
+    const result = findMultiLevelSR(candles, 50000);
+
+    for (const s of result.supports) {
+      expect(s.distancePercent).toBeGreaterThanOrEqual(0);
+    }
+    for (const r of result.resistances) {
+      expect(r.distancePercent).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  test('each level has price, strength, touches, distancePercent', () => {
+    const candles = makeZigzagCandles(100, 50000);
+    const result = findMultiLevelSR(candles, 50000);
+
+    const allLevels = [...result.supports, ...result.resistances];
+    for (const level of allLevels) {
+      expect(level).toHaveProperty('price');
+      expect(level).toHaveProperty('strength');
+      expect(level).toHaveProperty('touches');
+      expect(level).toHaveProperty('distancePercent');
+      expect(level.strength).toBeGreaterThanOrEqual(1);
+      expect(level.strength).toBeLessThanOrEqual(5);
+      expect(level.touches).toBeGreaterThanOrEqual(1);
+    }
+  });
+
+  test('handles flat data without error', () => {
+    const candles = makeFlatCandles(50, 50000);
+    const result = findMultiLevelSR(candles, 50000);
+
+    expect(result).toHaveProperty('pivot');
+    expect(result).toHaveProperty('nearestSupport');
+    expect(result).toHaveProperty('nearestResistance');
+  });
+
+  test('nearestSupport and nearestResistance match first elements', () => {
+    const candles = makeZigzagCandles(100, 50000);
+    const result = findMultiLevelSR(candles, 50000);
+
+    if (result.supports.length > 0) {
+      expect(result.nearestSupport).toBe(result.supports[0].price);
+    }
+    if (result.resistances.length > 0) {
+      expect(result.nearestResistance).toBe(result.resistances[0].price);
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// calculateTradeLevels with multi-level S/R Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('calculateTradeLevels with multi-level S/R', () => {
+  const srLevels = {
+    supports: [
+      { price: 48000, strength: 3, touches: 3, distancePercent: 4.0 },
+      { price: 46000, strength: 2, touches: 2, distancePercent: 8.0 }
+    ],
+    resistances: [
+      { price: 52000, strength: 3, touches: 3, distancePercent: 4.0 },
+      { price: 54000, strength: 1, touches: 1, distancePercent: 8.0 }
+    ],
+    pivot: 50000,
+    nearestSupport: 48000,
+    nearestResistance: 52000
+  };
+
+  test('BUY with srLevels: TP1 targets R1, TP2 targets R2', () => {
+    const result = calculateTradeLevels('BUY', 50000, 48000, 52000, 50000, 1000, {
+      srLevels
+    });
+
+    expect(result).not.toBeNull();
+    expect(result.takeProfit1).toBeCloseTo(52000, -2); // R1
+    expect(result.takeProfit2).toBeCloseTo(54000, -2); // R2
+  });
+
+  test('SELL with srLevels: TP1 targets S1, TP2 targets S2', () => {
+    const result = calculateTradeLevels('SELL', 50000, 48000, 52000, 50000, 1000, {
+      srLevels
+    });
+
+    expect(result).not.toBeNull();
+    expect(result.takeProfit1).toBeCloseTo(48000, -2); // S1
+    expect(result.takeProfit2).toBeCloseTo(46000, -2); // S2
+  });
+
+  test('BUY with srLevels: SL uses nearest support', () => {
+    const result = calculateTradeLevels('BUY', 50000, 48000, 52000, 50000, 1000, {
+      srLevels
+    });
+
+    // SL should be below S1 (48000) by atr * slMult (1000 * 1.5 = 1500)
+    expect(result.stopLoss).toBeCloseTo(48000 - 1500, -2);
+  });
+
+  test('falls back to original logic when srLevels is null', () => {
+    const result = calculateTradeLevels('BUY', 50000, 48000, 52000, 50000, 1000, {
+      srLevels: null
+    });
+
+    expect(result).not.toBeNull();
+    expect(result.takeProfit1).toBeCloseTo(52000, -2); // Original resistance
+    expect(result.stopLoss).toBeCloseTo(48000 - 1500, -2); // Original support - ATR*1.5
+  });
+
+  test('geometry validation works with multi-level S/R', () => {
+    // Price above all resistances — geometry validation should fix
+    const badSR = {
+      supports: [{ price: 49000, strength: 1, touches: 1, distancePercent: 2.0 }],
+      resistances: [{ price: 49500, strength: 1, touches: 1, distancePercent: 1.0 }], // below entry for BUY
+      pivot: 49250,
+      nearestSupport: 49000,
+      nearestResistance: 49500
+    };
+
+    const result = calculateTradeLevels('BUY', 50000, 49000, 49500, 49250, 1000, {
+      srLevels: badSR
+    });
+
+    // TP1 should be above entry (geometry validation fallback)
+    expect(result).not.toBeNull();
+    expect(result.takeProfit1).toBeGreaterThan(result.entry);
+    expect(result.stopLoss).toBeLessThan(result.entry);
   });
 });

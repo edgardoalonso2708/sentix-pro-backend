@@ -91,6 +91,7 @@ describe('DEFAULT_STRATEGY_CONFIG', () => {
     'trendScoreStrong', 'trendScoreModerate', 'rsiExtremeScore', 'rsiStrongScore',
     'rsiPullbackScore', 'macdStrongScore', 'macdWeakScore', 'divergenceBaseScore',
     'divergenceMaxScore', 'bbOuterScore', 'bbNearScore', 'srScore',
+    'srClusterThreshold', 'srSwingLookback', 'srMaxLevels', 'srZoneStrengthBonus',
     'momentumScore', 'fearGreedScore', 'derivativesScore', 'btcDomScore', 'dxyScore',
     // ADX thresholds
     'adxStrongThreshold', 'adxModerateThreshold', 'adxStrongMultiplier', 'adxWeakMultiplier',

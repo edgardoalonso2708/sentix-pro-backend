@@ -35,6 +35,10 @@ const DEFAULT_STRATEGY_CONFIG = {
   bbOuterScore: 10,         // Price at outer Bollinger band
   bbNearScore: 5,           // Price near band
   srScore: 8,               // Near support/resistance
+  srClusterThreshold: 0.008, // 0.8% — levels within this distance are clustered
+  srSwingLookback: 5,        // Bars on each side to qualify as swing high/low
+  srMaxLevels: 3,            // Max S/R levels per side (S1/S2/S3, R1/R2/R3)
+  srZoneStrengthBonus: 3,    // Max extra confidence for heavily-tested zones
   momentumScore: 5,         // 24h momentum (reduced)
   fearGreedScore: 3,        // Fear & Greed extreme contribution
   derivativesScore: 15,     // Extreme funding rate score
@@ -190,6 +194,16 @@ const PARAM_RANGES = {
     min: 0.01, max: 0.05, step: 0.01,
     label: 'Risk Per Trade',
     description: 'Percentage of capital risked per trade'
+  },
+  srClusterThreshold: {
+    min: 0.005, max: 0.015, step: 0.005,
+    label: 'S/R Cluster Threshold',
+    description: 'Percentage distance to cluster nearby S/R levels'
+  },
+  srSwingLookback: {
+    min: 3, max: 8, step: 1,
+    label: 'S/R Swing Lookback',
+    description: 'Bars on each side for swing high/low detection'
   },
 };
 

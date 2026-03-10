@@ -330,6 +330,128 @@ function calculateSupportResistance(historicalData) {
   };
 }
 
+/**
+ * Find multi-level support and resistance zones from OHLCV candles.
+ * Uses swing high/low detection + classic pivot extensions + level clustering.
+ *
+ * @param {Array} candles - OHLCV candles array with { high, low, close, timestamp }
+ * @param {number} currentPrice - Current market price
+ * @param {Object} cfg - Strategy config
+ * @returns {Object} { supports[], resistances[], pivot, nearestSupport, nearestResistance }
+ */
+function findMultiLevelSR(candles, currentPrice, cfg = {}) {
+  const clusterThreshold = cfg.srClusterThreshold || 0.008;
+  const swingLookback = cfg.srSwingLookback || 5;
+  const maxLevels = cfg.srMaxLevels || 3;
+
+  // Fallback for insufficient data
+  if (!candles || candles.length < swingLookback * 2 + 1) {
+    const high = candles && candles.length > 0 ? Math.max(...candles.map(d => d.high)) : currentPrice * 1.05;
+    const low = candles && candles.length > 0 ? Math.min(...candles.map(d => d.low)) : currentPrice * 0.95;
+    const close = candles && candles.length > 0 ? candles[candles.length - 1].close : currentPrice;
+    const pivot = (high + low + close) / 3;
+    const s1 = (2 * pivot) - high;
+    const r1 = (2 * pivot) - low;
+    return {
+      supports: [{ price: s1, strength: 1, touches: 1, distancePercent: currentPrice > 0 ? ((currentPrice - s1) / currentPrice) * 100 : 0 }],
+      resistances: [{ price: r1, strength: 1, touches: 1, distancePercent: currentPrice > 0 ? ((r1 - currentPrice) / currentPrice) * 100 : 0 }],
+      pivot,
+      nearestSupport: s1,
+      nearestResistance: r1
+    };
+  }
+
+  // ── Phase A: Detect swing highs and swing lows ──
+  const swingHighs = [];
+  const swingLows = [];
+  for (let i = swingLookback; i < candles.length - swingLookback; i++) {
+    let isSwingHigh = true;
+    let isSwingLow = true;
+    for (let j = 1; j <= swingLookback; j++) {
+      if (candles[i].high <= candles[i - j].high || candles[i].high <= candles[i + j].high) {
+        isSwingHigh = false;
+      }
+      if (candles[i].low >= candles[i - j].low || candles[i].low >= candles[i + j].low) {
+        isSwingLow = false;
+      }
+    }
+    if (isSwingHigh) swingHighs.push(candles[i].high);
+    if (isSwingLow) swingLows.push(candles[i].low);
+  }
+
+  // ── Phase B: Classic pivot levels as additional candidates ──
+  const recentCandles = candles.slice(-30);
+  const high = Math.max(...recentCandles.map(d => d.high));
+  const low = Math.min(...recentCandles.map(d => d.low));
+  const close = candles[candles.length - 1].close;
+  const pivot = (high + low + close) / 3;
+  const range = high - low;
+
+  const pivotR1 = (2 * pivot) - low;
+  const pivotR2 = pivot + range;
+  const pivotR3 = high + 2 * (pivot - low);
+  const pivotS1 = (2 * pivot) - high;
+  const pivotS2 = pivot - range;
+  const pivotS3 = low - 2 * (high - pivot);
+
+  // ── Phase C: Combine candidates and filter by side ──
+  const allResistanceCandidates = [...swingHighs, pivotR1, pivotR2, pivotR3]
+    .filter(p => p > currentPrice && isFinite(p));
+  const allSupportCandidates = [...swingLows, pivotS1, pivotS2, pivotS3]
+    .filter(p => p < currentPrice && p > 0 && isFinite(p));
+
+  // ── Phase D: Cluster nearby levels ──
+  function clusterLevels(candidates) {
+    if (candidates.length === 0) return [];
+    const sorted = [...candidates].sort((a, b) => a - b);
+    const clusters = [];
+    let currentCluster = [sorted[0]];
+
+    for (let i = 1; i < sorted.length; i++) {
+      const clusterAvg = currentCluster.reduce((s, v) => s + v, 0) / currentCluster.length;
+      if (Math.abs(sorted[i] - clusterAvg) / clusterAvg < clusterThreshold) {
+        currentCluster.push(sorted[i]);
+      } else {
+        clusters.push(currentCluster);
+        currentCluster = [sorted[i]];
+      }
+    }
+    clusters.push(currentCluster);
+
+    return clusters.map(cluster => {
+      const avgPrice = cluster.reduce((s, v) => s + v, 0) / cluster.length;
+      const touches = cluster.length;
+      const strength = Math.min(5, touches);
+      return { price: parseFloat(avgPrice.toFixed(8)), strength, touches };
+    });
+  }
+
+  // ── Phase E: Sort by distance, take maxLevels ──
+  const supports = clusterLevels(allSupportCandidates)
+    .sort((a, b) => b.price - a.price) // closest to current price first
+    .slice(0, maxLevels)
+    .map(level => ({
+      ...level,
+      distancePercent: parseFloat(((currentPrice - level.price) / currentPrice * 100).toFixed(2))
+    }));
+
+  const resistances = clusterLevels(allResistanceCandidates)
+    .sort((a, b) => a.price - b.price) // closest to current price first
+    .slice(0, maxLevels)
+    .map(level => ({
+      ...level,
+      distancePercent: parseFloat(((level.price - currentPrice) / currentPrice * 100).toFixed(2))
+    }));
+
+  return {
+    supports,
+    resistances,
+    pivot,
+    nearestSupport: supports[0]?.price || pivotS1,
+    nearestResistance: resistances[0]?.price || pivotR1
+  };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // ADVANCED INDICATORS (NEW)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -623,6 +745,7 @@ function calculateTradeLevels(action, currentPrice, support, resistance, pivot, 
   const trailMult = tradeConfig.atrTrailingMult || 2.5;
   const trailActivation = tradeConfig.atrTrailingActivation || 1.0;
   const minRR = tradeConfig.minRiskReward || 1.5;
+  const srLevels = tradeConfig.srLevels || null;
 
   let entry, stopLoss, takeProfit1, takeProfit2;
 
@@ -632,17 +755,29 @@ function calculateTradeLevels(action, currentPrice, support, resistance, pivot, 
     if (Math.abs(currentPrice - support) / currentPrice < 0.02) {
       entry = support + (atr * 0.25);
     }
-    stopLoss = support - (atr * slMult);
-    takeProfit1 = resistance;
-    takeProfit2 = resistance + (atr * tp2Mult);
+    if (srLevels && srLevels.resistances.length > 0) {
+      takeProfit1 = srLevels.resistances[0]?.price || resistance;
+      takeProfit2 = srLevels.resistances[1]?.price || (takeProfit1 + (atr * tp2Mult));
+      stopLoss = (srLevels.supports[0]?.price || support) - (atr * slMult);
+    } else {
+      stopLoss = support - (atr * slMult);
+      takeProfit1 = resistance;
+      takeProfit2 = resistance + (atr * tp2Mult);
+    }
   } else { // SELL
     entry = currentPrice;
     if (Math.abs(currentPrice - resistance) / currentPrice < 0.02) {
       entry = resistance - (atr * 0.25);
     }
-    stopLoss = resistance + (atr * slMult);
-    takeProfit1 = support;
-    takeProfit2 = support - (atr * tp2Mult);
+    if (srLevels && srLevels.supports.length > 0) {
+      takeProfit1 = srLevels.supports[0]?.price || support;
+      takeProfit2 = srLevels.supports[1]?.price || (takeProfit1 - (atr * tp2Mult));
+      stopLoss = (srLevels.resistances[0]?.price || resistance) + (atr * slMult);
+    } else {
+      stopLoss = resistance + (atr * slMult);
+      takeProfit1 = support;
+      takeProfit2 = support - (atr * tp2Mult);
+    }
   }
 
   // Ensure stop-loss is positive
@@ -1024,16 +1159,13 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
     const atr = calculateATR(ohlcvData, cfg.atrPeriod);
     const atrPercent = currentPrice > 0 ? (atr / currentPrice) * 100 : 0;
 
-    // Support/Resistance from actual H/L
-    const recentCandles = ohlcvData.slice(-30);
-    const high = Math.max(...recentCandles.map(d => d.high));
-    const low = Math.min(...recentCandles.map(d => d.low));
-    const close = prices[prices.length - 1];
-    const pivot = (high + low + close) / 3;
+    // Multi-level Support/Resistance from swing highs/lows + pivot extensions
+    const srLevels = findMultiLevelSR(ohlcvData, currentPrice, cfg);
+    // Backward-compat alias for existing code that reads supportResistance.support/resistance/pivot
     const supportResistance = {
-      support: (2 * pivot) - high,
-      resistance: (2 * pivot) - low,
-      pivot
+      support: srLevels.nearestSupport,
+      resistance: srLevels.nearestResistance,
+      pivot: srLevels.pivot
     };
 
     // ─── SCORING ENGINE v3 ──────────────────────────────────────────
@@ -1217,20 +1349,40 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
       signals.push('Low volume - weak conviction');
     }
 
-    // ─── 8. SUPPORT/RESISTANCE ──────────────────────────────────────
-    // Weight: up to ±8 score, up to 5 confidence
-    const distToSupport = (currentPrice - supportResistance.support) / currentPrice;
-    const distToResistance = (supportResistance.resistance - currentPrice) / currentPrice;
+    // ─── 8. SUPPORT/RESISTANCE (Multi-Level) ──────────────────────
+    // Weight: up to ±8 score, up to 8 confidence (5 base + 3 strength bonus)
+    // Gradual scoring: closer to level = stronger signal
+    const nearestSup = srLevels.supports[0];
+    const nearestRes = srLevels.resistances[0];
+    let srScoreContrib = 0;
+    let srConfContrib = 0;
 
-    if (distToSupport < 0.02 && distToSupport > -0.01) {
-      score += cfg.srScore;
-      confidence += 5;
-      signals.push('At support level');
-    } else if (distToResistance < 0.02 && distToResistance > -0.01) {
-      score -= cfg.srScore;
-      confidence += 5;
-      signals.push('At resistance level');
+    if (nearestSup && nearestSup.distancePercent < 3.0) {
+      const proximity = Math.max(0, 1 - (nearestSup.distancePercent / 3.0));
+      srScoreContrib += Math.round(cfg.srScore * proximity);
+      srConfContrib += Math.round(5 * proximity);
+      if (nearestSup.strength >= 3) {
+        srConfContrib += Math.min(cfg.srZoneStrengthBonus || 3, nearestSup.strength - 2);
+        signals.push(`Strong support S1 (${nearestSup.touches} tests)`);
+      } else if (proximity > 0.5) {
+        signals.push('Near support level');
+      }
     }
+
+    if (nearestRes && nearestRes.distancePercent < 3.0) {
+      const proximity = Math.max(0, 1 - (nearestRes.distancePercent / 3.0));
+      srScoreContrib -= Math.round(cfg.srScore * proximity);
+      srConfContrib += Math.round(5 * proximity);
+      if (nearestRes.strength >= 3) {
+        srConfContrib += Math.min(cfg.srZoneStrengthBonus || 3, nearestRes.strength - 2);
+        signals.push(`Strong resistance R1 (${nearestRes.touches} tests)`);
+      } else if (proximity > 0.5) {
+        signals.push('Near resistance level');
+      }
+    }
+
+    score += srScoreContrib;
+    confidence += srConfContrib;
 
     // ─── 9. MOMENTUM (24h change - minor weight) ───────────────────
     // Weight: up to ±8 score (reduced from ±10 - momentum is a lagging signal)
@@ -1376,7 +1528,7 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
       supportResistance.pivot, atr,
       { atrStopMult: cfg.atrStopMult, atrTP2Mult: cfg.atrTP2Mult,
         atrTrailingMult: cfg.atrTrailingMult, atrTrailingActivation: cfg.atrTrailingActivation,
-        minRiskReward: cfg.minRiskReward }
+        minRiskReward: cfg.minRiskReward, srLevels }
     );
 
     if (tradeLevels && !tradeLevels.riskRewardOk) {
@@ -1413,6 +1565,7 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
         atrPercent: atrPercent.toFixed(2)
       },
       tradeLevels,
+      supportResistanceLevels: srLevels,
       derivatives: derivativesData ? {
         fundingRate: derivativesData.fundingRate,
         fundingRatePercent: derivativesData.fundingRatePercent,
@@ -1604,7 +1757,8 @@ async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volu
         signal1h.tradeLevels.atrValue,
         { atrStopMult: cfg.atrStopMult, atrTP2Mult: cfg.atrTP2Mult,
           atrTrailingMult: cfg.atrTrailingMult, atrTrailingActivation: cfg.atrTrailingActivation,
-          minRiskReward: cfg.minRiskReward }
+          minRiskReward: cfg.minRiskReward,
+          srLevels: signal1h.supportResistanceLevels || null }
       )
     : null;
 
@@ -1620,6 +1774,7 @@ async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volu
     reasons: allReasons.join(' \u2022 '),
     indicators: signal1h.indicators,
     tradeLevels,
+    supportResistanceLevels: signal1h.supportResistanceLevels || null,
     derivatives: signal1h.derivatives || null,
     macroContext: signal1h.macroContext || null,
     orderBook: signal1h.orderBook || null,
@@ -1663,6 +1818,7 @@ module.exports = {
   calculateMACD,
   calculateBollingerBands,
   calculateSupportResistance,
+  findMultiLevelSR,
   calculateADX,
   detectEMATrend,
   detectRSIDivergence,
