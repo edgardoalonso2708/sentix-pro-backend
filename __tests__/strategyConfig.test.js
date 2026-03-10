@@ -117,7 +117,8 @@ describe('DEFAULT_STRATEGY_CONFIG', () => {
     'atrStopMult', 'atrTP2Mult', 'atrTrailingMult', 'atrTrailingActivation', 'minRiskReward',
     // Multi-timeframe
     'tf4hWeight', 'tf1hWeight', 'tf15mWeight', 'strongConfluenceMult',
-    'moderateConfluenceBonus', 'conflictingMult', 'governorMult',
+    'moderateConfluenceBonus', 'conflictingMult',
+    'governorMultMild', 'governorMultStrong', 'governorStrongThreshold', 'governorRangingDampen',
     // Dynamic TF weights
     'dynamicTFWeightsEnabled', 'tfTrending4hWeight', 'tfTrending1hWeight',
     'tfTrending15mWeight', 'tfRanging4hWeight', 'tfRanging1hWeight', 'tfRanging15mWeight',
@@ -198,11 +199,31 @@ describe('DEFAULT_STRATEGY_CONFIG', () => {
   test('multipliers are positive', () => {
     const mults = [
       'adxStrongMultiplier', 'adxWeakMultiplier', 'strongConfluenceMult',
-      'conflictingMult', 'governorMult'
+      'conflictingMult', 'governorMultMild', 'governorMultStrong'
     ];
     mults.forEach(key => {
       expect(DEFAULT_STRATEGY_CONFIG[key]).toBeGreaterThan(0);
     });
+  });
+
+  test('governor multipliers are ordered correctly (strong < mild)', () => {
+    expect(DEFAULT_STRATEGY_CONFIG.governorMultStrong).toBeLessThan(DEFAULT_STRATEGY_CONFIG.governorMultMild);
+  });
+
+  test('governor multipliers are between 0 and 1', () => {
+    expect(DEFAULT_STRATEGY_CONFIG.governorMultMild).toBeGreaterThan(0);
+    expect(DEFAULT_STRATEGY_CONFIG.governorMultMild).toBeLessThanOrEqual(1);
+    expect(DEFAULT_STRATEGY_CONFIG.governorMultStrong).toBeGreaterThan(0);
+    expect(DEFAULT_STRATEGY_CONFIG.governorMultStrong).toBeLessThanOrEqual(1);
+  });
+
+  test('governorRangingDampen is between 0 and 1', () => {
+    expect(DEFAULT_STRATEGY_CONFIG.governorRangingDampen).toBeGreaterThanOrEqual(0);
+    expect(DEFAULT_STRATEGY_CONFIG.governorRangingDampen).toBeLessThanOrEqual(1);
+  });
+
+  test('governorStrongThreshold is greater than trend threshold (15)', () => {
+    expect(DEFAULT_STRATEGY_CONFIG.governorStrongThreshold).toBeGreaterThan(15);
   });
 
   test('risk parameters are within sensible ranges', () => {

@@ -2199,6 +2199,88 @@ function calculateDynamicTFWeights(adx4h, cfg = {}) {
 }
 
 /**
+ * Apply graduated, regime-aware 4H governor penalty.
+ * Penalizes merged signal when 4H trend disagrees with merged direction.
+ * Penalty scales with 4H disagreement strength and is reduced in ranging markets.
+ *
+ * @param {number} mergedRawScore - Current merged raw score
+ * @param {number} raw4h - 4H timeframe raw score
+ * @param {string} trend4h - 4H trend ('bullish'|'bearish'|'neutral')
+ * @param {object} dynamicWeights - From calculateDynamicTFWeights() (has .regime, .interpolationFactor)
+ * @param {object} cfg - Strategy config with governor* keys
+ * @returns {{ adjustedScore: number, confidencePenalty: number, governorInfo: object }}
+ */
+function applyGovernor(mergedRawScore, raw4h, trend4h, dynamicWeights = {}, cfg = {}) {
+  const noop = {
+    adjustedScore: mergedRawScore,
+    confidencePenalty: 0,
+    governorInfo: { applied: false, reason: null }
+  };
+
+  // Governor only fires when 4H disagrees with merged signal direction
+  const disagrees =
+    (trend4h === 'bearish' && mergedRawScore > 0) ||
+    (trend4h === 'bullish' && mergedRawScore < 0);
+
+  if (!disagrees) return noop;
+
+  // --- Graduated multiplier based on 4H disagreement strength ---
+  const mildMult = cfg.governorMultMild ?? 0.80;
+  const strongMult = cfg.governorMultStrong ?? 0.55;
+  const strongThreshold = cfg.governorStrongThreshold ?? 40;
+  const trendThreshold = 15; // matches getTrend() threshold
+
+  // How strongly does 4H disagree? 0 = barely past threshold, 1 = full strong
+  const absRaw4h = Math.abs(raw4h);
+  const range = strongThreshold - trendThreshold;
+  const disagreementStrength = range > 0
+    ? Math.min(1, Math.max(0, (absRaw4h - trendThreshold) / range))
+    : 0;
+
+  // Interpolate between mild and strong multiplier
+  let baseMult = mildMult + disagreementStrength * (strongMult - mildMult);
+
+  // --- Regime-aware dampen ---
+  // interpolationFactor: 0 = ranging, 1 = trending, -1 = static/disabled
+  const rangingDampen = cfg.governorRangingDampen ?? 0.50;
+  const interpFactor = (dynamicWeights.interpolationFactor != null && dynamicWeights.interpolationFactor >= 0)
+    ? dynamicWeights.interpolationFactor
+    : 0.5; // fallback for static mode
+
+  // regimeAdjust: 1.0 in trending (full governor), rangingDampen in ranging
+  const regimeAdjust = rangingDampen + interpFactor * (1 - rangingDampen);
+
+  // Move multiplier toward 1.0 (no penalty) based on regime
+  const effectiveMult = 1 - regimeAdjust * (1 - baseMult);
+
+  const adjustedScore = mergedRawScore * effectiveMult;
+
+  // Graduated confidence penalty: proportional to penalty strength (-2 to -8)
+  const penaltyStrength = 1 - effectiveMult;
+  const confidencePenalty = -Math.round(2 + penaltyStrength * 14);
+
+  // Classify severity for display
+  const severity = disagreementStrength >= 0.6 ? 'strong' : 'mild';
+
+  return {
+    adjustedScore,
+    confidencePenalty,
+    governorInfo: {
+      applied: true,
+      severity,
+      raw4hScore: raw4h,
+      disagreementStrength: +disagreementStrength.toFixed(3),
+      baseMult: +baseMult.toFixed(3),
+      regime: dynamicWeights.regime || 'unknown',
+      regimeAdjust: +regimeAdjust.toFixed(3),
+      effectiveMult: +effectiveMult.toFixed(3),
+      confidencePenalty,
+      reason: `4H ${trend4h} governs (${severity}, ${dynamicWeights.regime || 'unknown'}) — ${Math.round((1 - effectiveMult) * 100)}% dampened`
+    }
+  };
+}
+
+/**
  * Generate a multi-timeframe confluent signal.
  * Runs analysis on 4h, 1h, and 15m candles, then merges with weighted scoring.
  * 4h = macro trend (40%), 1h = signal (40%), 15m = entry timing (20%)
@@ -2281,15 +2363,12 @@ async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volu
     confluenceReasons.push('Weak confluence - no clear direction');
   }
 
-  // 4h is the "governor" - don't fight the macro trend
-  if (trends['4h'] === 'bearish' && mergedRawScore > 0) {
-    mergedRawScore *= cfg.governorMult;
-    confidenceBonus -= 5;
-    confluenceReasons.push('4H bearish governs - dampened bullish signal');
-  } else if (trends['4h'] === 'bullish' && mergedRawScore < 0) {
-    mergedRawScore *= cfg.governorMult;
-    confidenceBonus -= 5;
-    confluenceReasons.push('4H bullish governs - dampened bearish signal');
+  // 4h governor — graduated, regime-aware
+  const governorResult = applyGovernor(mergedRawScore, signal4h.rawScore, trends['4h'], dynamicWeights, cfg);
+  mergedRawScore = governorResult.adjustedScore;
+  confidenceBonus += governorResult.confidencePenalty;
+  if (governorResult.governorInfo.applied) {
+    confluenceReasons.push(governorResult.governorInfo.reason);
   }
 
   mergedRawScore = Math.max(-100, Math.min(100, Math.round(mergedRawScore)));
@@ -2392,7 +2471,8 @@ async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volu
         action: signal15m.action
       },
       confluence,
-      dynamicWeights
+      dynamicWeights,
+      governorInfo: governorResult.governorInfo
     }
   };
 }
@@ -2419,6 +2499,7 @@ module.exports = {
   calculateFibonacciRetracement,
   analyzeMarketStructure,
   calculateDynamicTFWeights,
+  applyGovernor,
   calculateTradeLevels,
   scoreDerivatives,
   scoreBtcDominance,

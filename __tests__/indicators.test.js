@@ -17,7 +17,8 @@ const {
   scoreDerivatives,
   scoreBtcDominance,
   scoreDxyMacro,
-  scoreOrderBook
+  scoreOrderBook,
+  applyGovernor
 } = require('../technicalAnalysis');
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1626,5 +1627,171 @@ describe('calculateDynamicTFWeights', () => {
     const result = calculateDynamicTFWeights(25, {});
     // Should not throw; returns static since dynamicTFWeightsEnabled is falsy
     expect(result.regime).toBe('static');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// applyGovernor Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('applyGovernor', () => {
+  const trendingWeights = { regime: 'trending', interpolationFactor: 1.0 };
+  const rangingWeights = { regime: 'ranging', interpolationFactor: 0.0 };
+  const mixedWeights = { regime: 'mixed', interpolationFactor: 0.5 };
+  const defaultCfg = {
+    governorMultMild: 0.80,
+    governorMultStrong: 0.55,
+    governorStrongThreshold: 40,
+    governorRangingDampen: 0.50,
+  };
+
+  // --- No-op cases ---
+  test('no governor when 4H is neutral', () => {
+    const result = applyGovernor(30, 10, 'neutral', trendingWeights, defaultCfg);
+    expect(result.adjustedScore).toBe(30);
+    expect(result.confidencePenalty).toBe(0);
+    expect(result.governorInfo.applied).toBe(false);
+  });
+
+  test('no governor when 4H agrees with merged (both bullish)', () => {
+    const result = applyGovernor(30, 25, 'bullish', trendingWeights, defaultCfg);
+    expect(result.adjustedScore).toBe(30);
+    expect(result.governorInfo.applied).toBe(false);
+  });
+
+  test('no governor when 4H agrees with merged (both bearish)', () => {
+    const result = applyGovernor(-30, -25, 'bearish', trendingWeights, defaultCfg);
+    expect(result.adjustedScore).toBe(-30);
+    expect(result.governorInfo.applied).toBe(false);
+  });
+
+  test('no governor when merged score is 0', () => {
+    const result = applyGovernor(0, -30, 'bearish', trendingWeights, defaultCfg);
+    expect(result.adjustedScore).toBe(0);
+    expect(result.governorInfo.applied).toBe(false);
+  });
+
+  // --- Activation cases ---
+  test('activates when 4H bearish but merged positive', () => {
+    const result = applyGovernor(40, -20, 'bearish', trendingWeights, defaultCfg);
+    expect(result.governorInfo.applied).toBe(true);
+    expect(result.adjustedScore).toBeLessThan(40);
+    expect(result.adjustedScore).toBeGreaterThan(0); // still positive
+  });
+
+  test('activates when 4H bullish but merged negative', () => {
+    const result = applyGovernor(-40, 20, 'bullish', trendingWeights, defaultCfg);
+    expect(result.governorInfo.applied).toBe(true);
+    expect(result.adjustedScore).toBeGreaterThan(-40); // less negative
+    expect(result.adjustedScore).toBeLessThan(0); // still negative
+  });
+
+  // --- Graduated severity ---
+  test('mild disagreement (4H raw=-16) → light penalty, severity mild', () => {
+    // disagreementStrength = (16-15)/(40-15) = 0.04 → very close to mildMult
+    const result = applyGovernor(40, -16, 'bearish', trendingWeights, defaultCfg);
+    expect(result.governorInfo.effectiveMult).toBeGreaterThan(0.78);
+    expect(result.governorInfo.severity).toBe('mild');
+    expect(result.adjustedScore).toBeGreaterThan(30);
+  });
+
+  test('strong disagreement (4H raw=-50) → heavy penalty, severity strong', () => {
+    // disagreementStrength = (50-15)/(40-15) = 1.4 → clamped to 1.0
+    const result = applyGovernor(40, -50, 'bearish', trendingWeights, defaultCfg);
+    expect(result.governorInfo.effectiveMult).toBeCloseTo(0.55, 1);
+    expect(result.governorInfo.severity).toBe('strong');
+    expect(result.adjustedScore).toBeLessThan(24);
+  });
+
+  test('moderate disagreement interpolates between mild and strong', () => {
+    const mild = applyGovernor(40, -16, 'bearish', trendingWeights, defaultCfg);
+    const moderate = applyGovernor(40, -28, 'bearish', trendingWeights, defaultCfg);
+    const strong = applyGovernor(40, -50, 'bearish', trendingWeights, defaultCfg);
+    expect(moderate.adjustedScore).toBeLessThan(mild.adjustedScore);
+    expect(moderate.adjustedScore).toBeGreaterThan(strong.adjustedScore);
+  });
+
+  // --- Regime-aware behavior ---
+  test('ranging market → weaker governor penalty', () => {
+    const trending = applyGovernor(40, -30, 'bearish', trendingWeights, defaultCfg);
+    const ranging = applyGovernor(40, -30, 'bearish', rangingWeights, defaultCfg);
+    expect(ranging.adjustedScore).toBeGreaterThan(trending.adjustedScore);
+  });
+
+  test('mixed market → intermediate governor penalty', () => {
+    const trending = applyGovernor(40, -30, 'bearish', trendingWeights, defaultCfg);
+    const mixed = applyGovernor(40, -30, 'bearish', mixedWeights, defaultCfg);
+    const ranging = applyGovernor(40, -30, 'bearish', rangingWeights, defaultCfg);
+    expect(mixed.adjustedScore).toBeGreaterThan(trending.adjustedScore);
+    expect(mixed.adjustedScore).toBeLessThan(ranging.adjustedScore);
+  });
+
+  test('governorRangingDampen=1.0 → regime has no effect', () => {
+    const cfg = { ...defaultCfg, governorRangingDampen: 1.0 };
+    const trending = applyGovernor(40, -30, 'bearish', trendingWeights, cfg);
+    const ranging = applyGovernor(40, -30, 'bearish', rangingWeights, cfg);
+    expect(trending.adjustedScore).toBeCloseTo(ranging.adjustedScore, 1);
+  });
+
+  test('governorRangingDampen=0 → governor disabled in ranging', () => {
+    const cfg = { ...defaultCfg, governorRangingDampen: 0 };
+    const result = applyGovernor(40, -30, 'bearish', rangingWeights, cfg);
+    expect(result.adjustedScore).toBeCloseTo(40, 0);
+  });
+
+  // --- Confidence penalty ---
+  test('confidence penalty is proportional to penalty strength', () => {
+    const mild = applyGovernor(40, -16, 'bearish', trendingWeights, defaultCfg);
+    const strong = applyGovernor(40, -50, 'bearish', trendingWeights, defaultCfg);
+    expect(mild.confidencePenalty).toBeGreaterThan(strong.confidencePenalty); // less negative
+    expect(mild.confidencePenalty).toBeLessThan(0);
+    expect(strong.confidencePenalty).toBeLessThan(0);
+  });
+
+  test('no penalty → zero confidence impact', () => {
+    const result = applyGovernor(40, 25, 'bullish', trendingWeights, defaultCfg);
+    expect(result.confidencePenalty).toBe(0);
+  });
+
+  // --- Edge cases ---
+  test('fallback defaults when cfg keys missing', () => {
+    const result = applyGovernor(40, -30, 'bearish', trendingWeights, {});
+    expect(result.governorInfo.applied).toBe(true);
+    expect(result.adjustedScore).toBeLessThan(40);
+  });
+
+  test('static dynamicWeights (interpolationFactor=-1) uses fallback', () => {
+    const staticWeights = { regime: 'static', interpolationFactor: -1 };
+    const result = applyGovernor(40, -30, 'bearish', staticWeights, defaultCfg);
+    expect(result.governorInfo.applied).toBe(true);
+    // Uses fallback 0.5 for interpolation factor
+    expect(result.adjustedScore).toBeLessThan(40);
+  });
+
+  // --- Return shape ---
+  test('return object has expected shape when applied', () => {
+    const result = applyGovernor(40, -30, 'bearish', trendingWeights, defaultCfg);
+    expect(result).toHaveProperty('adjustedScore');
+    expect(result).toHaveProperty('confidencePenalty');
+    expect(result).toHaveProperty('governorInfo');
+    expect(result.governorInfo).toHaveProperty('applied', true);
+    expect(result.governorInfo).toHaveProperty('severity');
+    expect(result.governorInfo).toHaveProperty('effectiveMult');
+    expect(result.governorInfo).toHaveProperty('regime');
+    expect(result.governorInfo).toHaveProperty('reason');
+    expect(result.governorInfo).toHaveProperty('disagreementStrength');
+    expect(result.governorInfo).toHaveProperty('baseMult');
+    expect(result.governorInfo).toHaveProperty('regimeAdjust');
+    expect(result.governorInfo).toHaveProperty('confidencePenalty');
+  });
+
+  // --- Symmetry: bullish governor works same as bearish ---
+  test('bullish governor applies same graduated logic', () => {
+    const bearishGov = applyGovernor(40, -30, 'bearish', trendingWeights, defaultCfg);
+    const bullishGov = applyGovernor(-40, 30, 'bullish', trendingWeights, defaultCfg);
+    // Effective multiplier should be the same
+    expect(bullishGov.governorInfo.effectiveMult).toBeCloseTo(bearishGov.governorInfo.effectiveMult, 3);
+    // Adjusted scores should be symmetric (opposite signs, same magnitude)
+    expect(Math.abs(bullishGov.adjustedScore)).toBeCloseTo(Math.abs(bearishGov.adjustedScore), 1);
   });
 });

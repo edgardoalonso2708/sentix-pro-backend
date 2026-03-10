@@ -108,7 +108,11 @@ const DEFAULT_STRATEGY_CONFIG = {
   strongConfluenceMult: 1.15,  // Score multiplier when all TFs agree
   moderateConfluenceBonus: 5,  // Confidence bonus for 2/3 agreement
   conflictingMult: 0.70,       // Score multiplier when TFs conflict
-  governorMult: 0.50,          // 4H disagrees with merged signal
+  // ─── 4H Governor (graduated, regime-aware) ───────────────────
+  governorMultMild: 0.80,        // Mult when 4H disagrees mildly (rawScore barely past ±15)
+  governorMultStrong: 0.55,      // Mult when 4H disagrees strongly (rawScore ±40+)
+  governorStrongThreshold: 40,   // 4H |rawScore| at which governor reaches full strong penalty
+  governorRangingDampen: 0.50,   // In ranging, reduce governor penalty (0=no governor, 1=full)
 
   // ─── Dynamic TF Weights (ADX-based) ──────────────────────────────
   dynamicTFWeightsEnabled: 1,       // 1 = enabled, 0 = use static weights
@@ -210,6 +214,26 @@ const PARAM_RANGES = {
     min: 0.5, max: 0.9, step: 0.1,
     label: 'Conflicting TF Multiplier',
     description: 'Score reduction when timeframes disagree'
+  },
+  governorMultMild: {
+    min: 0.60, max: 0.95, step: 0.05,
+    label: 'Governor Mult (Mild)',
+    description: 'Score multiplier when 4H mildly disagrees with merged signal'
+  },
+  governorMultStrong: {
+    min: 0.40, max: 0.75, step: 0.05,
+    label: 'Governor Mult (Strong)',
+    description: 'Score multiplier when 4H strongly disagrees with merged signal'
+  },
+  governorStrongThreshold: {
+    min: 25, max: 55, step: 5,
+    label: 'Governor Strong Threshold',
+    description: '4H |rawScore| at which governor reaches full strong penalty'
+  },
+  governorRangingDampen: {
+    min: 0.25, max: 1.00, step: 0.25,
+    label: 'Governor Ranging Dampen',
+    description: 'How much governor penalty applies in ranging markets (0=none, 1=full)'
   },
   orderBookScore: {
     min: 5, max: 20, step: 5,
