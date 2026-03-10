@@ -23,6 +23,21 @@ const apiClient = axios.create({
 // In-memory cache for historical data (avoids repeated API calls)
 const historicalCache = new Map();
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const MAX_CACHE_ENTRIES = 100;
+
+// LRU eviction: remove oldest entries when cache exceeds MAX_CACHE_ENTRIES
+function cacheSet(key, value) {
+  historicalCache.set(key, value);
+  if (historicalCache.size > MAX_CACHE_ENTRIES) {
+    // Map iterates in insertion order; delete oldest entries
+    const keysToDelete = [];
+    for (const [k] of historicalCache) {
+      keysToDelete.push(k);
+      if (historicalCache.size - keysToDelete.length <= MAX_CACHE_ENTRIES) break;
+    }
+    for (const k of keysToDelete) historicalCache.delete(k);
+  }
+}
 
 // CoinCap ID mapping for fallback
 const COINCAP_HISTORY_IDS = {
@@ -93,7 +108,7 @@ async function fetchHistoricalData(coinId, days = 30) {
   }
 
   if (result.length > 0) {
-    historicalCache.set(cacheKey, { data: result, ts: Date.now() });
+    cacheSet(cacheKey, { data: result, ts: Date.now() });
   } else if (cached) {
     const staleMins = Math.round((Date.now() - cached.ts) / 60000);
     logger.warn('Using stale historical cache', { coinId, staleMinutes: staleMins });
@@ -118,7 +133,7 @@ async function fetchOHLCVCandles(coinId, interval = '1h', limit = 100) {
   try {
     candles = await fetchOHLCVForAsset(coinId, interval, limit);
     if (candles.length > 0) {
-      historicalCache.set(cacheKey, { data: candles, ts: Date.now() });
+      cacheSet(cacheKey, { data: candles, ts: Date.now() });
       return candles;
     }
   } catch (error) {
@@ -632,6 +647,31 @@ function calculateTradeLevels(action, currentPrice, support, resistance, pivot, 
 
   // Ensure stop-loss is positive
   stopLoss = Math.max(0.01, stopLoss);
+
+  // ── Geometry validation ──────────────────────────────────────────────
+  // For BUY: TP1 must be above entry, SL must be below entry
+  // For SELL: TP1 must be below entry, SL must be above entry
+  // If violated (price already past S/R), fall back to ATR-based targets
+  if (action === 'BUY') {
+    if (takeProfit1 <= entry) {
+      takeProfit1 = entry + (atr * 2.0);  // ATR-based fallback
+      takeProfit2 = entry + (atr * (2.0 + tp2Mult));
+    }
+    if (stopLoss >= entry) {
+      stopLoss = entry - (atr * slMult);
+    }
+  } else {
+    if (takeProfit1 >= entry) {
+      takeProfit1 = entry - (atr * 2.0);  // ATR-based fallback
+      takeProfit2 = entry - (atr * (2.0 + tp2Mult));
+    }
+    if (stopLoss <= entry) {
+      stopLoss = entry + (atr * slMult);
+    }
+  }
+  stopLoss = Math.max(0.01, stopLoss);
+  takeProfit1 = Math.max(0.01, takeProfit1);
+  takeProfit2 = Math.max(0.01, takeProfit2);
 
   const risk = Math.abs(entry - stopLoss);
   const reward = Math.abs(takeProfit1 - entry);

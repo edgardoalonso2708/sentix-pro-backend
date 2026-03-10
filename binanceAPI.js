@@ -8,6 +8,16 @@ const axios = require('axios');
 const { logger } = require('./logger');
 const { classifyAxiosError, Provider } = require('./errors');
 
+// Safe parseFloat: returns 0 (with warning) on NaN instead of propagating
+function safeFloat(value, field = 'unknown') {
+  const n = parseFloat(value);
+  if (isNaN(n)) {
+    logger.warn('parseFloat NaN encountered', { field, value: String(value).slice(0, 50) });
+    return 0;
+  }
+  return n;
+}
+
 // Binance Public API endpoints (in priority order)
 // data-api.binance.vision is geo-unrestricted (primary for cloud deploys)
 // api.binance.com returns 451 in US/restricted regions
@@ -177,19 +187,19 @@ async function fetchKlines(symbol, interval = '1h', limit = 100, startTime = nul
         activeBinanceBase = endpoint;
       }
 
-      // Transform to our internal format
+      // Transform to our internal format (safeFloat prevents NaN propagation)
       const candles = response.data.map(k => ({
         timestamp: k[0],               // Open time
-        open: parseFloat(k[1]),
-        high: parseFloat(k[2]),
-        low: parseFloat(k[3]),
-        close: parseFloat(k[4]),
-        volume: parseFloat(k[5]),
+        open: safeFloat(k[1], 'kline.open'),
+        high: safeFloat(k[2], 'kline.high'),
+        low: safeFloat(k[3], 'kline.low'),
+        close: safeFloat(k[4], 'kline.close'),
+        volume: safeFloat(k[5], 'kline.volume'),
         closeTime: k[6],
-        quoteVolume: parseFloat(k[7]),
+        quoteVolume: safeFloat(k[7], 'kline.quoteVolume'),
         trades: k[8],
-        takerBuyBaseVolume: parseFloat(k[9]),
-        takerBuyQuoteVolume: parseFloat(k[10])
+        takerBuyBaseVolume: safeFloat(k[9], 'kline.takerBuyBaseVolume'),
+        takerBuyQuoteVolume: safeFloat(k[10], 'kline.takerBuyQuoteVolume')
       }));
 
       logger.debug('Binance klines fetched', {
@@ -210,6 +220,28 @@ async function fetchKlines(symbol, interval = '1h', limit = 100, startTime = nul
         logger.warn(`Binance endpoint ${endpoint} returned ${status}, trying next...`);
         lastError = error;
         continue;
+      }
+
+      // 5xx or timeout: retry once with backoff before failing
+      if (status >= 500 || error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+        logger.warn(`Binance transient error on ${endpoint}: ${status || error.code}, retrying once...`);
+        await new Promise(r => setTimeout(r, 2000));
+        try {
+          const retryResponse = await binanceClient.get('/api/v3/klines', { params, baseURL: endpoint });
+          const candles = retryResponse.data.map(k => ({
+            timestamp: k[0], open: safeFloat(k[1], 'kline.open'), high: safeFloat(k[2], 'kline.high'),
+            low: safeFloat(k[3], 'kline.low'), close: safeFloat(k[4], 'kline.close'),
+            volume: safeFloat(k[5], 'kline.volume'), closeTime: k[6],
+            quoteVolume: safeFloat(k[7], 'kline.quoteVolume'), trades: k[8],
+            takerBuyBaseVolume: safeFloat(k[9], 'kline.takerBuyBaseVolume'),
+            takerBuyQuoteVolume: safeFloat(k[10], 'kline.takerBuyQuoteVolume')
+          }));
+          return candles;
+        } catch (retryErr) {
+          logger.warn(`Binance retry also failed on ${endpoint}`);
+          lastError = retryErr;
+          continue; // Try next endpoint
+        }
       }
 
       // Other errors: don't retry with other endpoints

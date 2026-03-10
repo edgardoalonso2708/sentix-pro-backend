@@ -125,6 +125,9 @@ async function runOptimization(options) {
       results.push({
         value,
         sharpe: backtestResult.metrics.sharpeRatio,
+        sortino: backtestResult.metrics.sortinoRatio || 0,
+        calmar: backtestResult.metrics.calmarRatio || 0,
+        expectancy: backtestResult.metrics.expectancy || 0,
         profitFactor: backtestResult.metrics.profitFactor,
         winRate: backtestResult.metrics.winRate,
         totalTrades: backtestResult.metrics.totalTrades,
@@ -132,7 +135,8 @@ async function runOptimization(options) {
         totalPnlPercent: backtestResult.metrics.totalPnlPercent,
         maxDrawdownPercent: backtestResult.metrics.maxDrawdownPercent,
         avgHoldingBars: backtestResult.metrics.avgHoldingBars,
-        maxConsecutiveLosses: backtestResult.metrics.maxConsecutiveLosses
+        maxConsecutiveLosses: backtestResult.metrics.maxConsecutiveLosses,
+        statisticallySignificant: backtestResult.metrics.statisticallySignificant
       });
 
       logger.info('Optimization step completed', {
@@ -161,10 +165,17 @@ async function runOptimization(options) {
     }
   }
 
-  // ─── 3. Sort by Sharpe ratio (descending) ─────────────────────────────
-  results.sort((a, b) => b.sharpe - a.sharpe);
+  // ─── 3. Filter low trade counts, sort by Sharpe ratio (descending) ────
+  const MIN_TRADES_FOR_RANKING = 10;
+  const validResults = results.filter(r => r.totalTrades >= MIN_TRADES_FOR_RANKING && !r.error);
+  const invalidResults = results.filter(r => r.totalTrades < MIN_TRADES_FOR_RANKING || r.error);
 
-  const bestResult = results[0];
+  // Sort valid results by Sharpe (descending), then append low-trade results at bottom
+  validResults.sort((a, b) => b.sharpe - a.sharpe);
+  invalidResults.sort((a, b) => b.sharpe - a.sharpe);
+  results = [...validResults, ...invalidResults];
+
+  const bestResult = validResults.length > 0 ? validResults[0] : results[0];
   const defaultValue = DEFAULT_STRATEGY_CONFIG[paramName];
   const defaultResult = results.find(r => r.value === defaultValue);
 
@@ -208,7 +219,7 @@ async function runOptimization(options) {
  * Start an optimization job (async, non-blocking).
  * Returns a job ID for progress tracking.
  */
-function startOptimizationJob(options) {
+function startOptimizationJob(options, onComplete = null) {
   const jobId = `opt-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
   const job = {
@@ -227,6 +238,16 @@ function startOptimizationJob(options) {
 
   activeJobs.set(jobId, job);
 
+  // Auto-cleanup old completed/errored jobs (keep last 20)
+  if (activeJobs.size > 20) {
+    const sorted = [...activeJobs.entries()]
+      .filter(([, j]) => j.status === 'completed' || j.status === 'error')
+      .sort((a, b) => new Date(a[1].startedAt) - new Date(b[1].startedAt));
+    while (sorted.length > 0 && activeJobs.size > 20) {
+      activeJobs.delete(sorted.shift()[0]);
+    }
+  }
+
   // Run async (don't await)
   runOptimization({ ...options, jobId })
     .then(result => {
@@ -235,6 +256,7 @@ function startOptimizationJob(options) {
         activeJobs.get(jobId).message = 'Optimización completada';
         activeJobs.get(jobId).result = result;
       }
+      if (onComplete) onComplete(null, result);
     })
     .catch(err => {
       logger.error('Optimization job failed', { jobId, error: err.message });
@@ -243,6 +265,7 @@ function startOptimizationJob(options) {
         activeJobs.get(jobId).message = err.message;
         activeJobs.get(jobId).error = err.message;
       }
+      if (onComplete) onComplete(err, null);
     });
 
   return jobId;

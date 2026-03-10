@@ -77,17 +77,21 @@ app.use(cors({
     // Allow requests with no origin (mobile apps, server-to-server, curl)
     if (!origin || allowedOrigins.some(o => origin.startsWith(o))) {
       callback(null, true);
+    } else if (process.env.NODE_ENV === 'production') {
+      logger.warn('CORS: rejected unknown origin', { origin });
+      callback(new Error('CORS not allowed'), false);
     } else {
-      // In production, still allow but log
-      if (process.env.NODE_ENV === 'production') {
-        logger.warn('CORS: unknown origin', { origin });
-      }
+      // Development: allow all origins with a warning
+      logger.warn('CORS: unknown origin (allowed in dev)', { origin });
       callback(null, true);
     }
   },
   credentials: true
 }));
-app.use(express.json());
+app.use(express.json({ limit: '1mb' }));
+
+// Rate limiting — MUST be registered BEFORE route definitions
+app.use('/api/', createRateLimiter(60000, 100));
 
 // ─── CONFIGURATION ─────────────────────────────────────────────────────────
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -889,8 +893,27 @@ function buildSignalEmailHTML(signal) {
 // ALERT PROCESSING SYSTEM
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Track recently sent alerts to avoid duplicate delivery
-const recentAlertKeys = new Set();
+// Track recently sent alerts to avoid duplicate delivery (bounded Map with timestamps)
+const recentAlertKeys = new Map(); // key -> timestamp
+const ALERT_DEDUP_TTL = 30 * 60 * 1000; // 30 min dedup window
+const MAX_ALERT_KEYS = 500;
+
+function isAlertDuplicate(key) {
+  const ts = recentAlertKeys.get(key);
+  if (ts && (Date.now() - ts) < ALERT_DEDUP_TTL) return true;
+  // Clean expired entries periodically (every check, cheap for bounded map)
+  if (recentAlertKeys.size > MAX_ALERT_KEYS) {
+    const now = Date.now();
+    for (const [k, v] of recentAlertKeys) {
+      if (now - v > ALERT_DEDUP_TTL) recentAlertKeys.delete(k);
+    }
+  }
+  return false;
+}
+
+function markAlertSent(key) {
+  recentAlertKeys.set(key, Date.now());
+}
 
 async function processAlerts() {
   try {
@@ -948,7 +971,7 @@ async function processAlerts() {
 
       // Deduplicate: only alert once per asset+action per cooldown period
       const alertKey = `${signal.asset}-${signal.action}`;
-      if (recentAlertKeys.has(alertKey)) continue;
+      if (isAlertDuplicate(alertKey)) continue;
 
       // Save to database (alerts table) - always save regardless of delivery prefs
       try {
@@ -1001,10 +1024,8 @@ async function processAlerts() {
         if (emailResult.success) emailCount++;
       }
 
-      // Mark as recently sent (cooldown from filter, default 20 min)
-      const cooldownMs = (filter.cooldown_minutes || 20) * 60 * 1000;
-      recentAlertKeys.add(alertKey);
-      setTimeout(() => recentAlertKeys.delete(alertKey), cooldownMs);
+      // Mark as recently sent (bounded map with timestamp, auto-expires on next check)
+      markAlertSent(alertKey);
     }
 
     logger.info('Alerts processed', {
@@ -2044,12 +2065,31 @@ app.post('/api/paper/close/:tradeId', async (req, res) => {
 // BACKTEST API ROUTES
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// In-memory backtest store (for when Supabase is unavailable)
+// In-memory backtest store (bounded LRU — max 50 entries)
 const backtestStore = new Map();
+const MAX_BACKTEST_STORE = 50;
+function backtestStoreSet(key, value) {
+  backtestStore.set(key, value);
+  if (backtestStore.size > MAX_BACKTEST_STORE) {
+    const oldest = backtestStore.keys().next().value;
+    backtestStore.delete(oldest);
+  }
+}
+
+// Concurrent job tracking
+let activeBacktestJobs = 0;
+const MAX_CONCURRENT_BACKTESTS = 5;
+let activeOptimizeJobs = 0;
+const MAX_CONCURRENT_OPTIMIZATIONS = 3;
 
 // ─── Launch a backtest ───────────────────────────────────────────────────────
 app.post('/api/backtest/run', async (req, res) => {
   try {
+    // Reject if too many concurrent backtests
+    if (activeBacktestJobs >= MAX_CONCURRENT_BACKTESTS) {
+      return res.status(429).json({ error: `Too many concurrent backtests (${activeBacktestJobs}/${MAX_CONCURRENT_BACKTESTS}). Try again later.` });
+    }
+
     const {
       asset = 'bitcoin',
       days = 90,
@@ -2066,8 +2106,11 @@ app.post('/api/backtest/run', async (req, res) => {
 
     // Validate inputs
     if (days < 7 || days > 365) return res.status(400).json({ error: 'days must be between 7 and 365' });
-    if (capital < 100) return res.status(400).json({ error: 'capital must be at least 100' });
+    if (capital < 100 || capital > 10000000) return res.status(400).json({ error: 'capital must be between 100 and 10,000,000' });
     if (!['1h', '4h'].includes(stepInterval)) return res.status(400).json({ error: 'stepInterval must be 1h or 4h' });
+    if (typeof riskPerTrade !== 'number' || riskPerTrade < 0.001 || riskPerTrade > 0.10) return res.status(400).json({ error: 'riskPerTrade must be between 0.001 and 0.10' });
+    if (!Number.isInteger(maxOpenPositions) || maxOpenPositions < 1 || maxOpenPositions > 10) return res.status(400).json({ error: 'maxOpenPositions must be between 1 and 10' });
+    if (!Array.isArray(allowedStrength)) return res.status(400).json({ error: 'allowedStrength must be an array' });
 
     // Try to create record in Supabase first
     let recordId = null;
@@ -2100,7 +2143,7 @@ app.post('/api/backtest/run', async (req, res) => {
     }
 
     // Store initial state in memory
-    backtestStore.set(recordId, {
+    backtestStoreSet(recordId, {
       id: recordId, user_id: userId, asset, days, step_interval: stepInterval,
       initial_capital: capital, status: 'running', progress: 0,
       created_at: new Date().toISOString()
@@ -2110,6 +2153,7 @@ app.post('/api/backtest/run', async (req, res) => {
     res.json({ id: recordId, status: 'running' });
 
     // Execute backtest asynchronously
+    activeBacktestJobs++;
     (async () => {
       try {
         const result = await runBacktest({
@@ -2145,7 +2189,7 @@ app.post('/api/backtest/run', async (req, res) => {
         };
 
         // Save to memory
-        backtestStore.set(recordId, completed);
+        backtestStoreSet(recordId, completed);
 
         // Try to save to DB
         if (useDB) {
@@ -2172,7 +2216,7 @@ app.post('/api/backtest/run', async (req, res) => {
 
       } catch (err) {
         logger.error(`Backtest failed: ${recordId}`, { error: err.message });
-        backtestStore.set(recordId, {
+        backtestStoreSet(recordId, {
           ...backtestStore.get(recordId), status: 'failed',
           error_message: err.message, completed_at: new Date().toISOString()
         });
@@ -2184,6 +2228,8 @@ app.post('/api/backtest/run', async (req, res) => {
             }).eq('id', recordId);
           } catch (_) { /* ignore */ }
         }
+      } finally {
+        activeBacktestJobs = Math.max(0, activeBacktestJobs - 1);
       }
     })();
 
@@ -2289,6 +2335,12 @@ app.get('/api/optimize/params', (req, res) => {
  */
 app.post('/api/optimize/run', (req, res) => {
   try {
+    // Reject if too many concurrent optimizations
+    if (activeOptimizeJobs >= MAX_CONCURRENT_OPTIMIZATIONS) {
+      return res.status(429).json({ error: `Too many concurrent optimizations (${activeOptimizeJobs}/${MAX_CONCURRENT_OPTIMIZATIONS}). Try again later.` });
+    }
+    activeOptimizeJobs++;
+
     const { asset, days, paramName, baseConfig, capital } = req.body;
 
     if (!paramName || !PARAM_RANGES[paramName]) {
@@ -2310,6 +2362,8 @@ app.post('/api/optimize/run', (req, res) => {
       paramName,
       baseConfig: baseConfig || {},
       capital: capital || 10000
+    }, () => {
+      activeOptimizeJobs = Math.max(0, activeOptimizeJobs - 1);
     });
 
     logger.info('Optimization job started', { jobId, asset, paramName, days: validDays });
@@ -2483,8 +2537,7 @@ cron.schedule('*/5 * * * *', async () => {
 // Validate environment on startup
 validateEnvironment();
 
-// Apply rate limiting to API routes
-app.use('/api/', createRateLimiter(60000, 100));
+// NOTE: Rate limiting is applied early (after express.json(), before routes)
 
 // Export app for testing, only listen when run directly
 if (require.main === module) {

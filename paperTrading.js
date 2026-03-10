@@ -30,7 +30,25 @@ const DEFAULT_CONFIG = {
   is_enabled: true,
   daily_pnl: 0,
   daily_pnl_reset_at: new Date().toISOString(),
-  last_trade_at: null
+  last_trade_at: null,
+  max_position_percent: 0.30,       // Max 30% of capital per position
+  partial_close_ratio: 0.5,         // Close 50% at TP1
+  max_holding_hours: 168,           // 7 days max holding period (0 = disabled)
+  move_sl_to_breakeven_after_tp1: true  // Move SL to entry after TP1 hit
+};
+
+// ─── CONFIG VALIDATION RANGES ────────────────────────────────────────────────
+const CONFIG_VALIDATION = {
+  risk_per_trade:        { min: 0.001, max: 0.10, type: 'number' },
+  max_open_positions:    { min: 1,     max: 10,   type: 'integer' },
+  max_daily_loss_percent:{ min: 0.01,  max: 0.20, type: 'number' },
+  cooldown_minutes:      { min: 5,     max: 1440, type: 'integer' },
+  min_confluence:        { min: 1,     max: 3,    type: 'integer' },
+  min_rr_ratio:          { min: 0.5,   max: 5.0,  type: 'number' },
+  initial_capital:       { min: 100,   max: 10000000, type: 'number' },
+  max_position_percent:  { min: 0.05,  max: 0.50, type: 'number' },
+  partial_close_ratio:   { min: 0.25,  max: 0.75, type: 'number' },
+  max_holding_hours:     { min: 0,     max: 720,  type: 'integer' },  // 0 = disabled, max 30 days
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -146,14 +164,39 @@ async function updateConfig(supabase, userId, updates) {
     const allowedFields = [
       'initial_capital', 'risk_per_trade', 'max_open_positions',
       'max_daily_loss_percent', 'cooldown_minutes', 'min_confluence',
-      'min_rr_ratio', 'allowed_strength', 'is_enabled'
+      'min_rr_ratio', 'allowed_strength', 'is_enabled',
+      'max_position_percent', 'partial_close_ratio', 'max_holding_hours',
+      'move_sl_to_breakeven_after_tp1'
     ];
 
     const filtered = {};
+    const validationErrors = [];
+
     for (const key of allowedFields) {
       if (updates[key] !== undefined) {
+        // Range validation for numeric fields
+        const rules = CONFIG_VALIDATION[key];
+        if (rules) {
+          const val = Number(updates[key]);
+          if (isNaN(val)) {
+            validationErrors.push(`${key}: must be a number`);
+            continue;
+          }
+          if (rules.type === 'integer' && !Number.isInteger(val)) {
+            validationErrors.push(`${key}: must be an integer`);
+            continue;
+          }
+          if (val < rules.min || val > rules.max) {
+            validationErrors.push(`${key}: must be between ${rules.min} and ${rules.max}`);
+            continue;
+          }
+        }
         filtered[key] = updates[key];
       }
+    }
+
+    if (validationErrors.length > 0) {
+      return { config: null, error: `Validation failed: ${validationErrors.join('; ')}` };
     }
 
     if (Object.keys(filtered).length === 0) {
@@ -182,7 +225,7 @@ async function updateConfig(supabase, userId, updates) {
 
 async function resetPaperAccount(supabase, userId) {
   try {
-    // Close all open trades at current state (mark as manual close with 0 P&L)
+    // Cancel all open trades (don't mark as closed with 0 PnL — that corrupts analytics)
     const { data: openTrades } = await supabase
       .from('paper_trades')
       .select('id')
@@ -195,11 +238,9 @@ async function resetPaperAccount(supabase, userId) {
       await supabase
         .from('paper_trades')
         .update({
-          status: 'closed',
-          exit_reason: 'manual',
-          exit_at: new Date().toISOString(),
-          realized_pnl: 0,
-          realized_pnl_percent: 0
+          status: 'cancelled',
+          exit_reason: 'account_reset',
+          exit_at: new Date().toISOString()
         })
         .eq('user_id', userId)
         .in('status', ['open', 'partial']);
@@ -297,8 +338,9 @@ function calculatePositionSize(config, signal) {
   let quantity = riskAmount / riskPerUnit;
   let positionSizeUsd = quantity * entryPrice;
 
-  // Cap at 30% of capital
-  const maxPosition = config.current_capital * 0.3;
+  // Cap at configurable % of capital (default 30%)
+  const maxPositionPct = config.max_position_percent || DEFAULT_CONFIG.max_position_percent;
+  const maxPosition = config.current_capital * maxPositionPct;
   if (positionSizeUsd > maxPosition) {
     positionSizeUsd = maxPosition;
     quantity = positionSizeUsd / entryPrice;
@@ -430,10 +472,10 @@ function checkPriceAgainstLevels(trade, currentPrice) {
 
 async function checkSafetyLimits(supabase, userId, config) {
   try {
-    // Reset daily P&L if new day
+    // Reset daily P&L if new day (UTC-based for deterministic resets)
     const resetAt = new Date(config.daily_pnl_reset_at);
     const now = new Date();
-    if (resetAt.toDateString() !== now.toDateString()) {
+    if (resetAt.toISOString().slice(0, 10) !== now.toISOString().slice(0, 10)) {
       await supabase
         .from('paper_config')
         .update({ daily_pnl: 0, daily_pnl_reset_at: now.toISOString() })
@@ -582,11 +624,11 @@ async function openTrade(supabase, userId, signal, positionSize) {
   }
 }
 
-async function executePartialClose(supabase, trade, closePrice) {
+async function executePartialClose(supabase, trade, closePrice, partialRatio = 0.5) {
   try {
     const entryPrice = parseFloat(trade.entry_price);
     const totalQuantity = parseFloat(trade.quantity);
-    const closeQuantity = totalQuantity / 2;
+    const closeQuantity = totalQuantity * partialRatio;
     const remainingQuantity = totalQuantity - closeQuantity;
 
     let pnl;
@@ -707,10 +749,16 @@ async function updateTrailingStop(supabase, tradeId, newTrailingStop, peakPrice)
 // POSITION MONITORING
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function monitorOpenPositions(supabase, userId, marketData) {
+async function monitorOpenPositions(supabase, userId, marketData, config = null) {
   const result = { checked: 0, closedTrades: [], partialCloses: [] };
 
   try {
+    // Fetch config if not provided (needed for partial ratio, holding time, breakeven)
+    if (!config) {
+      const { config: fetchedConfig } = await getOrCreateConfig(supabase, userId);
+      config = fetchedConfig || DEFAULT_CONFIG;
+    }
+
     const { data: trades, error } = await supabase
       .from('paper_trades')
       .select('*')
@@ -728,6 +776,24 @@ async function monitorOpenPositions(supabase, userId, marketData) {
       if (!currentPrice) {
         logger.debug('No price found for paper trade', { asset: trade.asset });
         continue;
+      }
+
+      // ── Check max holding time ──────────────────────────────────────
+      const maxHoldingHours = config.max_holding_hours || DEFAULT_CONFIG.max_holding_hours;
+      if (maxHoldingHours > 0 && trade.entry_at) {
+        const holdingMs = Date.now() - new Date(trade.entry_at).getTime();
+        if (holdingMs > maxHoldingHours * 3600 * 1000) {
+          const isExitBuy = trade.direction === 'SHORT';
+          const slippedClosePrice = applySlippage(currentPrice, isExitBuy);
+          const closeResult = await executeFullClose(supabase, trade, slippedClosePrice, 'time_expiry');
+          if (closeResult.closedTrade) {
+            result.closedTrades.push(closeResult.closedTrade);
+            logger.info('Trade closed by time expiry', {
+              asset: trade.asset, holdingHours: Math.round(holdingMs / 3600000)
+            });
+          }
+          continue; // Skip further checks for this trade
+        }
       }
 
       // Update max favorable / adverse
@@ -762,9 +828,22 @@ async function monitorOpenPositions(supabase, userId, marketData) {
         }
 
         case 'take_profit_1': {
-          const partialResult = await executePartialClose(supabase, trade, slippedClosePrice);
+          const partialRatio = config.partial_close_ratio || DEFAULT_CONFIG.partial_close_ratio;
+          const partialResult = await executePartialClose(supabase, trade, slippedClosePrice, partialRatio);
           if (partialResult.updatedTrade) {
             result.partialCloses.push(partialResult.updatedTrade);
+
+            // Move stop-loss to break-even after TP1 (professional trade management)
+            if (config.move_sl_to_breakeven_after_tp1 !== false) {
+              const breakEvenPrice = entryPrice;
+              await supabase
+                .from('paper_trades')
+                .update({ stop_loss: breakEvenPrice })
+                .eq('id', trade.id);
+              logger.info('Stop-loss moved to break-even after TP1', {
+                asset: trade.asset, breakEvenPrice
+              });
+            }
           }
           break;
         }
@@ -1108,7 +1187,10 @@ async function monitorAndManage(supabase, userId, marketData) {
         for (const trade of openTrades) {
           const price = resolveCurrentPrice(trade.asset, marketData);
           if (price) {
-            const { closedTrade } = await executeFullClose(supabase, trade, price, 'max_daily_loss');
+            // Apply slippage to emergency closes (liquidations have WORSE slippage)
+            const isExitBuy = trade.direction === 'SHORT';
+            const slippedPrice = applySlippage(price, isExitBuy);
+            const { closedTrade } = await executeFullClose(supabase, trade, slippedPrice, 'max_daily_loss');
             if (closedTrade) closedTrades.push(closedTrade);
           }
         }
@@ -1137,6 +1219,7 @@ async function monitorAndManage(supabase, userId, marketData) {
 module.exports = {
   // Constants
   DEFAULT_CONFIG,
+  CONFIG_VALIDATION,
 
   // Config
   getOrCreateConfig,

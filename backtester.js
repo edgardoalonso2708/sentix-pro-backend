@@ -335,8 +335,10 @@ function simulateTradeExecution(trade, candles, startIndex) {
       maxAdverse = Math.min(maxAdverse, worstCase);
 
       // CONSERVATIVE: Check SL first (if same candle hits both, SL wins)
+      // Gap-through: if low < stopLoss, price gapped through → worse fill
       if (low <= stopLoss) {
-        const exitPrice = stopLoss * (1 - TOTAL_COST); // Slippage + commission on exit
+        const gapFill = low < stopLoss ? (stopLoss + low) / 2 : stopLoss; // Model gap slippage
+        const exitPrice = gapFill * (1 - TOTAL_COST); // Slippage + commission on exit
         const pnl = ((exitPrice - entryPrice) * remainingQty) + partialPnl;
         return {
           exitIndex: i,
@@ -417,9 +419,10 @@ function simulateTradeExecution(trade, candles, startIndex) {
       maxFavorable = Math.max(maxFavorable, bestCase + partialPnl);
       maxAdverse = Math.min(maxAdverse, worstCase);
 
-      // SL (price goes UP)
+      // SL (price goes UP) — gap-through modeling
       if (high >= stopLoss) {
-        const exitPrice = stopLoss * (1 + TOTAL_COST);
+        const gapFill = high > stopLoss ? (stopLoss + high) / 2 : stopLoss;
+        const exitPrice = gapFill * (1 + TOTAL_COST);
         const pnl = ((entryPrice - exitPrice) * remainingQty) + partialPnl;
         return {
           exitIndex: i, exitTimestamp: candle.timestamp, exitPrice,
@@ -589,6 +592,51 @@ function calculateBacktestMetrics(completedTrades, equityCurve, initialCapital, 
     }
   }
 
+  // Sortino ratio — like Sharpe but only penalizes downside deviation
+  let sortinoRatio = 0;
+  if (equityCurve.length >= 3) {
+    const dayMs = 24 * 60 * 60 * 1000;
+    const dailyEquity = [];
+    let lastDay = -1;
+    for (const point of equityCurve) {
+      const dayNum = Math.floor(point.timestamp / dayMs);
+      if (dayNum !== lastDay) { dailyEquity.push(point.equity); lastDay = dayNum; }
+      else { dailyEquity[dailyEquity.length - 1] = point.equity; }
+    }
+    if (dailyEquity.length >= 2) {
+      const dailyReturns = [];
+      for (let i = 1; i < dailyEquity.length; i++) {
+        if (dailyEquity[i - 1] > 0) dailyReturns.push((dailyEquity[i] - dailyEquity[i - 1]) / dailyEquity[i - 1]);
+      }
+      if (dailyReturns.length >= 2) {
+        const riskFreeDaily = Math.pow(1.045, 1 / 365) - 1;
+        const excessReturns = dailyReturns.map(r => r - riskFreeDaily);
+        const avgExcess = excessReturns.reduce((s, r) => s + r, 0) / excessReturns.length;
+        // Downside deviation: only negative excess returns
+        const downsideSquares = excessReturns.filter(r => r < 0).map(r => r * r);
+        const downsideVariance = downsideSquares.length > 0
+          ? downsideSquares.reduce((s, v) => s + v, 0) / downsideSquares.length
+          : 0;
+        const downsideDev = Math.sqrt(downsideVariance);
+        sortinoRatio = downsideDev > 0 ? (avgExcess / downsideDev) * Math.sqrt(365) : 0;
+      }
+    }
+  }
+
+  // Calmar ratio — annualized return / max drawdown
+  const annualizedReturn = days > 0 ? ((totalPnl / initialCapital) * (365 / days)) * 100 : 0;
+  const calmarRatio = maxDrawdownPercent > 0 ? annualizedReturn / maxDrawdownPercent : 0;
+
+  // Expectancy = (avgWin * winRate) - (avgLoss * lossRate)
+  const avgWin = wins.length > 0 ? grossProfit / wins.length : 0;
+  const avgLossAmt = losses.length > 0 ? grossLoss / losses.length : 0;
+  const winRate = completedTrades.length > 0 ? wins.length / completedTrades.length : 0;
+  const lossRate = 1 - winRate;
+  const expectancy = (avgWin * winRate) - (avgLossAmt * lossRate);
+
+  // Statistical significance warning
+  const statisticallySignificant = completedTrades.length >= 30;
+
   // Consecutive wins/losses
   let maxConsWins = 0, maxConsLosses = 0, curWins = 0, curLosses = 0;
   for (const t of completedTrades) {
@@ -603,7 +651,7 @@ function calculateBacktestMetrics(completedTrades, equityCurve, initialCapital, 
     totalTrades: completedTrades.length,
     winCount: wins.length,
     lossCount: losses.length,
-    winRate: Math.round((wins.length / completedTrades.length) * 100),
+    winRate: Math.round(winRate * 100),
     totalPnl: Math.round(totalPnl * 100) / 100,
     totalPnlPercent: Math.round((totalPnl / initialCapital) * 10000) / 100,
     avgProfit: wins.length > 0 ? Math.round((grossProfit / wins.length) * 100) / 100 : 0,
@@ -614,6 +662,10 @@ function calculateBacktestMetrics(completedTrades, equityCurve, initialCapital, 
     maxDrawdownPercent: Math.round(maxDrawdownPercent * 100) / 100,
     profitFactor: grossLoss > 0 ? Math.round((grossProfit / grossLoss) * 100) / 100 : grossProfit > 0 ? Infinity : 0,
     sharpeRatio: Math.round(sharpeRatio * 100) / 100,
+    sortinoRatio: Math.round(sortinoRatio * 100) / 100,
+    calmarRatio: Math.round(calmarRatio * 100) / 100,
+    expectancy: Math.round(expectancy * 100) / 100,
+    statisticallySignificant,
     avgHoldingBars: Math.round(completedTrades.reduce((s, t) => s + t.holdingBars, 0) / completedTrades.length),
     tradesPerMonth: Math.round((completedTrades.length / days) * 30 * 10) / 10,
     maxConsecutiveWins: maxConsWins,
@@ -743,6 +795,10 @@ async function runBacktest(options, onProgress = null) {
   let lastTradeBar = -cooldownBars; // Allow immediate first trade
   let totalSteps = stepPoints.length;
 
+  // Running index pointers for 4h/15m (O(1) per step instead of O(N) .filter())
+  let last4hIndex = 0;
+  let last15mIndex = 0;
+
   if (onProgress) onProgress({ phase: 'running', message: `Analizando ${totalSteps} puntos...`, total: totalSteps, current: 0 });
 
   for (let stepIdx = 0; stepIdx < stepPoints.length; stepIdx++) {
@@ -786,23 +842,38 @@ async function runBacktest(options, onProgress = null) {
       openTrades.splice(tradesToRemove[i], 1);
     }
 
-    // ── Record equity ────────────────────────────────────────────
-    // Include unrealized P&L of open trades
+    // ── Record equity + update open trade MFE/MAE ────────────────
     let unrealizedPnl = 0;
     for (const trade of openTrades) {
+      let tradePnl;
       if (trade.direction === 'LONG') {
-        unrealizedPnl += (currentPrice - trade.entryPrice) * trade.remainingQty;
+        tradePnl = (currentPrice - trade.entryPrice) * trade.remainingQty;
+        unrealizedPnl += tradePnl;
       } else {
-        unrealizedPnl += (trade.entryPrice - currentPrice) * trade.remainingQty;
+        tradePnl = (trade.entryPrice - currentPrice) * trade.remainingQty;
+        unrealizedPnl += tradePnl;
       }
+      // Track MFE/MAE for force-close scenario
+      trade.maxFavorable = Math.max(trade.maxFavorable || 0, Math.max(0, tradePnl));
+      trade.maxAdverse = Math.min(trade.maxAdverse || 0, Math.min(0, tradePnl));
     }
     equityCurve.push({ timestamp: step.timestamp, equity: Math.round((currentCapital + unrealizedPnl) * 100) / 100 });
 
     // ── Generate signal at this step ──────────────────────────────
-    // Build candle windows for each timeframe (up to current step)
+    // Build candle windows for each timeframe (using running pointers for O(1))
     const window1h = candles1h.slice(Math.max(0, step.index - MIN_LOOKBACK['1h']), step.index + 1);
-    const window4h = candles4h.filter(c => c.timestamp <= step.timestamp).slice(-MIN_LOOKBACK['4h']);
-    const window15m = candles15m.filter(c => c.timestamp <= step.timestamp).slice(-MIN_LOOKBACK['15m']);
+
+    // Advance 4h pointer to current step timestamp
+    while (last4hIndex < candles4h.length - 1 && candles4h[last4hIndex + 1].timestamp <= step.timestamp) {
+      last4hIndex++;
+    }
+    const window4h = candles4h.slice(Math.max(0, last4hIndex - MIN_LOOKBACK['4h'] + 1), last4hIndex + 1);
+
+    // Advance 15m pointer to current step timestamp
+    while (last15mIndex < candles15m.length - 1 && candles15m[last15mIndex + 1].timestamp <= step.timestamp) {
+      last15mIndex++;
+    }
+    const window15m = candles15m.slice(Math.max(0, last15mIndex - MIN_LOOKBACK['15m'] + 1), last15mIndex + 1);
 
     if (window1h.length < 50 || window4h.length < 30 || window15m.length < 50) {
       continue; // Not enough data yet
@@ -885,7 +956,9 @@ async function runBacktest(options, onProgress = null) {
         confidence: signal.confidence,
         score: signal.score,
         rawScore: signal.rawScore,
-        confluence: signal.timeframes?.confluence || 'unknown'
+        confluence: signal.timeframes?.confluence || 'unknown',
+        maxFavorable: 0,
+        maxAdverse: 0
       };
 
       openTrades.push(newTrade);
@@ -916,8 +989,8 @@ async function runBacktest(options, onProgress = null) {
       pnl: Math.round(pnl * 100) / 100,
       pnlPercent: Math.round((pnl / trade.positionSizeUsd) * 10000) / 100,
       holdingBars: candles1h.length - 1 - trade.startIndex,
-      maxFavorable: 0,
-      maxAdverse: 0,
+      maxFavorable: Math.round((trade.maxFavorable || 0) * 100) / 100,
+      maxAdverse: Math.round((trade.maxAdverse || 0) * 100) / 100,
       entryTimestamp: candles1h[trade.startIndex].timestamp
     });
     currentCapital += pnl;

@@ -48,19 +48,21 @@ describe('simulateTradeExecution', () => {
 
   describe('LONG trades', () => {
 
-    test('hits stop loss when price drops below SL', () => {
+    test('hits stop loss when price drops below SL (gap-through slippage)', () => {
       const trade = makeTrade({ entryPrice: 100000, stopLoss: 97000 });
       const candles = [
         makeCandle(1000, 100000, 100500, 99500, 100200), // entry candle
         makeCandle(2000, 100200, 100800, 99800, 100300), // normal
-        makeCandle(3000, 100300, 100400, 96500, 96800),  // SL hit
+        makeCandle(3000, 100300, 100400, 96500, 96800),  // SL hit, low gaps through
       ];
 
       const result = simulateTradeExecution(trade, candles, 0);
 
+      // Gap-through: gapFill = (97000 + 96500) / 2 = 96750
+      const gapFill = (97000 + 96500) / 2;
       expect(result.exitReason).toBe('stop_loss');
       expect(result.exitIndex).toBe(2);
-      expect(result.exitPrice).toBeCloseTo(97000 * (1 - TOTAL_COST), 2);
+      expect(result.exitPrice).toBeCloseTo(gapFill * (1 - TOTAL_COST), 2);
       expect(result.pnl).toBeLessThan(0);
       expect(result.holdingBars).toBe(2);
     });
@@ -142,7 +144,7 @@ describe('simulateTradeExecution', () => {
       expect(result.pnl).toBeLessThan(0);
     });
 
-    test('calculates slippage correctly on exit', () => {
+    test('calculates slippage correctly on exit (with gap-through)', () => {
       const trade = makeTrade({ entryPrice: 100000, stopLoss: 97000 });
       const candles = [
         makeCandle(1000, 100000, 100500, 99500, 100200),
@@ -151,8 +153,9 @@ describe('simulateTradeExecution', () => {
 
       const result = simulateTradeExecution(trade, candles, 0);
 
-      // LONG SL exit: price * (1 - TOTAL_COST) = 97000 * 0.998
-      expect(result.exitPrice).toBeCloseTo(97000 * (1 - TOTAL_COST), 2);
+      // Gap-through: gapFill = (97000 + 96500) / 2 = 96750, then * (1 - TOTAL_COST)
+      const gapFill = (97000 + 96500) / 2;
+      expect(result.exitPrice).toBeCloseTo(gapFill * (1 - TOTAL_COST), 2);
     });
   });
 
@@ -160,7 +163,7 @@ describe('simulateTradeExecution', () => {
 
   describe('SHORT trades', () => {
 
-    test('hits stop loss when price rises above SL', () => {
+    test('hits stop loss when price rises above SL (gap-through slippage)', () => {
       const trade = makeTrade({
         direction: 'SHORT',
         entryPrice: 100000, stopLoss: 103000,
@@ -169,13 +172,15 @@ describe('simulateTradeExecution', () => {
       });
       const candles = [
         makeCandle(1000, 100000, 100500, 99500, 99800),
-        makeCandle(2000, 99800, 103500, 99700, 103200), // SL hit (high >= 103000)
+        makeCandle(2000, 99800, 103500, 99700, 103200), // SL hit (high >= 103000), gaps through
       ];
 
       const result = simulateTradeExecution(trade, candles, 0);
 
+      // Gap-through: gapFill = (103000 + 103500) / 2 = 103250
+      const gapFill = (103000 + 103500) / 2;
       expect(result.exitReason).toBe('stop_loss');
-      expect(result.exitPrice).toBeCloseTo(103000 * (1 + TOTAL_COST), 2);
+      expect(result.exitPrice).toBeCloseTo(gapFill * (1 + TOTAL_COST), 2);
       expect(result.pnl).toBeLessThan(0);
     });
 

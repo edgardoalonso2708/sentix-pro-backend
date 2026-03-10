@@ -1,5 +1,25 @@
 // Test data fetching functions by requiring server with mocked dependencies
-jest.mock('axios');
+jest.mock('axios', () => {
+  const mockAxiosInstance = {
+    get: jest.fn().mockResolvedValue({ data: {} }),
+    post: jest.fn().mockResolvedValue({ data: {} }),
+    interceptors: {
+      request: { use: jest.fn() },
+      response: { use: jest.fn() },
+    },
+  };
+  return {
+    __esModule: true,
+    default: {
+      get: jest.fn().mockResolvedValue({ data: {} }),
+      post: jest.fn().mockResolvedValue({ data: {} }),
+      create: jest.fn(() => mockAxiosInstance),
+    },
+    get: jest.fn().mockResolvedValue({ data: {} }),
+    post: jest.fn().mockResolvedValue({ data: {} }),
+    create: jest.fn(() => mockAxiosInstance),
+  };
+});
 jest.mock('@supabase/supabase-js', () => ({
   createClient: jest.fn(() => ({
     from: jest.fn(() => ({
