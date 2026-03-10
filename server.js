@@ -72,12 +72,19 @@ const allowedOrigins = [
   'http://localhost:3001',
 ].filter(Boolean);
 
+// Vercel preview/production domains (*.vercel.app)
+const VERCEL_ORIGIN_RE = /^https:\/\/[\w-]+\.vercel\.app$/;
+
 app.use(cors({
   origin: (origin, callback) => {
     // Allow requests with no origin (mobile apps, server-to-server, curl)
-    if (!origin || allowedOrigins.some(o => origin.startsWith(o))) {
-      callback(null, true);
-    } else if (process.env.NODE_ENV === 'production') {
+    if (!origin) return callback(null, true);
+    // Allow exact matches (FRONTEND_URL, localhost)
+    if (allowedOrigins.some(o => origin.startsWith(o))) return callback(null, true);
+    // Allow any Vercel deployment (preview URLs, production)
+    if (VERCEL_ORIGIN_RE.test(origin)) return callback(null, true);
+    // Production: reject unknown origins
+    if (process.env.NODE_ENV === 'production') {
       logger.warn('CORS: rejected unknown origin', { origin });
       callback(new Error('CORS not allowed'), false);
     } else {
