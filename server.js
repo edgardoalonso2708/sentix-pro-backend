@@ -13,7 +13,7 @@ const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
 const { SilentTelegramBot, setupTelegramCommands } = require('./telegramBot');
 const { fetchMetalsPricesSafe } = require('./metalsAPI');
-const { generateSignalWithRealData, generateMultiTimeframeSignal } = require('./technicalAnalysis');
+const { generateSignalWithRealData, generateMultiTimeframeSignal, fetchOHLCVCandles } = require('./technicalAnalysis');
 const { fetchDerivativesData, fetchOrderBookDepth } = require('./binanceAPI');
 const {
   upload,
@@ -56,7 +56,8 @@ const {
   getTradeHistory,
   getOpenPositions,
   executeFullClose,
-  resolveCurrentPrice
+  resolveCurrentPrice,
+  getPositionCorrelations
 } = require('./paperTrading');
 const { runBacktest } = require('./backtester');
 const { startOptimizationJob, getJobStatus, getAllJobs, PARAM_RANGES } = require('./optimizer');
@@ -2099,6 +2100,23 @@ app.get('/api/paper/performance/:userId', async (req, res) => {
     res.json({ metrics });
   } catch (error) {
     logger.error('Paper performance fetch failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Position correlation analysis
+app.get('/api/paper/correlation/:userId', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+    const { positions, error: posError } = await getOpenPositions(supabase, userId, cachedMarketData);
+    if (posError) return res.status(500).json({ error: posError.message || 'Failed to get positions' });
+    const correlation = await getPositionCorrelations(fetchOHLCVCandles, positions);
+    res.json({ correlation });
+  } catch (error) {
+    logger.error('Paper correlation fetch failed', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });

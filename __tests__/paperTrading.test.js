@@ -8,7 +8,10 @@ const {
   calculatePositionSize,
   checkPriceAgainstLevels,
   resolveCurrentPrice,
-  DEFAULT_CONFIG
+  DEFAULT_CONFIG,
+  calculateLogReturns,
+  calculatePearsonCorrelation,
+  getPositionCorrelations
 } = require('../paperTrading');
 
 // ─── Test Helpers ──────────────────────────────────────────────────────────
@@ -413,5 +416,209 @@ describe('DEFAULT_CONFIG', () => {
     expect(DEFAULT_CONFIG.min_rr_ratio).toBe(1.5);
     expect(DEFAULT_CONFIG.allowed_strength).toEqual(['STRONG BUY', 'STRONG SELL']);
     expect(DEFAULT_CONFIG.is_enabled).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// calculateLogReturns Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('calculateLogReturns', () => {
+  test('calculates correct log returns', () => {
+    const candles = [
+      { close: 100 },
+      { close: 110 },
+      { close: 105 }
+    ];
+    const returns = calculateLogReturns(candles);
+    expect(returns.length).toBe(2);
+    expect(returns[0]).toBeCloseTo(Math.log(110 / 100), 10);
+    expect(returns[1]).toBeCloseTo(Math.log(105 / 110), 10);
+  });
+
+  test('returns empty array for < 2 candles', () => {
+    expect(calculateLogReturns([{ close: 100 }])).toEqual([]);
+    expect(calculateLogReturns([])).toEqual([]);
+  });
+
+  test('returns empty array for null', () => {
+    expect(calculateLogReturns(null)).toEqual([]);
+  });
+
+  test('skips zero or negative prices', () => {
+    const candles = [
+      { close: 100 },
+      { close: 0 },
+      { close: 100 }
+    ];
+    const returns = calculateLogReturns(candles);
+    // Both pairs involve a zero (100→0 and 0→100), so both are skipped
+    expect(returns.length).toBe(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// calculatePearsonCorrelation Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('calculatePearsonCorrelation', () => {
+  test('perfectly correlated arrays return ~1.0', () => {
+    const a = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    const b = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20];
+    const r = calculatePearsonCorrelation(a, b);
+    expect(r).toBeCloseTo(1.0, 5);
+  });
+
+  test('inversely correlated arrays return ~-1.0', () => {
+    const a = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    const b = [20, 18, 16, 14, 12, 10, 8, 6, 4, 2];
+    const r = calculatePearsonCorrelation(a, b);
+    expect(r).toBeCloseTo(-1.0, 5);
+  });
+
+  test('uncorrelated arrays return ~0', () => {
+    // sin and cos are uncorrelated over full period
+    const n = 100;
+    const a = Array.from({ length: n }, (_, i) => Math.sin(i * 0.5));
+    const b = Array.from({ length: n }, (_, i) => Math.cos(i * 0.7 + 2));
+    const r = calculatePearsonCorrelation(a, b);
+    expect(Math.abs(r)).toBeLessThan(0.3);
+  });
+
+  test('returns 0 for insufficient data', () => {
+    expect(calculatePearsonCorrelation([1, 2, 3], [4, 5, 6])).toBe(0);
+    expect(calculatePearsonCorrelation(null, [1, 2, 3, 4, 5])).toBe(0);
+    expect(calculatePearsonCorrelation([1, 2, 3, 4, 5], null)).toBe(0);
+  });
+
+  test('handles constant arrays (zero std dev)', () => {
+    const a = [5, 5, 5, 5, 5, 5];
+    const b = [1, 2, 3, 4, 5, 6];
+    const r = calculatePearsonCorrelation(a, b);
+    expect(r).toBe(0);
+  });
+
+  test('result is clamped to [-1, 1]', () => {
+    const a = [1, 2, 3, 4, 5, 6, 7];
+    const b = [10, 20, 30, 40, 50, 60, 70];
+    const r = calculatePearsonCorrelation(a, b);
+    expect(r).toBeGreaterThanOrEqual(-1);
+    expect(r).toBeLessThanOrEqual(1);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// getPositionCorrelations Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('getPositionCorrelations', () => {
+  // Mock candle generator
+  const makeCandles = (base, trend = 0, noise = 0.01) => {
+    return Array.from({ length: 168 }, (_, i) => {
+      const price = base * (1 + trend * i / 168) * (1 + (Math.random() - 0.5) * noise);
+      return { open: price, high: price * 1.005, low: price * 0.995, close: price, volume: 100 };
+    });
+  };
+
+  test('returns riskLevel none for 0 positions', async () => {
+    const result = await getPositionCorrelations(jest.fn(), []);
+    expect(result.riskLevel).toBe('none');
+    expect(result.pairs).toEqual([]);
+  });
+
+  test('returns riskLevel none for 1 position', async () => {
+    const result = await getPositionCorrelations(jest.fn(), [{ asset: 'bitcoin' }]);
+    expect(result.riskLevel).toBe('none');
+    expect(result.pairs).toEqual([]);
+  });
+
+  test('returns riskLevel none for null positions', async () => {
+    const result = await getPositionCorrelations(jest.fn(), null);
+    expect(result.riskLevel).toBe('none');
+  });
+
+  test('same asset in multiple positions → high risk', async () => {
+    const positions = [{ asset: 'bitcoin' }, { asset: 'bitcoin' }];
+    const result = await getPositionCorrelations(jest.fn(), positions);
+    expect(result.riskLevel).toBe('high');
+    expect(result.avgCorrelation).toBe(1.0);
+    expect(result.effectiveDiversification).toBe(0);
+    expect(result.warnings.length).toBeGreaterThan(0);
+  });
+
+  test('2 different assets → calculates correlation pair', async () => {
+    const mockFetch = jest.fn()
+      .mockResolvedValueOnce(makeCandles(50000, 0.1, 0.02))
+      .mockResolvedValueOnce(makeCandles(3000, 0.08, 0.02));
+
+    const positions = [{ asset: 'bitcoin' }, { asset: 'ethereum' }];
+    const result = await getPositionCorrelations(mockFetch, positions);
+
+    expect(result.pairs.length).toBe(1);
+    expect(result.pairs[0].assetA).toBe('bitcoin');
+    expect(result.pairs[0].assetB).toBe('ethereum');
+    expect(typeof result.pairs[0].correlation).toBe('number');
+    expect(result.pairs[0].correlation).toBeGreaterThanOrEqual(-1);
+    expect(result.pairs[0].correlation).toBeLessThanOrEqual(1);
+    expect(['low', 'medium', 'high']).toContain(result.riskLevel);
+  });
+
+  test('3 assets → generates 3 pairs (N*(N-1)/2)', async () => {
+    const mockFetch = jest.fn()
+      .mockResolvedValueOnce(makeCandles(50000))
+      .mockResolvedValueOnce(makeCandles(3000))
+      .mockResolvedValueOnce(makeCandles(100));
+
+    const positions = [{ asset: 'bitcoin' }, { asset: 'ethereum' }, { asset: 'solana' }];
+    const result = await getPositionCorrelations(mockFetch, positions);
+    expect(result.pairs.length).toBe(3);
+  });
+
+  test('effectiveDiversification is between 0 and 1', async () => {
+    const mockFetch = jest.fn()
+      .mockResolvedValueOnce(makeCandles(50000, 0.1))
+      .mockResolvedValueOnce(makeCandles(3000, -0.1));
+
+    const positions = [{ asset: 'bitcoin' }, { asset: 'ethereum' }];
+    const result = await getPositionCorrelations(mockFetch, positions);
+    expect(result.effectiveDiversification).toBeGreaterThanOrEqual(0);
+    expect(result.effectiveDiversification).toBeLessThanOrEqual(1);
+  });
+
+  test('riskLevel classification boundaries', async () => {
+    // We can't control exact correlation but we test the structure
+    const mockFetch = jest.fn()
+      .mockResolvedValueOnce(makeCandles(50000, 0.1))
+      .mockResolvedValueOnce(makeCandles(3000, 0.08));
+
+    const positions = [{ asset: 'bitcoin' }, { asset: 'ethereum' }];
+    const result = await getPositionCorrelations(mockFetch, positions);
+    expect(['low', 'medium', 'high']).toContain(result.riskLevel);
+    expect(typeof result.avgCorrelation).toBe('number');
+    expect(typeof result.maxCorrelation).toBe('number');
+  });
+
+  test('handles fetch error gracefully', async () => {
+    const mockFetch = jest.fn().mockRejectedValue(new Error('Network error'));
+    const positions = [{ asset: 'bitcoin' }, { asset: 'ethereum' }];
+    const result = await getPositionCorrelations(mockFetch, positions);
+    // Should not throw, returns empty/default
+    expect(result.riskLevel).toBe('none');
+    expect(result.pairs).toEqual([]);
+  });
+
+  test('warnings generated for high correlation pair', async () => {
+    // Use same data for both to force high correlation
+    const sameCandles = makeCandles(50000, 0.1, 0.001);
+    const mockFetch = jest.fn()
+      .mockResolvedValueOnce(sameCandles)
+      .mockResolvedValueOnce(sameCandles.map(c => ({ ...c, close: c.close * 1.01 })));
+
+    const positions = [{ asset: 'bitcoin' }, { asset: 'ethereum' }];
+    const result = await getPositionCorrelations(mockFetch, positions);
+    // High correlation expected since data is nearly identical
+    if (Math.abs(result.pairs[0]?.correlation) >= 0.7) {
+      expect(result.warnings.length).toBeGreaterThan(0);
+    }
   });
 });

@@ -1093,6 +1093,174 @@ async function getOpenPositions(supabase, userId, marketData = null) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// POSITION CORRELATION ANALYSIS
+// Pearson correlation between open position price returns
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Calculate log returns from OHLCV candles
+ * @param {Array} candles - [{close, ...}]
+ * @returns {number[]} log returns
+ */
+function calculateLogReturns(candles) {
+  if (!candles || candles.length < 2) return [];
+  const returns = [];
+  for (let i = 1; i < candles.length; i++) {
+    const prev = candles[i - 1].close;
+    const curr = candles[i].close;
+    if (prev > 0 && curr > 0) {
+      returns.push(Math.log(curr / prev));
+    }
+  }
+  return returns;
+}
+
+/**
+ * Calculate Pearson correlation coefficient between two arrays
+ * @param {number[]} arrA
+ * @param {number[]} arrB
+ * @returns {number} correlation [-1, 1], or 0 if insufficient data
+ */
+function calculatePearsonCorrelation(arrA, arrB) {
+  if (!arrA || !arrB || arrA.length < 5 || arrB.length < 5) return 0;
+  const n = Math.min(arrA.length, arrB.length);
+  const a = arrA.slice(0, n);
+  const b = arrB.slice(0, n);
+
+  const meanA = a.reduce((s, v) => s + v, 0) / n;
+  const meanB = b.reduce((s, v) => s + v, 0) / n;
+
+  let sumAB = 0, sumA2 = 0, sumB2 = 0;
+  for (let i = 0; i < n; i++) {
+    const dA = a[i] - meanA;
+    const dB = b[i] - meanB;
+    sumAB += dA * dB;
+    sumA2 += dA * dA;
+    sumB2 += dB * dB;
+  }
+
+  const denom = Math.sqrt(sumA2 * sumB2);
+  if (denom === 0) return 0;
+  return Math.max(-1, Math.min(1, sumAB / denom));
+}
+
+/**
+ * Analyze correlations between open positions using historical price returns
+ * @param {Function} fetchCandles - (coinId, interval, limit) → candles[] (injectable for testing)
+ * @param {Array} positions - open positions with .asset field
+ * @returns {Object} correlation analysis
+ */
+async function getPositionCorrelations(fetchCandles, positions) {
+  const empty = {
+    pairs: [],
+    riskLevel: 'none',
+    avgCorrelation: 0,
+    maxCorrelation: 0,
+    effectiveDiversification: 1,
+    warnings: [],
+    assetCount: positions ? positions.length : 0
+  };
+
+  if (!positions || positions.length <= 1) return empty;
+
+  // Get unique assets
+  const uniqueAssets = [...new Set(positions.map(p => p.asset))];
+  if (uniqueAssets.length <= 1) {
+    // All positions in same asset → perfect correlation
+    return {
+      pairs: [{ assetA: uniqueAssets[0], assetB: uniqueAssets[0], correlation: 1.0, level: 'high' }],
+      riskLevel: 'high',
+      avgCorrelation: 1.0,
+      maxCorrelation: 1.0,
+      effectiveDiversification: 0,
+      warnings: [`All ${positions.length} positions are in ${uniqueAssets[0]} — no diversification`],
+      assetCount: positions.length
+    };
+  }
+
+  // Fetch 7 days of 1h candles for each unique asset
+  const candleMap = {};
+  for (const asset of uniqueAssets) {
+    try {
+      const candles = await fetchCandles(asset, '1h', 168);
+      if (candles && candles.length >= 10) {
+        candleMap[asset] = candles;
+      }
+    } catch (err) {
+      // Skip asset if fetch fails
+      logger.warn('Correlation: failed to fetch candles', { asset, error: err.message });
+    }
+  }
+
+  // Need at least 2 assets with data
+  const assetsWithData = Object.keys(candleMap);
+  if (assetsWithData.length < 2) return empty;
+
+  // Calculate log returns for each asset
+  const returnsMap = {};
+  for (const asset of assetsWithData) {
+    returnsMap[asset] = calculateLogReturns(candleMap[asset]);
+  }
+
+  // Calculate pairwise correlations
+  const pairs = [];
+  for (let i = 0; i < assetsWithData.length; i++) {
+    for (let j = i + 1; j < assetsWithData.length; j++) {
+      const assetA = assetsWithData[i];
+      const assetB = assetsWithData[j];
+      const corr = calculatePearsonCorrelation(returnsMap[assetA], returnsMap[assetB]);
+      const absCorr = Math.abs(corr);
+
+      let level = 'low';
+      if (absCorr >= 0.75) level = 'high';
+      else if (absCorr >= 0.5) level = 'medium';
+
+      pairs.push({
+        assetA,
+        assetB,
+        correlation: +corr.toFixed(4),
+        level
+      });
+    }
+  }
+
+  // Aggregate metrics
+  const absCorrelations = pairs.map(p => Math.abs(p.correlation));
+  const avgCorrelation = absCorrelations.length > 0
+    ? +(absCorrelations.reduce((s, v) => s + v, 0) / absCorrelations.length).toFixed(4)
+    : 0;
+  const maxCorrelation = absCorrelations.length > 0
+    ? +Math.max(...absCorrelations).toFixed(4)
+    : 0;
+
+  let riskLevel = 'low';
+  if (avgCorrelation >= 0.75) riskLevel = 'high';
+  else if (avgCorrelation >= 0.5) riskLevel = 'medium';
+
+  const effectiveDiversification = +(1 - avgCorrelation).toFixed(4);
+
+  // Generate warnings
+  const warnings = [];
+  for (const pair of pairs) {
+    if (Math.abs(pair.correlation) >= 0.7) {
+      warnings.push(
+        `${pair.assetA} ↔ ${pair.assetB}: correlation ${pair.correlation} — ${pair.correlation > 0 ? 'move together' : 'move opposite'}`
+      );
+    }
+  }
+
+  return {
+    pairs,
+    riskLevel,
+    avgCorrelation,
+    maxCorrelation,
+    effectiveDiversification,
+    warnings,
+    assetCount: positions.length
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // ORCHESTRATION (called from server.js)
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1253,6 +1421,11 @@ module.exports = {
   getPerformanceMetrics,
   getTradeHistory,
   getOpenPositions,
+
+  // Correlation
+  calculateLogReturns,
+  calculatePearsonCorrelation,
+  getPositionCorrelations,
 
   // Orchestration
   evaluateAndExecute,
