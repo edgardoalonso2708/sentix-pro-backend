@@ -298,6 +298,27 @@ const PARAM_RANGES = {
 };
 
 /**
+ * Schedule & TTL configuration — operational parameters (not signal scoring).
+ * Controls trading hours filtering and signal freshness/decay.
+ */
+const SCHEDULE_CONFIG = {
+  // ─── Trading Hours (local timezone) ──────────────────────────────
+  tradingHoursEnabled: false,        // false = 24/7 (default), true = filter active
+  tradingHoursStart: 8,              // Start hour (0-23) in local time
+  tradingHoursEnd: 22,               // End hour (0-23) in local time
+  tradingDays: [1, 2, 3, 4, 5],     // Days of week (0=Sun, 1=Mon, ..., 6=Sat)
+  timezone: 'America/Mexico_City',   // IANA timezone for hour calculation
+  offHoursConfidenceReduction: 15,   // Reduce confidence by this when off-hours
+
+  // ─── Signal TTL / Decay ──────────────────────────────────────────
+  signalTTLMinutes: 15,              // Minutes until signal considered expired
+  signalFreshMinutes: 5,             // Minutes signal is considered "fresh"
+  signalAgingMinutes: 10,            // Minutes until signal transitions to "stale"
+};
+
+Object.freeze(SCHEDULE_CONFIG);
+
+/**
  * Merge user config with defaults (user values override defaults)
  */
 function mergeConfig(userConfig = {}) {
@@ -314,5 +335,6 @@ function mergeConfig(userConfig = {}) {
 module.exports = {
   DEFAULT_STRATEGY_CONFIG,
   PARAM_RANGES,
+  SCHEDULE_CONFIG,
   mergeConfig
 };

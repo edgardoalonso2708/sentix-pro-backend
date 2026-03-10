@@ -1,6 +1,7 @@
 const {
   DEFAULT_STRATEGY_CONFIG,
   PARAM_RANGES,
+  SCHEDULE_CONFIG,
   mergeConfig
 } = require('../strategyConfig');
 
@@ -317,5 +318,59 @@ describe('PARAM_RANGES', () => {
 
   test.each(paramNames)('%s description is non-empty', (paramName) => {
     expect(PARAM_RANGES[paramName].description.length).toBeGreaterThan(0);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SCHEDULE_CONFIG Validation Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('SCHEDULE_CONFIG', () => {
+  test('has all required keys', () => {
+    const keys = [
+      'tradingHoursEnabled', 'tradingHoursStart', 'tradingHoursEnd',
+      'tradingDays', 'timezone', 'offHoursConfidenceReduction',
+      'signalTTLMinutes', 'signalFreshMinutes', 'signalAgingMinutes'
+    ];
+    keys.forEach(k => {
+      expect(SCHEDULE_CONFIG).toHaveProperty(k);
+    });
+  });
+
+  test('trading hours are within 0-23', () => {
+    expect(SCHEDULE_CONFIG.tradingHoursStart).toBeGreaterThanOrEqual(0);
+    expect(SCHEDULE_CONFIG.tradingHoursStart).toBeLessThanOrEqual(23);
+    expect(SCHEDULE_CONFIG.tradingHoursEnd).toBeGreaterThanOrEqual(0);
+    expect(SCHEDULE_CONFIG.tradingHoursEnd).toBeLessThanOrEqual(23);
+  });
+
+  test('tradingDays is array of valid day numbers (0-6)', () => {
+    expect(Array.isArray(SCHEDULE_CONFIG.tradingDays)).toBe(true);
+    expect(SCHEDULE_CONFIG.tradingDays.length).toBeGreaterThan(0);
+    SCHEDULE_CONFIG.tradingDays.forEach(d => {
+      expect(d).toBeGreaterThanOrEqual(0);
+      expect(d).toBeLessThanOrEqual(6);
+    });
+  });
+
+  test('TTL values are positive and ordered (fresh < aging <= TTL)', () => {
+    expect(SCHEDULE_CONFIG.signalFreshMinutes).toBeGreaterThan(0);
+    expect(SCHEDULE_CONFIG.signalAgingMinutes).toBeGreaterThan(0);
+    expect(SCHEDULE_CONFIG.signalTTLMinutes).toBeGreaterThan(0);
+    expect(SCHEDULE_CONFIG.signalFreshMinutes).toBeLessThan(SCHEDULE_CONFIG.signalAgingMinutes);
+    expect(SCHEDULE_CONFIG.signalAgingMinutes).toBeLessThanOrEqual(SCHEDULE_CONFIG.signalTTLMinutes);
+  });
+
+  test('offHoursConfidenceReduction is positive', () => {
+    expect(SCHEDULE_CONFIG.offHoursConfidenceReduction).toBeGreaterThan(0);
+  });
+
+  test('timezone is a valid string', () => {
+    expect(typeof SCHEDULE_CONFIG.timezone).toBe('string');
+    expect(SCHEDULE_CONFIG.timezone.length).toBeGreaterThan(0);
+  });
+
+  test('is frozen (immutable)', () => {
+    expect(Object.isFrozen(SCHEDULE_CONFIG)).toBe(true);
   });
 });

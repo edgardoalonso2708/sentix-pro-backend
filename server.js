@@ -61,7 +61,8 @@ const {
 } = require('./paperTrading');
 const { runBacktest } = require('./backtester');
 const { startOptimizationJob, getJobStatus, getAllJobs, PARAM_RANGES } = require('./optimizer');
-const { DEFAULT_STRATEGY_CONFIG } = require('./strategyConfig');
+const { DEFAULT_STRATEGY_CONFIG, SCHEDULE_CONFIG } = require('./strategyConfig');
+const { isWithinTradingHours, enrichSignalWithTTL } = require('./scheduleUtils');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -721,6 +722,18 @@ async function generateSignals() {
     }
   }
 
+  // Mark off-hours signals (reduced confidence, tagged for frontend display)
+  const tradingHours = isWithinTradingHours(SCHEDULE_CONFIG);
+  if (!tradingHours.active) {
+    const reduction = SCHEDULE_CONFIG.offHoursConfidenceReduction || 15;
+    allSignals.forEach(s => {
+      s.offHours = true;
+      s.offHoursReason = tradingHours.reason;
+      s.confidence = Math.max(0, s.confidence - reduction);
+    });
+    logger.info('Off-hours signals marked', { reason: tradingHours.reason, reduction });
+  }
+
   // Sort by confidence (highest first), then by action priority (BUY/SELL before HOLD)
   cachedSignals = allSignals.sort((a, b) => {
     const actionPriority = { BUY: 2, SELL: 2, HOLD: 0 };
@@ -1161,20 +1174,20 @@ app.get('/api/market', (req, res) => {
 });
 
 app.get('/api/signals', async (req, res) => {
-  // Return in-memory signals if available
-  if (cachedSignals.length > 0) {
-    return res.json(cachedSignals);
-  }
+  let signals = cachedSignals;
 
   // Fallback: load from database if in-memory is empty (e.g. after restart)
-  const persisted = await loadPersistedSignals();
-  if (persisted.length > 0) {
-    cachedSignals = persisted;
-    return res.json(persisted);
+  if (signals.length === 0) {
+    const persisted = await loadPersistedSignals();
+    if (persisted.length > 0) {
+      cachedSignals = persisted;
+      signals = persisted;
+    }
   }
 
-  // No signals available yet
-  res.json([]);
+  // Enrich with TTL/freshness metadata on every request
+  const enriched = signals.map(s => enrichSignalWithTTL(s, SCHEDULE_CONFIG));
+  res.json(enriched);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
