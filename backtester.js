@@ -26,6 +26,11 @@ const MIN_LOOKBACK = {
   '4h': 100    // ~17 days of 4h
 };
 
+// Macro data cache (avoids re-fetch during optimizer grid iterations)
+let _btcDomCache = { data: [], expiry: 0 };
+let _dxyCache = { data: [], expiry: 0 };
+const MACRO_CACHE_TTL = 10 * 60 * 1000; // 10 min
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // HISTORICAL DATA FETCHING
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -254,6 +259,152 @@ async function fetchHistoricalFundingRate(asset, startMs, endMs) {
     return allRates;
   } catch (err) {
     logger.warn('Failed to fetch historical funding rates', { asset, error: err.message });
+    return [];
+  }
+}
+
+/**
+ * Fetch historical BTC dominance using "Anchor + Drift" model.
+ * Gets current BTC dominance from CoinGecko /global, then uses historical
+ * BTC market cap to estimate past dominance with dampened drift.
+ * @param {number} days - Number of days of history
+ * @returns {Promise<Array>} Array of { timestamp, btcDom, btcMcap } sorted ascending
+ */
+async function fetchHistoricalBtcDominance(days) {
+  // Check cache first
+  if (_btcDomCache.data.length > 0 && Date.now() < _btcDomCache.expiry) {
+    logger.debug('Using cached BTC dominance data', { points: _btcDomCache.data.length });
+    return _btcDomCache.data;
+  }
+
+  try {
+    // Step 1: Get current BTC dominance
+    const globalRes = await axios.get('https://api.coingecko.com/api/v3/global', { timeout: 15000 });
+    const currentDom = globalRes.data?.data?.market_cap_percentage?.btc;
+    if (!currentDom || typeof currentDom !== 'number') {
+      logger.warn('CoinGecko /global returned no BTC dominance');
+      return [];
+    }
+
+    // Rate limit courtesy before next CoinGecko call
+    await new Promise(r => setTimeout(r, 1500));
+
+    // Step 2: Get historical BTC market cap
+    const mcapRes = await axios.get('https://api.coingecko.com/api/v3/coins/bitcoin/market_chart', {
+      params: { vs_currency: 'usd', days: Math.min(days, 365) },
+      timeout: 15000
+    });
+
+    const mcaps = mcapRes.data?.market_caps;
+    if (!Array.isArray(mcaps) || mcaps.length < 2) {
+      logger.warn('CoinGecko market_chart returned insufficient data');
+      return [];
+    }
+
+    // Step 3: Anchor + Drift — estimate historical dominance
+    // currentMcap is the latest market cap point
+    const currentMcap = mcaps[mcaps.length - 1][1];
+    const DAMPENING = 0.3; // Total market moves in same direction as BTC
+
+    const points = mcaps.map(([ts, mcap]) => {
+      const mcapRatio = mcap / currentMcap;
+      // btcDom drifts proportionally (dampened) to how much BTC mcap changed
+      let btcDom = currentDom * (1 + DAMPENING * (mcapRatio - 1));
+      btcDom = Math.max(30, Math.min(75, btcDom)); // Clamp to realistic range
+      return {
+        timestamp: ts,
+        btcDom: parseFloat(btcDom.toFixed(2)),
+        btcMcap: mcap
+      };
+    }).sort((a, b) => a.timestamp - b.timestamp);
+
+    logger.info('Historical BTC dominance estimated (Anchor+Drift)', {
+      points: points.length,
+      currentDom: currentDom.toFixed(2),
+      from: new Date(points[0].timestamp).toISOString().slice(0, 10),
+      to: new Date(points[points.length - 1].timestamp).toISOString().slice(0, 10)
+    });
+
+    // Cache for optimizer
+    _btcDomCache = { data: points, expiry: Date.now() + MACRO_CACHE_TTL };
+    return points;
+  } catch (err) {
+    logger.warn('Failed to fetch historical BTC dominance', { error: err.message });
+    return [];
+  }
+}
+
+/**
+ * Fetch historical DXY proxy using EUR/USD from Frankfurter API (ECB data).
+ * Uses same formula as live: dxy = (1 / eurUsd) * 120
+ * @param {number} days - Number of days of history
+ * @returns {Promise<Array>} Array of { timestamp, dxy, dxyTrend, dxyChange } sorted ascending
+ */
+async function fetchHistoricalDXY(days) {
+  // Check cache first
+  if (_dxyCache.data.length > 0 && Date.now() < _dxyCache.expiry) {
+    logger.debug('Using cached DXY data', { points: _dxyCache.data.length });
+    return _dxyCache.data;
+  }
+
+  try {
+    const endDate = new Date();
+    const startDate = new Date(Date.now() - (days * 24 * 60 * 60 * 1000));
+    const startStr = startDate.toISOString().slice(0, 10);
+    const endStr = endDate.toISOString().slice(0, 10);
+
+    const res = await axios.get(`https://api.frankfurter.app/${startStr}..${endStr}`, {
+      params: { from: 'USD', to: 'EUR' },
+      timeout: 15000
+    });
+
+    const rates = res.data?.rates;
+    if (!rates || typeof rates !== 'object') {
+      logger.warn('Frankfurter API returned no rates');
+      return [];
+    }
+
+    // Convert daily EUR/USD rates to DXY proxy points
+    const entries = Object.entries(rates).sort(([a], [b]) => a.localeCompare(b));
+    const points = [];
+
+    for (let i = 0; i < entries.length; i++) {
+      const [dateStr, rateObj] = entries[i];
+      const eurRate = rateObj.EUR;
+      if (!eurRate || eurRate <= 0) continue;
+
+      // Same formula as server.js: dxy = (1 / eurUsd) * 120
+      // eurRate here is EUR per 1 USD, so dxy = eurRate * 120
+      const dxy = parseFloat((eurRate * 120).toFixed(2));
+      const ts = new Date(dateStr + 'T12:00:00Z').getTime(); // Noon UTC
+
+      // Compute trend vs previous day
+      let dxyTrend = 'stable';
+      let dxyChange = 0;
+      if (i > 0) {
+        const prevEur = entries[i - 1][1].EUR;
+        if (prevEur && prevEur > 0) {
+          const prevDxy = prevEur * 120;
+          dxyChange = parseFloat(((dxy - prevDxy) / prevDxy * 100).toFixed(3));
+          if (dxyChange > 0.05) dxyTrend = 'rising';
+          else if (dxyChange < -0.05) dxyTrend = 'falling';
+        }
+      }
+
+      points.push({ timestamp: ts, dxy, dxyTrend, dxyChange });
+    }
+
+    logger.info('Historical DXY proxy fetched (EUR/USD via Frankfurter)', {
+      points: points.length,
+      from: points.length > 0 ? new Date(points[0].timestamp).toISOString().slice(0, 10) : 'N/A',
+      to: points.length > 0 ? new Date(points[points.length - 1].timestamp).toISOString().slice(0, 10) : 'N/A'
+    });
+
+    // Cache for optimizer
+    _dxyCache = { data: points, expiry: Date.now() + MACRO_CACHE_TTL };
+    return points;
+  } catch (err) {
+    logger.warn('Failed to fetch historical DXY', { error: err.message });
     return [];
   }
 }
@@ -731,24 +882,34 @@ async function runBacktest(options, onProgress = null) {
     '15m': candles15m.length
   });
 
-  // ─── 1b. Fetch historical context data (Fear & Greed, Funding Rates) ──
-  if (onProgress) onProgress({ phase: 'fetching', message: 'Descargando datos de contexto (F&G, funding)...' });
+  // ─── 1b. Fetch historical context data (F&G, Funding, BTC Dom, DXY) ──
+  if (onProgress) onProgress({ phase: 'fetching', message: 'Descargando datos de contexto (F&G, funding, BTC dom, DXY)...' });
 
-  const [historicalFG, historicalFunding] = await Promise.allSettled([
+  // Phase 1: Parallel fetch (different APIs, no rate-limit conflict)
+  const [historicalFG, historicalFunding, historicalDXY] = await Promise.allSettled([
     fetchHistoricalFearGreed(days + 10),
-    fetchHistoricalFundingRate(asset, Date.now() - ((days + 10) * 24 * 60 * 60 * 1000), Date.now())
+    fetchHistoricalFundingRate(asset, Date.now() - ((days + 10) * 24 * 60 * 60 * 1000), Date.now()),
+    fetchHistoricalDXY(days + 10)  // Frankfurter API (not CoinGecko)
   ]);
+
+  // Phase 2: CoinGecko sequential (rate limit protection — shares limit with candle fetches)
+  const btcDomData = await fetchHistoricalBtcDominance(days + 10);
 
   const fgData = historicalFG.status === 'fulfilled' ? historicalFG.value : [];
   const fundingData = historicalFunding.status === 'fulfilled' ? historicalFunding.value : [];
+  const dxyData = historicalDXY.status === 'fulfilled' ? historicalDXY.value : [];
 
   const hasFearGreed = fgData.length > 0;
   const hasFunding = fundingData.length > 0;
+  const hasBtcDom = btcDomData.length > 0;
+  const hasDXY = dxyData.length > 0;
 
   logger.info('Historical context data loaded', {
     fearGreedPoints: fgData.length,
     fundingRatePoints: fundingData.length,
-    factorsAvailable: `${10 + (hasFearGreed ? 1 : 0) + (hasFunding ? 1 : 0)}/14`
+    btcDomPoints: btcDomData.length,
+    dxyPoints: dxyData.length,
+    factorsAvailable: `${10 + (hasFearGreed ? 1 : 0) + (hasFunding ? 1 : 0) + (hasBtcDom ? 1 : 0) + (hasDXY ? 1 : 0)}/14`
   });
 
   // ─── 2. Determine backtest window ────────────────────────────────────
@@ -899,8 +1060,32 @@ async function runBacktest(options, onProgress = null) {
         }
       : derivativesData;
 
-    // macroData (BTC dominance, DXY) — not available historically, pass through
-    const stepMacro = macroData;
+    // ── Lookup historical macro data (BTC dominance, DXY) ──────────
+    const stepBtcDom = hasBtcDom ? lookupByTimestamp(btcDomData, step.timestamp) : null;
+    const stepDxy = hasDXY ? lookupByTimestamp(dxyData, step.timestamp) : null;
+
+    let stepMacro = null;
+    if (stepBtcDom || stepDxy) {
+      // Derive btcChange24h from BTC market cap history for non-BTC assets
+      let btcChange24h = 0;
+      if (asset === 'bitcoin') {
+        btcChange24h = change24h;
+      } else if (stepBtcDom) {
+        const prevBtc = lookupByTimestamp(btcDomData, step.timestamp - 24 * 3600000);
+        if (prevBtc?.btcMcap > 0 && stepBtcDom.btcMcap > 0) {
+          btcChange24h = ((stepBtcDom.btcMcap - prevBtc.btcMcap) / prevBtc.btcMcap) * 100;
+        }
+      }
+      stepMacro = {
+        btcDom: stepBtcDom?.btcDom || 0,
+        btcChange24h: parseFloat(btcChange24h.toFixed(2)),
+        dxy: stepDxy?.dxy || 100,
+        dxyTrend: stepDxy?.dxyTrend || 'neutral',
+        dxyChange: stepDxy?.dxyChange || 0
+      };
+    } else if (macroData) {
+      stepMacro = macroData;
+    }
 
     try {
       const signal = await generateMultiTimeframeSignal(
@@ -1049,14 +1234,22 @@ async function runBacktest(options, onProgress = null) {
     historicalContext: {
       fearGreedPoints: fgData.length,
       fundingRatePoints: fundingData.length,
-      factorsUsed: 10 + (hasFearGreed ? 1 : 0) + (hasFunding ? 1 : 0),
+      btcDomPoints: btcDomData.length,
+      dxyPoints: dxyData.length,
+      factorsUsed: 10 + (hasFearGreed ? 1 : 0) + (hasFunding ? 1 : 0) + (hasBtcDom ? 1 : 0) + (hasDXY ? 1 : 0),
       factorsTotal: 14
     },
-    note: `Backtest basado en ${10 + (hasFearGreed ? 1 : 0) + (hasFunding ? 1 : 0)}/14 factores (${[
-      ...(hasFearGreed ? [] : ['Fear & Greed']),
-      ...(hasFunding ? [] : ['Funding Rate']),
-      'BTC dominance', 'DXY'
-    ].join(', ')} no disponibles históricamente)`
+    note: (() => {
+      const missing = [
+        ...(hasFearGreed ? [] : ['Fear & Greed']),
+        ...(hasFunding ? [] : ['Funding Rate']),
+        ...(hasBtcDom ? [] : ['BTC dominance']),
+        ...(hasDXY ? [] : ['DXY']),
+        'Order Book'  // Always missing — no historical data exists
+      ];
+      const factorCount = 10 + (hasFearGreed ? 1 : 0) + (hasFunding ? 1 : 0) + (hasBtcDom ? 1 : 0) + (hasDXY ? 1 : 0);
+      return `Backtest basado en ${factorCount}/14 factores (${missing.join(', ')} no disponibles históricamente)`;
+    })()
   };
 }
 
@@ -1069,6 +1262,8 @@ module.exports = {
   fetchAllTimeframes,
   fetchHistoricalFearGreed,
   fetchHistoricalFundingRate,
+  fetchHistoricalBtcDominance,
+  fetchHistoricalDXY,
   lookupByTimestamp,
   runBacktest,
   simulateTradeExecution,
@@ -1076,5 +1271,10 @@ module.exports = {
   SLIPPAGE,
   COMMISSION,
   TOTAL_COST,
-  INTERVAL_MS
+  INTERVAL_MS,
+  // Test helper — reset module-level caches
+  _resetMacroCache() {
+    _btcDomCache = { data: [], expiry: 0 };
+    _dxyCache = { data: [], expiry: 0 };
+  }
 };
