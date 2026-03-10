@@ -3,7 +3,7 @@
 // Tests for simulateTradeExecution and calculateBacktestMetrics (pure functions)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const { simulateTradeExecution, calculateBacktestMetrics, SLIPPAGE, INTERVAL_MS } = require('../backtester');
+const { simulateTradeExecution, calculateBacktestMetrics, SLIPPAGE, COMMISSION, TOTAL_COST, INTERVAL_MS } = require('../backtester');
 
 // ─── HELPERS ────────────────────────────────────────────────────────────────
 
@@ -60,7 +60,7 @@ describe('simulateTradeExecution', () => {
 
       expect(result.exitReason).toBe('stop_loss');
       expect(result.exitIndex).toBe(2);
-      expect(result.exitPrice).toBeCloseTo(97000 * (1 - SLIPPAGE), 2);
+      expect(result.exitPrice).toBeCloseTo(97000 * (1 - TOTAL_COST), 2);
       expect(result.pnl).toBeLessThan(0);
       expect(result.holdingBars).toBe(2);
     });
@@ -151,8 +151,8 @@ describe('simulateTradeExecution', () => {
 
       const result = simulateTradeExecution(trade, candles, 0);
 
-      // LONG SL exit: price * (1 - SLIPPAGE) = 97000 * 0.999
-      expect(result.exitPrice).toBeCloseTo(97000 * 0.999, 2);
+      // LONG SL exit: price * (1 - TOTAL_COST) = 97000 * 0.998
+      expect(result.exitPrice).toBeCloseTo(97000 * (1 - TOTAL_COST), 2);
     });
   });
 
@@ -175,7 +175,7 @@ describe('simulateTradeExecution', () => {
       const result = simulateTradeExecution(trade, candles, 0);
 
       expect(result.exitReason).toBe('stop_loss');
-      expect(result.exitPrice).toBeCloseTo(103000 * (1 + SLIPPAGE), 2);
+      expect(result.exitPrice).toBeCloseTo(103000 * (1 + TOTAL_COST), 2);
       expect(result.pnl).toBeLessThan(0);
     });
 
@@ -435,6 +435,15 @@ describe('calculateBacktestMetrics', () => {
 describe('Constants', () => {
   test('SLIPPAGE is 0.1%', () => {
     expect(SLIPPAGE).toBe(0.001);
+  });
+
+  test('COMMISSION is 0.1%', () => {
+    expect(COMMISSION).toBe(0.001);
+  });
+
+  test('TOTAL_COST = SLIPPAGE + COMMISSION', () => {
+    expect(TOTAL_COST).toBe(SLIPPAGE + COMMISSION);
+    expect(TOTAL_COST).toBe(0.002);
   });
 
   test('INTERVAL_MS has correct values', () => {

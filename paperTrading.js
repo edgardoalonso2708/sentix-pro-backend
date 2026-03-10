@@ -5,6 +5,17 @@
 
 const { logger } = require('./logger');
 
+// ─── EXECUTION SIMULATION ───────────────────────────────────────────────────
+const SLIPPAGE = 0.001;    // 0.1% spread/slippage per trade
+const COMMISSION = 0.001;  // 0.1% exchange fee per side (Binance default)
+
+function applySlippage(price, isBuy) {
+  // BUY: fill higher (worse), SELL: fill lower (worse)
+  const slip = isBuy ? (1 + SLIPPAGE) : (1 - SLIPPAGE);
+  const comm = (1 + COMMISSION); // commission always worsens the effective price
+  return isBuy ? price * slip * comm : price * slip / comm;
+}
+
 // ─── DEFAULT CONFIGURATION ──────────────────────────────────────────────────
 const DEFAULT_CONFIG = {
   initial_capital: 10000,
@@ -499,12 +510,16 @@ async function openTrade(supabase, userId, signal, positionSize) {
       confluenceCount = Math.max(bullish, bearish);
     }
 
+    // Apply slippage + commission to entry (simulates real execution)
+    const isBuy = direction === 'LONG';
+    const slippedEntry = applySlippage(signal.tradeLevels.entry, isBuy);
+
     const tradeData = {
       user_id: userId,
       asset: signal.asset,
       asset_class: signal.assetClass || 'crypto',
       direction,
-      entry_price: signal.tradeLevels.entry,
+      entry_price: Math.round(slippedEntry * 100) / 100,
       entry_signal_strength: signal.strengthLabel,
       entry_confidence: signal.confidence,
       entry_raw_score: signal.rawScore,
@@ -733,9 +748,13 @@ async function monitorOpenPositions(supabase, userId, marketData) {
       // Check price against levels
       const check = checkPriceAgainstLevels(trade, currentPrice);
 
+      // Apply slippage + commission on exit (LONG closes are sells, SHORT closes are buys)
+      const isExitBuy = trade.direction === 'SHORT'; // SHORT exit = buy back
+      const slippedClosePrice = applySlippage(currentPrice, isExitBuy);
+
       switch (check.action) {
         case 'stop_loss': {
-          const closeResult = await executeFullClose(supabase, trade, currentPrice, 'stop_loss');
+          const closeResult = await executeFullClose(supabase, trade, slippedClosePrice, 'stop_loss');
           if (closeResult.closedTrade) {
             result.closedTrades.push(closeResult.closedTrade);
           }
@@ -743,7 +762,7 @@ async function monitorOpenPositions(supabase, userId, marketData) {
         }
 
         case 'take_profit_1': {
-          const partialResult = await executePartialClose(supabase, trade, currentPrice);
+          const partialResult = await executePartialClose(supabase, trade, slippedClosePrice);
           if (partialResult.updatedTrade) {
             result.partialCloses.push(partialResult.updatedTrade);
           }
@@ -751,7 +770,7 @@ async function monitorOpenPositions(supabase, userId, marketData) {
         }
 
         case 'take_profit_2': {
-          const closeResult = await executeFullClose(supabase, trade, currentPrice, 'take_profit_2');
+          const closeResult = await executeFullClose(supabase, trade, slippedClosePrice, 'take_profit_2');
           if (closeResult.closedTrade) {
             result.closedTrades.push(closeResult.closedTrade);
           }
@@ -759,7 +778,7 @@ async function monitorOpenPositions(supabase, userId, marketData) {
         }
 
         case 'trailing_stop': {
-          const closeResult = await executeFullClose(supabase, trade, currentPrice, 'trailing_stop');
+          const closeResult = await executeFullClose(supabase, trade, slippedClosePrice, 'trailing_stop');
           if (closeResult.closedTrade) {
             result.closedTrades.push(closeResult.closedTrade);
           }

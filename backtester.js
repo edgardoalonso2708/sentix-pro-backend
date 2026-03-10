@@ -4,7 +4,8 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const { logger } = require('./logger');
-const { fetchKlines, SYMBOL_MAP } = require('./binanceAPI');
+const axios = require('axios');
+const { fetchKlines, SYMBOL_MAP, FUTURES_SYMBOL_MAP } = require('./binanceAPI');
 const { generateMultiTimeframeSignal } = require('./technicalAnalysis');
 const { evaluateSignalForTrade, calculatePositionSize, DEFAULT_CONFIG } = require('./paperTrading');
 
@@ -17,7 +18,9 @@ const INTERVAL_MS = {
   '1d': 24 * 60 * 60 * 1000
 };
 
-const SLIPPAGE = 0.001; // 0.1% per trade (simulates spread + fees)
+const SLIPPAGE = 0.001;    // 0.1% spread/slippage
+const COMMISSION = 0.001;  // 0.1% exchange fee per side (Binance default)
+const TOTAL_COST = SLIPPAGE + COMMISSION; // Combined per-side execution cost
 
 // Minimum candles needed for indicator calculation
 const MIN_LOOKBACK = {
@@ -148,6 +151,143 @@ async function fetchAllTimeframes(asset, days) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// HISTORICAL CONTEXT DATA (Fear & Greed, Funding Rates)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Fetch historical Fear & Greed Index from Alternative.me
+ * @param {number} days - Number of days of history
+ * @returns {Promise<Array>} Array of { timestamp, value } sorted ascending
+ */
+async function fetchHistoricalFearGreed(days) {
+  try {
+    const limit = Math.min(days + 10, 1000); // API max ~1000
+    const res = await axios.get(`https://api.alternative.me/fng/?limit=${limit}&date_format=world`, {
+      timeout: 15000
+    });
+
+    if (!res.data?.data || !Array.isArray(res.data.data)) {
+      logger.warn('Fear & Greed API returned unexpected format');
+      return [];
+    }
+
+    // API returns newest first; each entry: { value: "25", timestamp: "1234567890" }
+    const points = res.data.data
+      .map(d => ({
+        timestamp: parseInt(d.timestamp) * 1000, // Convert to ms
+        value: parseInt(d.value)
+      }))
+      .filter(d => !isNaN(d.timestamp) && !isNaN(d.value))
+      .sort((a, b) => a.timestamp - b.timestamp);
+
+    logger.info('Historical Fear & Greed fetched', {
+      points: points.length,
+      from: points.length > 0 ? new Date(points[0].timestamp).toISOString().slice(0, 10) : 'N/A',
+      to: points.length > 0 ? new Date(points[points.length - 1].timestamp).toISOString().slice(0, 10) : 'N/A'
+    });
+
+    return points;
+  } catch (err) {
+    logger.warn('Failed to fetch historical Fear & Greed', { error: err.message });
+    return [];
+  }
+}
+
+/**
+ * Fetch historical funding rates from Binance Futures
+ * @param {string} asset - CoinGecko ID (e.g., 'bitcoin')
+ * @param {number} startMs - Start timestamp in ms
+ * @param {number} endMs - End timestamp in ms
+ * @returns {Promise<Array>} Array of { timestamp, fundingRate } sorted ascending
+ */
+async function fetchHistoricalFundingRate(asset, startMs, endMs) {
+  const futuresSymbol = FUTURES_SYMBOL_MAP[asset];
+  if (!futuresSymbol) {
+    logger.debug('No futures symbol for asset, skipping funding rate', { asset });
+    return [];
+  }
+
+  try {
+    const allRates = [];
+    let currentStart = startMs;
+    const batchSize = 1000;
+
+    // Paginate through funding rate history (8h intervals)
+    while (currentStart < endMs) {
+      const res = await axios.get('https://fapi.binance.com/fapi/v1/fundingRate', {
+        params: {
+          symbol: futuresSymbol,
+          startTime: currentStart,
+          endTime: endMs,
+          limit: batchSize
+        },
+        timeout: 15000
+      });
+
+      if (!Array.isArray(res.data) || res.data.length === 0) break;
+
+      for (const r of res.data) {
+        allRates.push({
+          timestamp: r.fundingTime,
+          fundingRate: parseFloat(r.fundingRate)
+        });
+      }
+
+      // Move past last result
+      currentStart = res.data[res.data.length - 1].fundingTime + 1;
+
+      // Rate limit courtesy
+      if (res.data.length === batchSize) {
+        await new Promise(r => setTimeout(r, 500));
+      }
+    }
+
+    allRates.sort((a, b) => a.timestamp - b.timestamp);
+
+    logger.info('Historical funding rates fetched', {
+      asset, futuresSymbol, points: allRates.length,
+      from: allRates.length > 0 ? new Date(allRates[0].timestamp).toISOString().slice(0, 10) : 'N/A',
+      to: allRates.length > 0 ? new Date(allRates[allRates.length - 1].timestamp).toISOString().slice(0, 10) : 'N/A'
+    });
+
+    return allRates;
+  } catch (err) {
+    logger.warn('Failed to fetch historical funding rates', { asset, error: err.message });
+    return [];
+  }
+}
+
+/**
+ * Lookup the closest historical value by timestamp (binary search)
+ * @param {Array} sortedData - Sorted array with .timestamp property
+ * @param {number} targetTs - Target timestamp in ms
+ * @returns {Object|null} Closest entry or null
+ */
+function lookupByTimestamp(sortedData, targetTs) {
+  if (!sortedData || sortedData.length === 0) return null;
+
+  let lo = 0, hi = sortedData.length - 1;
+
+  // If target is before all data, use first point
+  if (targetTs <= sortedData[0].timestamp) return sortedData[0];
+  // If target is after all data, use last point
+  if (targetTs >= sortedData[hi].timestamp) return sortedData[hi];
+
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (sortedData[mid].timestamp === targetTs) return sortedData[mid];
+    if (sortedData[mid].timestamp < targetTs) lo = mid + 1;
+    else hi = mid - 1;
+  }
+
+  // Return the closest of lo and hi
+  if (lo >= sortedData.length) return sortedData[hi];
+  if (hi < 0) return sortedData[lo];
+  return Math.abs(sortedData[lo].timestamp - targetTs) < Math.abs(sortedData[hi].timestamp - targetTs)
+    ? sortedData[lo] : sortedData[hi];
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // TRADE SIMULATION (Pure - no DB)
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -196,7 +336,7 @@ function simulateTradeExecution(trade, candles, startIndex) {
 
       // CONSERVATIVE: Check SL first (if same candle hits both, SL wins)
       if (low <= stopLoss) {
-        const exitPrice = stopLoss * (1 - SLIPPAGE); // Slippage on exit
+        const exitPrice = stopLoss * (1 - TOTAL_COST); // Slippage + commission on exit
         const pnl = ((exitPrice - entryPrice) * remainingQty) + partialPnl;
         return {
           exitIndex: i,
@@ -215,7 +355,7 @@ function simulateTradeExecution(trade, candles, startIndex) {
 
       // Check trailing stop (if active)
       if (trailingActive && low <= trailingStopCurrent) {
-        const exitPrice = trailingStopCurrent * (1 - SLIPPAGE);
+        const exitPrice = trailingStopCurrent * (1 - TOTAL_COST);
         const pnl = ((exitPrice - entryPrice) * remainingQty) + partialPnl;
         return {
           exitIndex: i, exitTimestamp: candle.timestamp, exitPrice,
@@ -230,7 +370,7 @@ function simulateTradeExecution(trade, candles, startIndex) {
 
       // Check TP1 (partial close - 50%)
       if (status === 'open' && high >= tp1) {
-        const closePrice = tp1 * (1 - SLIPPAGE);
+        const closePrice = tp1 * (1 - TOTAL_COST);
         const closeQty = quantity / 2;
         partialPnl = (closePrice - entryPrice) * closeQty;
         remainingQty = quantity - closeQty;
@@ -241,7 +381,7 @@ function simulateTradeExecution(trade, candles, startIndex) {
 
       // Check TP2 (full close of remaining)
       if (status === 'partial' && tp2 && high >= tp2) {
-        const exitPrice = tp2 * (1 - SLIPPAGE);
+        const exitPrice = tp2 * (1 - TOTAL_COST);
         const pnl = ((exitPrice - entryPrice) * remainingQty) + partialPnl;
         return {
           exitIndex: i, exitTimestamp: candle.timestamp, exitPrice,
@@ -279,7 +419,7 @@ function simulateTradeExecution(trade, candles, startIndex) {
 
       // SL (price goes UP)
       if (high >= stopLoss) {
-        const exitPrice = stopLoss * (1 + SLIPPAGE);
+        const exitPrice = stopLoss * (1 + TOTAL_COST);
         const pnl = ((entryPrice - exitPrice) * remainingQty) + partialPnl;
         return {
           exitIndex: i, exitTimestamp: candle.timestamp, exitPrice,
@@ -294,7 +434,7 @@ function simulateTradeExecution(trade, candles, startIndex) {
 
       // Trailing stop (price goes UP)
       if (trailingActive && high >= trailingStopCurrent) {
-        const exitPrice = trailingStopCurrent * (1 + SLIPPAGE);
+        const exitPrice = trailingStopCurrent * (1 + TOTAL_COST);
         const pnl = ((entryPrice - exitPrice) * remainingQty) + partialPnl;
         return {
           exitIndex: i, exitTimestamp: candle.timestamp, exitPrice,
@@ -309,7 +449,7 @@ function simulateTradeExecution(trade, candles, startIndex) {
 
       // TP1 (price goes DOWN)
       if (status === 'open' && low <= tp1) {
-        const closePrice = tp1 * (1 + SLIPPAGE);
+        const closePrice = tp1 * (1 + TOTAL_COST);
         const closeQty = quantity / 2;
         partialPnl = (entryPrice - closePrice) * closeQty;
         remainingQty = quantity - closeQty;
@@ -320,7 +460,7 @@ function simulateTradeExecution(trade, candles, startIndex) {
 
       // TP2 (price goes DOWN)
       if (status === 'partial' && tp2 && low <= tp2) {
-        const exitPrice = tp2 * (1 + SLIPPAGE);
+        const exitPrice = tp2 * (1 + TOTAL_COST);
         const pnl = ((entryPrice - exitPrice) * remainingQty) + partialPnl;
         return {
           exitIndex: i, exitTimestamp: candle.timestamp, exitPrice,
@@ -411,11 +551,43 @@ function calculateBacktestMetrics(completedTrades, equityCurve, initialCapital, 
     }
   }
 
-  // Sharpe ratio (simplified - using trade returns)
-  const returns = completedTrades.map(t => t.pnlPercent / 100);
-  const avgReturn = returns.reduce((s, r) => s + r, 0) / returns.length;
-  const stdDev = Math.sqrt(returns.reduce((s, r) => s + Math.pow(r - avgReturn, 2), 0) / returns.length);
-  const sharpeRatio = stdDev > 0 ? (avgReturn / stdDev) * Math.sqrt(252 / (days / completedTrades.length)) : 0;
+  // Sharpe ratio — computed from daily equity returns (not per-trade)
+  // Uses sample std dev (N-1), annualized with 365 (crypto trades 24/7), risk-free rate ~4.5%
+  let sharpeRatio = 0;
+  if (equityCurve.length >= 3) {
+    // Build daily equity snapshots from the equity curve
+    const dayMs = 24 * 60 * 60 * 1000;
+    const dailyEquity = [];
+    let lastDay = -1;
+    for (const point of equityCurve) {
+      const dayNum = Math.floor(point.timestamp / dayMs);
+      if (dayNum !== lastDay) {
+        dailyEquity.push(point.equity);
+        lastDay = dayNum;
+      } else {
+        dailyEquity[dailyEquity.length - 1] = point.equity; // keep last value of the day
+      }
+    }
+
+    if (dailyEquity.length >= 2) {
+      const dailyReturns = [];
+      for (let i = 1; i < dailyEquity.length; i++) {
+        if (dailyEquity[i - 1] > 0) {
+          dailyReturns.push((dailyEquity[i] - dailyEquity[i - 1]) / dailyEquity[i - 1]);
+        }
+      }
+
+      if (dailyReturns.length >= 2) {
+        const riskFreeDaily = Math.pow(1.045, 1 / 365) - 1; // ~4.5% annual risk-free rate
+        const excessReturns = dailyReturns.map(r => r - riskFreeDaily);
+        const avgExcess = excessReturns.reduce((s, r) => s + r, 0) / excessReturns.length;
+        // Sample standard deviation (N-1)
+        const variance = excessReturns.reduce((s, r) => s + Math.pow(r - avgExcess, 2), 0) / (excessReturns.length - 1);
+        const stdDev = Math.sqrt(variance);
+        sharpeRatio = stdDev > 0 ? (avgExcess / stdDev) * Math.sqrt(365) : 0;
+      }
+    }
+  }
 
   // Consecutive wins/losses
   let maxConsWins = 0, maxConsLosses = 0, curWins = 0, curLosses = 0;
@@ -504,6 +676,26 @@ async function runBacktest(options, onProgress = null) {
     '1h': candles1h.length,
     '4h': candles4h.length,
     '15m': candles15m.length
+  });
+
+  // ─── 1b. Fetch historical context data (Fear & Greed, Funding Rates) ──
+  if (onProgress) onProgress({ phase: 'fetching', message: 'Descargando datos de contexto (F&G, funding)...' });
+
+  const [historicalFG, historicalFunding] = await Promise.allSettled([
+    fetchHistoricalFearGreed(days + 10),
+    fetchHistoricalFundingRate(asset, Date.now() - ((days + 10) * 24 * 60 * 60 * 1000), Date.now())
+  ]);
+
+  const fgData = historicalFG.status === 'fulfilled' ? historicalFG.value : [];
+  const fundingData = historicalFunding.status === 'fulfilled' ? historicalFunding.value : [];
+
+  const hasFearGreed = fgData.length > 0;
+  const hasFunding = fundingData.length > 0;
+
+  logger.info('Historical context data loaded', {
+    fearGreedPoints: fgData.length,
+    fundingRatePoints: fundingData.length,
+    factorsAvailable: `${10 + (hasFearGreed ? 1 : 0) + (hasFunding ? 1 : 0)}/14`
   });
 
   // ─── 2. Determine backtest window ────────────────────────────────────
@@ -623,10 +815,25 @@ async function runBacktest(options, onProgress = null) {
     // Volume from last candle
     const vol = candles1h[step.index]?.volume || 0;
 
+    // ── Lookup historical context for this timestamp ──────────────
+    const stepFearGreed = hasFearGreed
+      ? lookupByTimestamp(fgData, step.timestamp).value
+      : fearGreed; // Fall back to static param (default 50)
+
+    const stepDerivatives = hasFunding
+      ? {
+          fundingRatePercent: lookupByTimestamp(fundingData, step.timestamp).fundingRate * 100,
+          longShortRatio: derivativesData?.longShortRatio || null // Not available historically
+        }
+      : derivativesData;
+
+    // macroData (BTC dominance, DXY) — not available historically, pass through
+    const stepMacro = macroData;
+
     try {
       const signal = await generateMultiTimeframeSignal(
-        asset, currentPrice, change24h, vol, fearGreed,
-        derivativesData, macroData,
+        asset, currentPrice, change24h, vol, stepFearGreed,
+        stepDerivatives, stepMacro,
         { '4h': window4h, '1h': window1h, '15m': window15m },
         strategyConfig
       );
@@ -655,8 +862,8 @@ async function runBacktest(options, onProgress = null) {
 
       // Apply slippage to entry
       const slippedEntry = signal.action === 'BUY'
-        ? signal.tradeLevels.entry * (1 + SLIPPAGE)
-        : signal.tradeLevels.entry * (1 - SLIPPAGE);
+        ? signal.tradeLevels.entry * (1 + TOTAL_COST)
+        : signal.tradeLevels.entry * (1 - TOTAL_COST);
 
       // Open trade
       const newTrade = {
@@ -765,7 +972,17 @@ async function runBacktest(options, onProgress = null) {
     equityCurve,
     duration: parseFloat(duration),
     candlesAnalyzed: { '1h': candles1h.length, '4h': candles4h.length, '15m': candles15m.length },
-    note: 'Backtest basado en 10/13 factores técnicos (excluye derivados, BTC dominance, DXY — no disponibles históricamente)'
+    historicalContext: {
+      fearGreedPoints: fgData.length,
+      fundingRatePoints: fundingData.length,
+      factorsUsed: 10 + (hasFearGreed ? 1 : 0) + (hasFunding ? 1 : 0),
+      factorsTotal: 14
+    },
+    note: `Backtest basado en ${10 + (hasFearGreed ? 1 : 0) + (hasFunding ? 1 : 0)}/14 factores (${[
+      ...(hasFearGreed ? [] : ['Fear & Greed']),
+      ...(hasFunding ? [] : ['Funding Rate']),
+      'BTC dominance', 'DXY'
+    ].join(', ')} no disponibles históricamente)`
   };
 }
 
@@ -776,9 +993,14 @@ async function runBacktest(options, onProgress = null) {
 module.exports = {
   fetchHistoricalCandles,
   fetchAllTimeframes,
+  fetchHistoricalFearGreed,
+  fetchHistoricalFundingRate,
+  lookupByTimestamp,
   runBacktest,
   simulateTradeExecution,
   calculateBacktestMetrics,
   SLIPPAGE,
+  COMMISSION,
+  TOTAL_COST,
   INTERVAL_MS
 };
