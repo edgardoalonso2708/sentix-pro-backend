@@ -1502,11 +1502,12 @@ app.post('/api/backtest/run', async (req, res) => {
     // Return immediately
     res.json({ id: recordId, status: 'running' });
 
-    // Execute backtest asynchronously
+    // Execute backtest asynchronously (with 10min timeout)
+    const BACKTEST_TIMEOUT_MS = 10 * 60 * 1000;
     activeBacktestJobs++;
     (async () => {
       try {
-        const result = await runBacktest({
+        const backtestPromise = runBacktest({
           asset, days, stepInterval, capital, riskPerTrade,
           maxOpenPositions, minConfluence, minRR, allowedStrength,
           cooldownBars, fearGreed: 50, derivativesData: null, macroData: null,
@@ -1514,15 +1515,26 @@ app.post('/api/backtest/run', async (req, res) => {
         }, async (progress) => {
           // Update progress in memory
           const entry = backtestStore.get(recordId);
-          if (entry) entry.progress = typeof progress === 'object' ? Math.round((progress.current / progress.total) * 100) : progress;
+          if (entry && typeof progress === 'object' && progress.total > 0 && progress.current != null) {
+            entry.progress = Math.round((progress.current / progress.total) * 100);
+          } else if (entry && typeof progress === 'number') {
+            entry.progress = progress;
+          }
 
-          // Also try DB if available
-          if (useDB) {
+          // Also try DB if available (only for numeric progress)
+          const pVal = entry?.progress;
+          if (useDB && typeof pVal === 'number' && !isNaN(pVal)) {
             try {
-              await supabase.from('backtest_results').update({ progress: entry?.progress || 0 }).eq('id', recordId);
+              await supabase.from('backtest_results').update({ progress: pVal }).eq('id', recordId);
             } catch (_) { /* ignore */ }
           }
         });
+
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error(`Backtest timed out after ${BACKTEST_TIMEOUT_MS / 60000} minutes`)), BACKTEST_TIMEOUT_MS)
+        );
+
+        const result = await Promise.race([backtestPromise, timeoutPromise]);
 
         // Build completed result
         const metrics = result.metrics || result;
@@ -1701,18 +1713,25 @@ app.delete('/api/backtest', async (req, res) => {
 
     // Delete from Supabase
     try {
-      const { data, error } = await supabase
+      const { error, count } = await supabase
         .from('backtest_results')
-        .delete()
+        .delete({ count: 'exact' })
         .in('id', ids);
-      if (!error) dbDeleted = ids.length;
-    } catch (_) { /* DB unavailable */ }
+      if (error) {
+        logger.warn('Supabase delete error', { error: error.message, ids });
+      } else {
+        dbDeleted = count || ids.length;
+      }
+    } catch (e) {
+      logger.warn('Supabase delete failed', { error: e.message });
+    }
 
     // Delete from memory
     for (const id of ids) {
       if (backtestStore.delete(id)) memDeleted++;
     }
 
+    logger.info('Backtests deleted', { dbDeleted, memDeleted, ids });
     res.json({ deleted: Math.max(dbDeleted, memDeleted), ids });
   } catch (error) {
     logger.error('Backtest delete failed', { error: error.message });
