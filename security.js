@@ -22,9 +22,19 @@ const ENV_RULES = {
       return null;
     }
   },
+  SUPABASE_SERVICE_ROLE_KEY: {
+    required: false,
+    label: 'Supabase Service Role Key (recommended)',
+    validate: (v) => {
+      if (!v.startsWith('eyJ')) return 'must be a valid JWT (starts with eyJ)';
+      const parts = v.split('.');
+      if (parts.length < 3) return 'must be a valid JWT (at least three dot-separated parts)';
+      return null;
+    }
+  },
   SUPABASE_KEY: {
     required: true,
-    label: 'Supabase Key',
+    label: 'Supabase Key (fallback)',
     validate: (v) => {
       if (!v.startsWith('eyJ')) return 'must be a valid JWT (starts with eyJ)';
       const parts = v.split('.');

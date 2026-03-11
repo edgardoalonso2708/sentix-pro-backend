@@ -22,7 +22,7 @@ const { LRUCache } = require('../shared/lruCache');
 const { metrics } = require('../shared/metrics');
 
 // ─── SUPABASE CLIENT ──────────────────────────────────────────────────────
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY);
 
 // ─── RESEND EMAIL CLIENT ──────────────────────────────────────────────────
 const RESEND_API_KEY = process.env.RESEND_API_KEY;

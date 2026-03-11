@@ -18,7 +18,7 @@ const { MSG, sendToParent, installWorkerIPC } = require('../shared/ipc');
 const { metrics } = require('../shared/metrics');
 
 // ─── SUPABASE CLIENT ──────────────────────────────────────────────────────
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY);
 
 // ─── CACHED STATE (local to this worker) ──────────────────────────────────
 let cachedMarketData = null;
