@@ -23,6 +23,9 @@ const MSG = {
   // All workers → Orchestrator (health response)
   HEARTBEAT_PONG: 'heartbeat_pong',
 
+  // Workers → Orchestrator → API (APM metrics snapshot)
+  METRICS_UPDATE: 'metrics_update',
+
   // Orchestrator → All workers (graceful shutdown)
   SHUTDOWN: 'shutdown',
 };

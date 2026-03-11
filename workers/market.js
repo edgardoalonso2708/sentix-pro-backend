@@ -15,6 +15,7 @@ const { monitorAndManage } = require('../paperTrading');
 const { logger } = require('../logger');
 const { classifyAxiosError, Provider } = require('../errors');
 const { MSG, sendToParent, installWorkerIPC } = require('../shared/ipc');
+const { metrics } = require('../shared/metrics');
 
 // ─── SUPABASE CLIENT ──────────────────────────────────────────────────────
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
@@ -93,6 +94,7 @@ async function fetchWithRetry(fn, retries = 3, baseDelay = 2000) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async function fetchCryptoPrices() {
+  const _t0 = Date.now();
   try {
     const cryptoData = await fetchWithRetry(async () => {
       const ids = Object.keys(CRYPTO_ASSETS).join(',');
@@ -127,22 +129,29 @@ async function fetchCryptoPrices() {
 
     if (Object.keys(cryptoData).length > 0) {
       lastSuccessfulCrypto = cryptoData;
+      metrics.counter('provider.coingecko.success');
+      metrics.histogram('provider.coingecko.latency', Date.now() - _t0);
       logger.info('CoinGecko fetch OK', { assets: Object.keys(cryptoData).length });
       return cryptoData;
     }
   } catch (error) {
+    metrics.counter('provider.coingecko.error');
     logger.providerError(classifyAxiosError(error, Provider.COINGECKO, 'simple/price'));
   }
 
   try {
     logger.info('Falling back to CoinCap API');
+    const _t1 = Date.now();
     const cryptoData = await fetchFromCoinCap();
     if (Object.keys(cryptoData).length > 0) {
       lastSuccessfulCrypto = cryptoData;
+      metrics.counter('provider.coincap.success');
+      metrics.histogram('provider.coincap.latency', Date.now() - _t1);
       logger.info('CoinCap fallback OK', { assets: Object.keys(cryptoData).length });
       return cryptoData;
     }
   } catch (error) {
+    metrics.counter('provider.coincap.error');
     logger.providerError(classifyAxiosError(error, Provider.COINCAP, 'assets'));
   }
 
@@ -268,8 +277,10 @@ async function fetchDXY() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async function updateMarketData() {
+  const _cycleStart = Date.now();
   try {
     logger.info('Updating market data');
+    metrics.counter('market.cycles');
 
     const crypto = await fetchCryptoPrices();
     const [fearGreedData, globalData, metals, dxyData] = await Promise.all([
@@ -298,6 +309,8 @@ async function updateMarketData() {
       };
       logger.warn('Market data partially updated (crypto unchanged, using cache)');
     }
+
+    metrics.histogram('market.cycle.duration', Date.now() - _cycleStart);
 
     // Send market data to orchestrator → api.js (for SSE broadcast)
     sendToParent(MSG.MARKET_UPDATE, cachedMarketData);
@@ -350,6 +363,12 @@ cronTask = cron.schedule('*/1 * * * *', async () => {
     isUpdatingMarketData = false;
   }
 });
+
+// Send metrics to API via IPC every 60s
+const _metricsTimer = setInterval(() => {
+  sendToParent(MSG.METRICS_UPDATE, metrics.snapshot());
+}, 60000);
+_metricsTimer.unref();
 
 // Initial fetch on startup
 (async () => {

@@ -19,6 +19,7 @@ const { isWithinTradingHours } = require('../scheduleUtils');
 const { SCHEDULE_CONFIG } = require('../strategyConfig');
 const { MSG, sendToParent, installWorkerIPC } = require('../shared/ipc');
 const { LRUCache } = require('../shared/lruCache');
+const { metrics } = require('../shared/metrics');
 
 // ─── SUPABASE CLIENT ──────────────────────────────────────────────────────
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
@@ -394,8 +395,10 @@ function markAlertSent(key) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async function processAlerts() {
+  const _cycleStart = Date.now();
   try {
     logger.info('Processing alerts');
+    metrics.counter('alerts.cycles');
 
     const signals = await generateSignals();
     let savedCount = 0;
@@ -495,6 +498,11 @@ async function processAlerts() {
       markAlertSent(alertKey);
     }
 
+    metrics.counter('alerts.signals', signals.length);
+    metrics.counter('alerts.telegram', telegramCount);
+    metrics.counter('alerts.email', emailCount);
+    metrics.histogram('alerts.cycle.duration', Date.now() - _cycleStart);
+
     logger.info('Alerts processed', {
       totalSignals: signals.length,
       saved: savedCount,
@@ -583,6 +591,12 @@ cronTask = cron.schedule('*/5 * * * *', async () => {
     isProcessingAlerts = false;
   }
 });
+
+// Send metrics to API via IPC every 60s
+const _metricsTimer = setInterval(() => {
+  sendToParent(MSG.METRICS_UPDATE, metrics.snapshot());
+}, 60000);
+_metricsTimer.unref();
 
 // Initial startup
 (async () => {

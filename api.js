@@ -8,8 +8,10 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
+const crypto = require('crypto');
 const { MSG } = require('./shared/ipc');
 const { LRUCache } = require('./shared/lruCache');
+const { metrics } = require('./shared/metrics');
 const { runBacktestInThread, runOptimizeInThread, getStats: getComputeStats, terminateAll: terminateComputeWorkers } = require('./workers/compute');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
@@ -95,14 +97,20 @@ app.use(express.json({ limit: '1mb' }));
 // Rate limiting — MUST be registered BEFORE route definitions
 app.use('/api/', createRateLimiter(60000, 100));
 
-// Request logging middleware (skip SSE stream to avoid noise)
+// Request metrics + logging middleware (skip SSE stream to avoid noise)
 app.use((req, res, next) => {
   if (req.path === '/api/stream') return next();
   const start = Date.now();
+  req.id = crypto.randomUUID().slice(0, 8);
   res.on('finish', () => {
     const duration = Date.now() - start;
+    const route = req.route?.path || req.path;
+    metrics.counter('http.requests');
+    metrics.histogram('http.latency', duration);
+    if (res.statusCode >= 400) metrics.counter('http.errors');
+    if (res.statusCode >= 500) metrics.counter('http.errors.5xx');
     if (duration > 1000 || res.statusCode >= 400) {
-      logger.info('HTTP request', { method: req.method, path: req.path, status: res.statusCode, durationMs: duration });
+      logger.info('HTTP request', { reqId: req.id, method: req.method, path: req.path, status: res.statusCode, durationMs: duration });
     }
   });
   next();
@@ -214,6 +222,7 @@ const bot = new SilentTelegramBot(TELEGRAM_BOT_TOKEN);
 // ─── CACHED DATA (populated via IPC from worker processes) ────────────────
 let cachedMarketData = null;
 let cachedSignals = [];
+let workerMetrics = {}; // Merged metrics from market/alerts workers
 
 // ─── SSE (Server-Sent Events) CLIENTS ──────────────────────────────────────
 const sseClients = new Set();
@@ -330,6 +339,17 @@ app.get('/api/health', async (req, res) => {
     uptime: Math.round(process.uptime()),
     checks
   });
+});
+
+// ─── Metrics endpoint (APM) ─────────────────────────────────────────────────
+app.get('/api/metrics', (req, res) => {
+  const snap = metrics.snapshot();
+  snap.caches = {
+    backtests: backtestStore.stats(),
+    features: getCacheStats()
+  };
+  snap.workers = workerMetrics;
+  res.json(snap);
 });
 
 app.get('/api/market', (req, res) => {
@@ -449,6 +469,8 @@ function broadcastSSE(eventType, data) {
     }
   }
 
+  metrics.counter('sse.broadcasts');
+  metrics.counter(`sse.broadcasts.${eventType}`);
   if (sent > 0 || failed > 0) {
     logger.debug('SSE broadcast', { eventType, sent, failed, remaining: sseClients.size });
   }
@@ -1895,12 +1917,32 @@ if (process.send && process.env.WORKER_NAME) {
       case MSG.HEARTBEAT_PING:
         process.send({ type: MSG.HEARTBEAT_PONG, ts: Date.now() });
         break;
+      case MSG.METRICS_UPDATE:
+        if (msg.worker && msg.data) {
+          workerMetrics[msg.worker] = msg.data;
+        }
+        break;
       case MSG.SHUTDOWN:
         gracefulShutdown('IPC_SHUTDOWN');
         break;
     }
   });
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PROCESS METRICS COLLECTION (every 30s)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const _metricsTimer = setInterval(() => {
+  const mem = process.memoryUsage();
+  metrics.gauge('process.memory.rss', mem.rss);
+  metrics.gauge('process.memory.heapUsed', mem.heapUsed);
+  metrics.gauge('process.memory.heapTotal', mem.heapTotal);
+  metrics.gauge('process.memory.external', mem.external);
+  metrics.gauge('process.uptime', Math.round(process.uptime()));
+  metrics.gauge('sse.clients', sseClients.size);
+}, 30000);
+_metricsTimer.unref();
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SERVER STARTUP

@@ -147,6 +147,11 @@ function handleWorkerMessage(fromWorker, msg) {
       }
       break;
 
+    case MSG.METRICS_UPDATE:
+      // Forward worker metrics to API for aggregation
+      sendTo('api', { ...msg, worker: fromWorker });
+      break;
+
     default:
       // Unknown message type — log and ignore
       break;
