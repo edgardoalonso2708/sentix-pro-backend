@@ -359,6 +359,73 @@ describe('runMonteCarloSimulation — full', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// Extended features: p2.5/p97.5, profitFactor, _raw arrays
+// ═══════════════════════════════════════════════════════════════════════════════
+describe('extended MC features', () => {
+  const pnls = [
+    150, -80, 200, -120, 90, -60, 180, -40, 110, -95,
+    70, -30, 250, -150, 60, -45, 130, -70, 85, -55,
+    190, -100, 75, -35, 160, -90, 140, -65, 95, -50
+  ];
+  const trades = makeTrades(pnls);
+
+  test('default confidence levels include p2_5 and p97_5', () => {
+    const result = runMonteCarloSimulation(trades, 10000, { simulations: 100, seed: 42 });
+    expect(result.percentiles).toHaveProperty('p2_5');
+    expect(result.percentiles).toHaveProperty('p97_5');
+    expect(result.percentiles.p2_5).toHaveProperty('returnPct');
+    expect(result.percentiles.p97_5).toHaveProperty('returnPct');
+  });
+
+  test('p2_5 <= p5 <= p50 <= p95 <= p97_5 (monotonic)', () => {
+    const result = runMonteCarloSimulation(trades, 10000, { simulations: 500, seed: 42 });
+    expect(result.percentiles.p2_5.returnPct).toBeLessThanOrEqual(result.percentiles.p5.returnPct);
+    expect(result.percentiles.p95.returnPct).toBeLessThanOrEqual(result.percentiles.p97_5.returnPct);
+  });
+
+  test('computePathMetrics includes profitFactor', () => {
+    const testTrades = makeTrades([100, -50, 200, -30, 150]);
+    const result = computePathMetrics(testTrades, 10000);
+    expect(result).toHaveProperty('profitFactor');
+    expect(result.profitFactor).toBeGreaterThan(0);
+  });
+
+  test('profitFactor: all wins → Infinity, converted to finite in MC', () => {
+    const allWins = makeTrades([100, 200, 50]);
+    const result = computePathMetrics(allWins, 10000);
+    expect(result.profitFactor).toBe(Infinity);
+  });
+
+  test('_rawSharpes is sorted array of sharpe values', () => {
+    const result = runMonteCarloSimulation(trades, 10000, { simulations: 100, seed: 42 });
+    expect(Array.isArray(result._rawSharpes)).toBe(true);
+    expect(result._rawSharpes.length).toBe(100);
+    // Verify sorted
+    for (let i = 1; i < result._rawSharpes.length; i++) {
+      expect(result._rawSharpes[i]).toBeGreaterThanOrEqual(result._rawSharpes[i - 1]);
+    }
+  });
+
+  test('_rawReturns is sorted array of return percentages', () => {
+    const result = runMonteCarloSimulation(trades, 10000, { simulations: 100, seed: 42 });
+    expect(Array.isArray(result._rawReturns)).toBe(true);
+    expect(result._rawReturns.length).toBe(100);
+  });
+
+  test('_rawProfitFactors is sorted and finite', () => {
+    const result = runMonteCarloSimulation(trades, 10000, { simulations: 100, seed: 42 });
+    expect(Array.isArray(result._rawProfitFactors)).toBe(true);
+    result._rawProfitFactors.forEach(pf => {
+      expect(isFinite(pf)).toBe(true);
+    });
+    // Verify sorted
+    for (let i = 1; i < result._rawProfitFactors.length; i++) {
+      expect(result._rawProfitFactors[i]).toBeGreaterThanOrEqual(result._rawProfitFactors[i - 1]);
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // Performance
 // ═══════════════════════════════════════════════════════════════════════════════
 describe('performance', () => {

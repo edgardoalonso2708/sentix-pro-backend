@@ -10,6 +10,7 @@ const { generateMultiTimeframeSignal } = require('./technicalAnalysis');
 const { evaluateSignalForTrade, calculatePositionSize, DEFAULT_CONFIG } = require('./paperTrading');
 const { SLIPPAGE, COMMISSION, TOTAL_COST } = require('./constants');
 const { runMonteCarloSimulation } = require('./monteCarloSim');
+const { runStatisticalTests } = require('./statisticalTests');
 
 // ─── CONSTANTS ──────────────────────────────────────────────────────────────
 
@@ -1198,6 +1199,9 @@ async function runBacktest(options, onProgress = null) {
     seed: 42
   });
 
+  // Statistical significance tests (p-values, confidence intervals)
+  const significance = runStatisticalTests(completedTrades, monteCarlo);
+
   const duration = ((Date.now() - startTime) / 1000).toFixed(1);
 
   logger.info('Backtest completed', {
@@ -1235,6 +1239,7 @@ async function runBacktest(options, onProgress = null) {
     config: { asset, days, stepInterval, capital, riskPerTrade, maxOpenPositions, minConfluence, minRR, allowedStrength, cooldownBars, strategyConfig },
     metrics,
     monteCarlo,
+    significance,
     trades: cleanTrades,
     equityCurve,
     duration: parseFloat(duration),

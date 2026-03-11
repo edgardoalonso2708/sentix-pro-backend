@@ -57,6 +57,11 @@ function computePathMetrics(trades, initialCapital) {
   const stdR = Math.sqrt(variance);
   const sharpe = stdR > 0 ? (meanR / stdR) * Math.sqrt(365) : 0;
 
+  // Profit factor
+  const grossProfit = trades.filter(t => t.pnl > 0).reduce((s, t) => s + t.pnl, 0);
+  const grossLoss = Math.abs(trades.filter(t => t.pnl <= 0).reduce((s, t) => s + t.pnl, 0));
+  const profitFactor = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? Infinity : 0;
+
   return {
     finalEquity: Math.round(equity * 100) / 100,
     totalReturn: Math.round(totalReturn * 100) / 100,
@@ -64,7 +69,8 @@ function computePathMetrics(trades, initialCapital) {
     maxDrawdown: Math.round(maxDrawdown * 100) / 100,
     maxDrawdownPct: Math.round(maxDrawdownPct * 10000) / 100,
     winRate: Math.round(winRate * 100) / 100,
-    sharpe: Math.round(sharpe * 100) / 100
+    sharpe: Math.round(sharpe * 100) / 100,
+    profitFactor: Math.round(profitFactor * 100) / 100
   };
 }
 
@@ -189,7 +195,7 @@ function runMonteCarloSimulation(trades, initialCapital, options = {}) {
   const {
     simulations = 1000,
     seed = 42,
-    confidenceLevels = [5, 10, 25, 50, 75, 90, 95]
+    confidenceLevels = [2.5, 5, 10, 25, 50, 75, 90, 95, 97.5]
   } = options;
 
   // Guard: need minimum trades for meaningful simulation
@@ -227,11 +233,13 @@ function runMonteCarloSimulation(trades, initialCapital, options = {}) {
   const sharpes = pathResults.map(p => p.sharpe).sort((a, b) => a - b);
   const winRates = pathResults.map(p => p.winRate).sort((a, b) => a - b);
   const finalEquities = pathResults.map(p => p.finalEquity).sort((a, b) => a - b);
+  const profitFactors = pathResults.map(p => p.profitFactor).filter(pf => isFinite(pf)).sort((a, b) => a - b);
 
   // Build percentile tables
   const percentiles = {};
   for (const p of confidenceLevels) {
-    percentiles[`p${p}`] = {
+    const key = `p${String(p).replace('.', '_')}`;
+    percentiles[key] = {
       returnPct: Math.round(calculatePercentile(returns, p) * 100) / 100,
       maxDrawdownPct: Math.round(calculatePercentile(drawdowns, p) * 100) / 100,
       sharpe: Math.round(calculatePercentile(sharpes, p) * 100) / 100,
@@ -269,7 +277,11 @@ function runMonteCarloSimulation(trades, initialCapital, options = {}) {
       worstCase5: percentiles.p5.returnPct,
       bestCase95: percentiles.p95.returnPct,
       profitProbability: Math.round((returns.filter(r => r > 0).length / simulations) * 10000) / 100
-    }
+    },
+    // Internal: sorted distributions for statistical tests (not for frontend display)
+    _rawSharpes: sharpes,
+    _rawReturns: returns,
+    _rawProfitFactors: profitFactors
   };
 }
 

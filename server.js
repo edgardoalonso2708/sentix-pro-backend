@@ -2285,6 +2285,15 @@ app.post('/api/backtest/run', async (req, res) => {
 
         // Build completed result
         const metrics = result.metrics || result;
+
+        // Strip internal MC arrays before sending to client/DB
+        const mcForClient = result.monteCarlo ? { ...result.monteCarlo } : null;
+        if (mcForClient) {
+          delete mcForClient._rawSharpes;
+          delete mcForClient._rawReturns;
+          delete mcForClient._rawProfitFactors;
+        }
+
         const completed = {
           id: recordId, user_id: userId, asset, days, step_interval: stepInterval,
           initial_capital: capital, status: 'completed', progress: 100,
@@ -2295,7 +2304,8 @@ app.post('/api/backtest/run', async (req, res) => {
           profit_factor: metrics.profitFactor, sharpe_ratio: metrics.sharpeRatio,
           avg_holding_hours: metrics.avgHoldingBars, trades: result.trades,
           equity_curve: result.equityCurve, metrics: metrics,
-          monte_carlo: result.monteCarlo || null,
+          monte_carlo: mcForClient,
+          significance: result.significance || null,
           completed_at: new Date().toISOString(), created_at: backtestStore.get(recordId)?.created_at
         };
 
@@ -2314,7 +2324,8 @@ app.post('/api/backtest/run', async (req, res) => {
               profit_factor: metrics.profitFactor, sharpe_ratio: metrics.sharpeRatio,
               avg_holding_hours: metrics.avgHoldingBars, trades: result.trades,
               equity_curve: result.equityCurve, metrics: metrics,
-              monte_carlo: result.monteCarlo || null,
+              monte_carlo: mcForClient,
+              significance: result.significance || null,
               completed_at: new Date().toISOString()
             }).eq('id', recordId);
           } catch (_) { /* saved in memory */ }
