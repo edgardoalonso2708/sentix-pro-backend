@@ -1523,7 +1523,7 @@ app.post('/api/backtest/run', async (req, res) => {
           if (useDB && typeof pVal === 'number' && !isNaN(pVal) && pVal % 20 === 0) {
             try {
               const { error: progErr } = await supabase.from('backtest_results').update({ progress: pVal }).eq('id', recordId);
-              if (progErr) logger.warn('Backtest progress DB update failed', { recordId, error: progErr.message });
+              if (progErr) logger.warn(`Backtest progress DB update failed [${progErr.code}]: ${progErr.message}`);
             } catch (_) { /* ignore */ }
           }
         });
@@ -1581,9 +1581,9 @@ app.post('/api/backtest/run', async (req, res) => {
               kelly_sizing: result.kellySizing || null,
               completed_at: new Date().toISOString()
             }).eq('id', recordId);
-            if (updateErr) logger.error('Backtest DB update failed', { recordId, error: updateErr.message, code: updateErr.code });
+            if (updateErr) logger.error(`Backtest DB update FAILED [${updateErr.code}]: ${updateErr.message} | hint: ${updateErr.hint || 'none'} | details: ${updateErr.details || 'none'}`);
             else logger.info('Backtest saved to DB', { recordId });
-          } catch (dbErr) { logger.error('Backtest DB update exception', { recordId, error: dbErr.message }); }
+          } catch (dbErr) { logger.error(`Backtest DB update exception: ${dbErr.message}`); }
         }
 
         logger.info(`Backtest completed: ${recordId}`, {
