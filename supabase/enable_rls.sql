@@ -135,15 +135,14 @@ WITH (security_invoker = true) AS
 SELECT
   p.user_id,
   p.asset,
-  p.asset_class,
-  SUM(p.quantity) as total_quantity,
-  AVG(p.avg_buy_price) as avg_buy_price,
-  SUM(p.total_invested) as total_invested,
+  SUM(p.amount) as total_amount,
+  AVG(p.buy_price) as avg_buy_price,
+  SUM(p.amount * p.buy_price) as total_invested,
   COUNT(DISTINCT p.wallet_id) as wallet_count
 FROM public.portfolios p
 JOIN public.wallets w ON w.id = p.wallet_id
 WHERE w.is_active = true
-GROUP BY p.user_id, p.asset, p.asset_class;
+GROUP BY p.user_id, p.asset;
 
 -- wallet_summary view
 DROP VIEW IF EXISTS public.wallet_summary;
@@ -154,13 +153,13 @@ SELECT
   w.user_id,
   w.name as wallet_name,
   w.provider,
-  w.wallet_type,
+  w.type as wallet_type,
   w.is_active,
   COUNT(p.id) as position_count,
-  COALESCE(SUM(p.total_invested), 0) as total_invested
+  COALESCE(SUM(p.amount * p.buy_price), 0) as total_invested
 FROM public.wallets w
 LEFT JOIN public.portfolios p ON p.wallet_id = w.id
-GROUP BY w.id, w.user_id, w.name, w.provider, w.wallet_type, w.is_active;
+GROUP BY w.id, w.user_id, w.name, w.provider, w.type, w.is_active;
 
 
 -- ═══════════════════════════════════════════════════════════════════════════════
