@@ -16,6 +16,7 @@ class SilentTelegramBot {
     this._offset = 0;
     this._polling = false;
     this._handlers = [];
+    this._callbackHandlers = [];
 
     const isValidToken = token &&
       token.length > 20 &&
@@ -92,25 +93,48 @@ class SilentTelegramBot {
   }
 
   /**
-   * Process a single Telegram update
+   * Process a single Telegram update (text messages + callback queries)
    */
   _processUpdate(update) {
-    if (!update.message || !update.message.text) return;
-    const text = update.message.text;
-    for (const { regex, callback } of this._handlers) {
-      const match = text.match(regex);
-      if (match) {
-        try { callback(update.message, match); } catch (e) {
-          logger.warn('Telegram handler error', { error: e.message });
+    // Handle text messages
+    if (update.message?.text) {
+      const text = update.message.text;
+      for (const { regex, callback } of this._handlers) {
+        const match = text.match(regex);
+        if (match) {
+          try { callback(update.message, match); } catch (e) {
+            logger.warn('Telegram handler error', { error: e.message });
+          }
+        }
+      }
+    }
+
+    // Handle inline keyboard callback queries
+    if (update.callback_query) {
+      const { id, data } = update.callback_query;
+      for (const { pattern, callback } of this._callbackHandlers) {
+        if (data.startsWith(pattern)) {
+          try {
+            callback(update.callback_query);
+          } catch (e) {
+            logger.warn('Telegram callback handler error', { error: e.message });
+          }
+          // Acknowledge the callback to remove loading spinner
+          this._apiCall('answerCallbackQuery', { callback_query_id: id }).catch(() => {});
+          break;
         }
       }
     }
   }
 
   /**
-   * Call Telegram Bot API via HTTPS (with timeout)
+   * Call Telegram Bot API via HTTPS GET (simple params)
    */
   _apiCall(method, params = {}) {
+    // Use POST for methods that need JSON body (reply_markup, etc.)
+    const needsPost = Object.values(params).some(v => typeof v === 'object');
+    if (needsPost) return this._apiCallPost(method, params);
+
     return new Promise((resolve, reject) => {
       const query = Object.entries(params)
         .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
@@ -135,12 +159,124 @@ class SilentTelegramBot {
       });
 
       req.on('error', reject);
-      // Timeout: polling timeout (15s) + 5s buffer
       req.setTimeout(20000, () => {
         req.destroy();
         reject(new Error('Request timeout'));
       });
     });
+  }
+
+  /**
+   * Call Telegram Bot API via HTTPS POST (for JSON body params)
+   */
+  _apiCallPost(method, params = {}) {
+    return new Promise((resolve, reject) => {
+      const postData = JSON.stringify(params);
+      const options = {
+        hostname: 'api.telegram.org',
+        path: `/bot${this._token}/${method}`,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(postData),
+        },
+      };
+
+      const req = https.request(options, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          try {
+            const json = JSON.parse(data);
+            if (!json.ok) {
+              const err = new Error(json.description || 'API error');
+              err.statusCode = json.error_code;
+              reject(err);
+            } else {
+              resolve(json);
+            }
+          } catch { reject(new Error('Invalid JSON response')); }
+        });
+      });
+
+      req.on('error', reject);
+      req.setTimeout(10000, () => {
+        req.destroy();
+        reject(new Error('Request timeout'));
+      });
+      req.write(postData);
+      req.end();
+    });
+  }
+
+  // ─── Callback query handlers ─────────────────────────────────────────────
+
+  /**
+   * Register a callback query handler for inline keyboard buttons.
+   * @param {string} pattern - Prefix to match in callback_data
+   * @param {Function} callback - Handler receiving the callback_query object
+   */
+  onCallbackQuery(pattern, callback) {
+    if (this.enabled) {
+      this._callbackHandlers.push({ pattern, callback });
+    }
+  }
+
+  /**
+   * Broadcast a message with inline keyboard buttons to all subscribers.
+   * @param {string} text - Markdown-formatted message
+   * @param {Array} inlineKeyboard - Array of button rows: [[{text, callback_data}]]
+   * @returns {Object} { sent, total, messageIds }
+   */
+  async broadcastWithButtons(text, inlineKeyboard) {
+    if (!this.enabled || this.subscribedChatIds.size === 0) {
+      return { sent: 0, total: this.subscribedChatIds.size, messageIds: {} };
+    }
+
+    let sent = 0;
+    const messageIds = {};
+    for (const chatId of this.subscribedChatIds) {
+      try {
+        const result = await this._apiCallPost('sendMessage', {
+          chat_id: chatId,
+          text,
+          parse_mode: 'Markdown',
+          reply_markup: { inline_keyboard: inlineKeyboard },
+        });
+        if (result.ok) {
+          sent++;
+          messageIds[chatId] = result.result.message_id;
+        }
+      } catch (err) {
+        logger.debug('broadcastWithButtons failed for chat', { chatId, error: err.message });
+      }
+    }
+    return { sent, total: this.subscribedChatIds.size, messageIds };
+  }
+
+  /**
+   * Edit a previously sent message (e.g., after button click).
+   */
+  async editMessage(chatId, messageId, text, inlineKeyboard = null) {
+    if (!this.enabled) return { success: false, reason: 'bot_disabled' };
+    try {
+      const params = {
+        chat_id: chatId,
+        message_id: messageId,
+        text,
+        parse_mode: 'Markdown',
+      };
+      if (inlineKeyboard) {
+        params.reply_markup = { inline_keyboard: inlineKeyboard };
+      } else {
+        // Remove keyboard after action
+        params.reply_markup = { inline_keyboard: [] };
+      }
+      await this._apiCallPost('editMessageText', params);
+      return { success: true };
+    } catch (err) {
+      return { success: false, reason: err.message };
+    }
   }
 
   // ─── Standard bot methods ───────────────────────────────────────────────
@@ -229,6 +365,7 @@ function setupTelegramCommands(bot, marketDataGetter, signalsGetter) {
       '/precio [ASSET] - Precio actual\n' +
       '/señales - Señales activas\n' +
       '/mercado - Resumen del mercado\n' +
+      '/autotune - Estado del auto-tuner\n' +
       '/stop - Detener alertas',
       { parse_mode: 'Markdown' }
     );
@@ -293,7 +430,59 @@ function setupTelegramCommands(bot, marketDataGetter, signalsGetter) {
   });
 }
 
+/**
+ * Setup auto-tune Telegram command and callback handlers.
+ * Called from alerts worker where autoTuner is available.
+ */
+function setupAutoTuneCommands(bot, getAutoTuneState) {
+  if (!bot.isActive()) return;
+
+  bot.onText(/\/autotune/, async (msg) => {
+    const chatId = msg.chat.id;
+    try {
+      const state = getAutoTuneState ? await getAutoTuneState() : null;
+      if (!state) {
+        await bot.sendMessage(chatId, '🤖 *Auto-Tuner*\n\nNo hay información disponible.', { parse_mode: 'Markdown' });
+        return;
+      }
+
+      let text = '🤖 *Auto-Parameter Tuner*\n\n';
+      text += `Config: ${state.configSource === 'saved' ? '🟢 Auto-Tuned' : '📦 Default'}\n`;
+      text += `Régimen: ${state.marketRegime || 'unknown'}\n`;
+      text += `Aprobación: ${state.approvalMode || 'auto'}\n`;
+
+      if (state.lastRun) {
+        const ago = Math.round((Date.now() - new Date(state.lastRun.started_at).getTime()) / 3600000);
+        text += `\nÚltimo run: hace ${ago}h`;
+        const applied = state.lastRun.params_applied ? Object.keys(state.lastRun.params_applied).length : 0;
+        text += ` (${applied} params aplicados)`;
+        if (state.lastRun.ai_review?.decision) {
+          text += `\nAI: ${state.lastRun.ai_review.decision}`;
+        }
+      }
+
+      if (state.pendingCount > 0) {
+        text += `\n\n⏳ *${state.pendingCount} propuesta(s) pendiente(s)*`;
+      }
+
+      const buttons = [[
+        { text: '🔄 Ejecutar ahora', callback_data: 'at_run' },
+      ]];
+
+      await bot._apiCallPost('sendMessage', {
+        chat_id: chatId,
+        text,
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: buttons },
+      });
+    } catch (err) {
+      await bot.sendMessage(chatId, '❌ Error obteniendo estado del auto-tuner.');
+    }
+  });
+}
+
 module.exports = {
   SilentTelegramBot,
-  setupTelegramCommands
+  setupTelegramCommands,
+  setupAutoTuneCommands,
 };

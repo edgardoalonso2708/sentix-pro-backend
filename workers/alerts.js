@@ -9,7 +9,7 @@ require('dotenv').config();
 const cron = require('node-cron');
 const { createClient } = require('@supabase/supabase-js');
 const { Resend } = require('resend');
-const { SilentTelegramBot, setupTelegramCommands } = require('../telegramBot');
+const { SilentTelegramBot, setupTelegramCommands, setupAutoTuneCommands } = require('../telegramBot');
 const { generateSignalWithRealData, generateMultiTimeframeSignal } = require('../technicalAnalysis');
 const { fetchDerivativesData, fetchOrderBookDepth } = require('../binanceAPI');
 const { evaluateAndExecute } = require('../paperTrading');
@@ -21,7 +21,12 @@ const { MSG, sendToParent, installWorkerIPC } = require('../shared/ipc');
 const { LRUCache } = require('../shared/lruCache');
 const { metrics } = require('../shared/metrics');
 const { recordSignalOutcome, checkPendingOutcomes } = require('../signalAccuracy');
-const { runAutoTune, getActiveConfig, isAutoTuneRunning } = require('../autoTuner');
+const {
+  runAutoTune, getActiveConfig, isAutoTuneRunning, getApprovalMode,
+  getAutoTuneHistory, approveProposal, getPendingProposals,
+  cleanupExpiredProposals, checkPostApplyPerformance,
+} = require('../autoTuner');
+const { computeFeatures } = require('../featureStore');
 
 // ─── SUPABASE CLIENT ──────────────────────────────────────────────────────
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY);
@@ -655,7 +660,7 @@ cronTask = cron.schedule('*/5 * * * *', async () => {
   }
 });
 
-// Cron: auto-parameter tuning daily at 3:00 AM
+// Cron: auto-parameter tuning daily at 3:00 AM (now with Telegram approval)
 cron.schedule('0 3 * * *', async () => {
   if (isAutoTuneRunning()) {
     logger.debug('Skipping auto-tune — already running');
@@ -663,11 +668,13 @@ cron.schedule('0 3 * * *', async () => {
   }
   logger.info('Starting scheduled auto-tune');
   try {
-    const result = await runAutoTune(supabase, { trigger: 'scheduled' });
+    const result = await runAutoTune(supabase, { trigger: 'scheduled', bot });
     if (result.error) {
       logger.warn('Scheduled auto-tune failed', { error: result.error });
     } else if (result.skipped) {
       logger.info('Scheduled auto-tune skipped', { reason: result.reason });
+    } else if (result.status === 'pending_approval') {
+      logger.info('Scheduled auto-tune pending Telegram approval', { runId: result.runId });
     } else {
       const applied = result.paramsApplied ? Object.keys(result.paramsApplied).length : 0;
       logger.info('Scheduled auto-tune completed', {
@@ -675,8 +682,8 @@ cron.schedule('0 3 * * *', async () => {
         aiDecision: result.aiReview?.decision || 'N/A',
         regime: result.marketRegime,
       });
-      // Notify via Telegram
-      if (bot.isActive() && applied > 0) {
+      // Notify via Telegram (auto mode only — telegram mode sends its own proposal)
+      if (bot.isActive() && applied > 0 && result.approvalMode === 'auto') {
         const paramList = Object.entries(result.paramsApplied)
           .map(([k, v]) => `  • ${k}: ${v}`)
           .join('\n');
@@ -692,6 +699,16 @@ cron.schedule('0 3 * * *', async () => {
     }
   } catch (err) {
     logger.error('Scheduled auto-tune error', { error: err.message });
+  }
+});
+
+// Cron: cleanup expired proposals + post-apply monitoring every 6h
+cron.schedule('0 */6 * * *', async () => {
+  try {
+    await cleanupExpiredProposals(supabase, bot);
+    await checkPostApplyPerformance(supabase, bot);
+  } catch (err) {
+    logger.debug('Post-apply/cleanup check error', { error: err.message });
   }
 });
 
@@ -715,6 +732,54 @@ _metricsTimer.unref();
 
   // Load Telegram subscribers
   await loadTelegramSubscribers();
+
+  // Setup Telegram auto-tune callback handlers (inline keyboard buttons)
+  bot.onCallbackQuery('at_', async (query) => {
+    const parts = query.data.split('_'); // at_apply_runId | at_blend_runId | at_reject_runId | at_run
+    const action = parts[1];
+
+    if (action === 'run') {
+      // Manual trigger from Telegram
+      if (isAutoTuneRunning()) {
+        await bot.sendMessage(query.message.chat.id, '⏳ Auto-tune ya está ejecutándose.');
+        return;
+      }
+      await bot.sendMessage(query.message.chat.id, '🔄 Iniciando auto-tune manual...');
+      runAutoTune(supabase, { trigger: 'manual', bot }).catch(err => {
+        logger.error('Manual auto-tune from Telegram failed', { error: err.message });
+      });
+      return;
+    }
+
+    // Approval action: apply/blend/reject
+    const runId = parts.slice(2).join('_'); // Handle UUIDs with underscores
+    if (!runId) return;
+
+    const result = await approveProposal(supabase, runId, action, 'telegram', bot);
+    if (!result.success) {
+      await bot.sendMessage(query.message.chat.id, `⚠️ ${result.message}`);
+    }
+    // editMessage is called inside approveProposal
+  });
+
+  // Setup /autotune command
+  setupAutoTuneCommands(bot, async () => {
+    const { config, source } = await getActiveConfig(supabase);
+    const { history } = await getAutoTuneHistory(supabase, 1);
+    let marketRegime = 'unknown';
+    try {
+      const features = await computeFeatures('bitcoin', '4h');
+      marketRegime = features?.marketRegime || 'unknown';
+    } catch (_) {}
+
+    return {
+      configSource: source,
+      marketRegime,
+      approvalMode: getApprovalMode(),
+      lastRun: history[0] || null,
+      pendingCount: getPendingProposals().length,
+    };
+  });
 
   logger.info('Alerts worker ready');
 })();

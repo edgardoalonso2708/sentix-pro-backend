@@ -59,7 +59,10 @@ const {
 } = require('./paperTrading');
 const { runBacktest } = require('./backtester');
 const { startOptimizationJob, getJobStatus, getAllJobs, PARAM_RANGES } = require('./optimizer');
-const { runAutoTune, getAutoTuneHistory, getActiveConfig, isAutoTuneRunning, PRIORITY_PARAMS } = require('./autoTuner');
+const {
+  runAutoTune, getAutoTuneHistory, getActiveConfig, isAutoTuneRunning,
+  getApprovalMode, approveProposal, getPendingProposals, PRIORITY_PARAMS,
+} = require('./autoTuner');
 const { DEFAULT_STRATEGY_CONFIG, SCHEDULE_CONFIG } = require('./strategyConfig');
 const { enrichSignalWithTTL } = require('./scheduleUtils');
 const { getAccuracyMetrics } = require('./signalAccuracy');
@@ -1849,11 +1852,14 @@ app.get('/api/autotune/history', async (req, res) => {
 app.get('/api/autotune/config', async (req, res) => {
   try {
     const { config, source } = await getActiveConfig(supabase);
+    const pending = getPendingProposals();
     res.json({
       config,
       source,
       priorityParams: PRIORITY_PARAMS,
       isRunning: isAutoTuneRunning(),
+      approvalMode: getApprovalMode(),
+      pendingCount: pending.length,
     });
   } catch (err) {
     logger.error('Active config fetch failed', { error: err.message });
@@ -1899,6 +1905,41 @@ app.post('/api/autotune/reset', async (req, res) => {
     res.json({ status: 'reset', message: 'Strategy config reset to defaults' });
   } catch (err) {
     logger.error('Config reset failed', { error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/autotune/pending — Get pending proposals awaiting approval
+ */
+app.get('/api/autotune/pending', (req, res) => {
+  try {
+    const pending = getPendingProposals();
+    res.json({ pending, approvalMode: getApprovalMode() });
+  } catch (err) {
+    logger.error('Pending proposals fetch failed', { error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /api/autotune/approve — Approve or reject a pending proposal
+ */
+app.post('/api/autotune/approve', async (req, res) => {
+  try {
+    const { runId, decision } = req.body;
+    if (!runId || !['apply', 'blend', 'reject'].includes(decision)) {
+      return res.status(400).json({ error: 'Invalid request. Need runId and decision (apply|blend|reject).' });
+    }
+
+    const result = await approveProposal(supabase, runId, decision, 'api');
+    if (!result.success) {
+      return res.status(404).json({ error: result.message });
+    }
+
+    res.json(result);
+  } catch (err) {
+    logger.error('Approval failed', { error: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });

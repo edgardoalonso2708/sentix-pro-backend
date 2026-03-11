@@ -1,8 +1,9 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// SENTIX PRO — AUTO-PARAMETER TUNER
+// SENTIX PRO — AUTO-PARAMETER TUNER (Hybrid AI + Telegram Approval)
 // Periodically re-optimizes strategy parameters and applies safe changes.
 // Nivel 1: Statistical (grid search + walk-forward + safety guards)
-// Nivel 2: AI review via Claude API (optional, requires ANTHROPIC_API_KEY)
+// Nivel 2: AI review via Claude API (enhanced context)
+// Nivel 3: Telegram/API approval before applying + post-apply monitoring
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const { logger } = require('./logger');
@@ -33,11 +34,16 @@ const TUNER_CONFIG = {
   maxParamsPerRun: 5,
   cooldownHours: 12,
   blendRatio: 0.5,
-  revertThresholdPct: 20,  // If performance drops > 20%, flag for revert
+  revertThresholdPct: 20,  // If performance drops > 20%, auto-revert
+  proposalTtlMs: 4 * 60 * 60 * 1000, // 4 hours for Telegram approval
 };
 
-// ─── In-memory lock ──────────────────────────────────────────────────────────
+// ─── Approval mode: 'auto' (apply immediately) | 'telegram' (require approval)
+const APPROVAL_MODE = process.env.AUTOTUNE_APPROVAL_MODE || 'telegram';
+
+// ─── In-memory state ─────────────────────────────────────────────────────────
 let isRunning = false;
+const pendingProposals = new Map(); // runId → { accepted, configAfter, configBefore, context, expiresAt, messageIds }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ACTIVE CONFIG MANAGEMENT
@@ -113,7 +119,7 @@ async function checkCooldown(supabase) {
     const { data } = await supabase
       .from('auto_tune_runs')
       .select('completed_at')
-      .eq('status', 'completed')
+      .in('status', ['completed', 'pending_approval'])
       .order('completed_at', { ascending: false })
       .limit(1)
       .single();
@@ -173,11 +179,117 @@ function evaluateProposal(result) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// NIVEL 2 — AI REVIEW (Claude API)
+// ENHANCED CONTEXT — Paper trading + Signal accuracy + History
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Ask Claude to review proposed parameter changes.
+ * Gather rich context for the AI advisor: paper trading perf, signal accuracy, tune history.
+ */
+async function getEnhancedContext(supabase, asset) {
+  const context = {
+    paperPerformance: null,
+    signalAccuracy: null,
+    recentTuneRuns: [],
+    regimeHistory: null,
+  };
+
+  // Paper trading performance (last 30 days)
+  try {
+    const cutoff = new Date(Date.now() - 30 * 24 * 3600 * 1000).toISOString();
+    const { data: trades } = await supabase
+      .from('paper_trades')
+      .select('realized_pnl, realized_pnl_percent, exit_reason')
+      .eq('status', 'closed')
+      .gte('closed_at', cutoff);
+
+    if (trades && trades.length >= 5) {
+      const wins = trades.filter(t => t.realized_pnl > 0).length;
+      const pnls = trades.map(t => parseFloat(t.realized_pnl) || 0);
+      const avgPnl = pnls.reduce((s, v) => s + v, 0) / pnls.length;
+      const totalPnl = pnls.reduce((s, v) => s + v, 0);
+
+      // Simple Sharpe approximation (annualized from daily avg)
+      const mean = avgPnl;
+      const variance = pnls.reduce((s, v) => s + (v - mean) ** 2, 0) / pnls.length;
+      const stdDev = Math.sqrt(variance) || 1;
+      const dailySharpe = mean / stdDev;
+      const sharpe = Math.round(dailySharpe * Math.sqrt(365) * 100) / 100;
+
+      // Max drawdown
+      let peak = 0, maxDD = 0, running = 0;
+      for (const p of pnls) {
+        running += p;
+        if (running > peak) peak = running;
+        const dd = (peak - running) / (Math.abs(peak) || 1);
+        if (dd > maxDD) maxDD = dd;
+      }
+
+      context.paperPerformance = {
+        trades: trades.length,
+        winRate: Math.round((wins / trades.length) * 100),
+        avgPnl: Math.round(avgPnl * 100) / 100,
+        totalPnl: Math.round(totalPnl * 100) / 100,
+        sharpe,
+        maxDrawdown: Math.round(maxDD * 100),
+      };
+    }
+  } catch (_) { /* non-critical */ }
+
+  // Signal accuracy (last 7 days)
+  try {
+    const cutoff = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+    const { data: outcomes } = await supabase
+      .from('signal_outcomes')
+      .select('direction_correct_1h, direction_correct_4h, direction_correct_24h')
+      .gte('signal_generated_at', cutoff)
+      .not('price_1h', 'is', null);
+
+    if (outcomes && outcomes.length >= 5) {
+      const total = outcomes.length;
+      const hit1h = outcomes.filter(o => o.direction_correct_1h).length;
+      const hit4h = outcomes.filter(o => o.direction_correct_4h !== null && o.direction_correct_4h).length;
+      const hit24h = outcomes.filter(o => o.direction_correct_24h !== null && o.direction_correct_24h).length;
+      const count4h = outcomes.filter(o => o.direction_correct_4h !== null).length;
+      const count24h = outcomes.filter(o => o.direction_correct_24h !== null).length;
+
+      context.signalAccuracy = {
+        total,
+        hitRate1h: Math.round((hit1h / total) * 100),
+        hitRate4h: count4h > 0 ? Math.round((hit4h / count4h) * 100) : null,
+        hitRate24h: count24h > 0 ? Math.round((hit24h / count24h) * 100) : null,
+      };
+    }
+  } catch (_) { /* non-critical */ }
+
+  // Last 5 auto-tune runs
+  try {
+    const { data: runs } = await supabase
+      .from('auto_tune_runs')
+      .select('started_at, status, market_regime, params_applied, ai_review, approved_by')
+      .order('started_at', { ascending: false })
+      .limit(5);
+
+    if (runs) {
+      context.recentTuneRuns = runs.map(r => ({
+        date: r.started_at?.slice(0, 10),
+        status: r.status,
+        regime: r.market_regime,
+        applied: r.params_applied ? Object.keys(r.params_applied).length : 0,
+        aiDecision: r.ai_review?.decision || 'N/A',
+        approvedBy: r.approved_by || 'auto',
+      }));
+    }
+  } catch (_) { /* non-critical */ }
+
+  return context;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NIVEL 2 — AI REVIEW (Claude API — Enhanced)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Ask Claude to review proposed parameter changes with enriched context.
  * Returns { decision, reasoning, modifiedParams } or null if unavailable.
  */
 async function aiReviewProposals(proposals, context) {
@@ -227,7 +339,31 @@ function buildAIPrompt(proposals, context) {
     `- ${p.paramName}: ${p.currentValue} → ${p.proposedValue} (Sharpe: ${p.currentSharpe?.toFixed(2)} → ${p.proposedSharpe?.toFixed(2)}, +${p.improvementPct?.toFixed(1)}%)`
   ).join('\n');
 
-  return `You are a quantitative trading strategy advisor for a crypto/metals automated trading system called Sentix Pro.
+  // Enhanced context sections
+  let paperSection = '';
+  if (context.paperPerformance) {
+    const pp = context.paperPerformance;
+    paperSection = `\nPAPER TRADING (last 30d):
+- ${pp.trades} trades, Win Rate: ${pp.winRate}%, Sharpe: ${pp.sharpe}
+- Avg P&L: $${pp.avgPnl}, Total P&L: $${pp.totalPnl}, Max DD: ${pp.maxDrawdown}%`;
+  }
+
+  let signalSection = '';
+  if (context.signalAccuracy) {
+    const sa = context.signalAccuracy;
+    signalSection = `\nSIGNAL ACCURACY (last 7d, ${sa.total} signals):
+- 1h hit rate: ${sa.hitRate1h}%${sa.hitRate4h !== null ? `, 4h: ${sa.hitRate4h}%` : ''}${sa.hitRate24h !== null ? `, 24h: ${sa.hitRate24h}%` : ''}`;
+  }
+
+  let historySection = '';
+  if (context.recentTuneRuns && context.recentTuneRuns.length > 0) {
+    const lines = context.recentTuneRuns.map(r =>
+      `  ${r.date}: ${r.status} (regime: ${r.regime}, ${r.applied} params, AI: ${r.aiDecision}, approved: ${r.approvedBy})`
+    ).join('\n');
+    historySection = `\nRECENT AUTO-TUNE HISTORY:\n${lines}`;
+  }
+
+  return `You are a quantitative trading strategy advisor for Sentix Pro, a crypto/metals automated trading system.
 
 CURRENT CONTEXT:
 - Market regime: ${context.marketRegime || 'unknown'}
@@ -235,16 +371,19 @@ CURRENT CONTEXT:
 - Asset optimized: ${context.asset}
 - Current active config source: ${context.configSource}
 - Recent trade count: ${context.recentTradeCount || 'N/A'}
+- Approval mode: ${APPROVAL_MODE}${paperSection}${signalSection}${historySection}
 
 PROPOSED PARAMETER CHANGES (all passed statistical safety checks):
 ${paramLines}
 
 INSTRUCTIONS:
 Evaluate whether these changes should be applied to a live (paper) trading system. Consider:
-1. Do the changes make sense given the market regime?
+1. Do the changes make sense given the market regime and recent performance?
 2. Are the improvements meaningful or could they be noise?
 3. Are any changes too aggressive (too far from defaults)?
 4. Could applying all changes at once create unexpected interactions?
+5. Does the signal accuracy data suggest the current strategy needs adjustment?
+6. Looking at recent tune history, is there a pattern of oscillating params?
 
 Respond with EXACTLY this format:
 DECISION: APPLY | BLEND | REJECT
@@ -278,6 +417,250 @@ function parseAIDecision(text) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// TELEGRAM APPROVAL FLOW
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Send a proposal to Telegram for user approval.
+ */
+async function sendTelegramProposal(bot, runId, accepted, aiReview, context) {
+  if (!bot || !bot.isActive()) return null;
+
+  const paramLines = accepted.map(p =>
+    `  \`${p.paramName}\`: ${p.currentValue} → *${p.proposedValue}* (+${p.improvementPct}%)`
+  ).join('\n');
+
+  const aiLine = aiReview ? `\nAI (${aiReview.decision}): _${(aiReview.reasoning || '').substring(0, 150)}_` : '';
+
+  const text =
+    `🤖 *AUTO-TUNE: Aprobación Requerida*\n\n` +
+    `Régimen: ${context.marketRegime || 'unknown'}\n` +
+    `Asset: ${context.asset}\n` +
+    `Cambios propuestos (${accepted.length}):\n${paramLines}\n` +
+    `${aiLine}\n\n` +
+    `⏰ Expira en 4 horas`;
+
+  const buttons = [
+    [
+      { text: '✅ Aplicar', callback_data: `at_apply_${runId}` },
+      { text: '🔀 Blend 50/50', callback_data: `at_blend_${runId}` },
+      { text: '❌ Rechazar', callback_data: `at_reject_${runId}` },
+    ],
+  ];
+
+  try {
+    const result = await bot.broadcastWithButtons(text, buttons);
+    return result.messageIds;
+  } catch (err) {
+    logger.warn('Failed to send Telegram proposal', { error: err.message });
+    return null;
+  }
+}
+
+/**
+ * Approve or reject a pending proposal.
+ * @param {string} decision - 'apply' | 'blend' | 'reject'
+ * @param {string} source - 'telegram' | 'api' | 'auto' | 'expired'
+ */
+async function approveProposal(supabase, runId, decision, source, bot = null) {
+  const proposal = pendingProposals.get(String(runId));
+  if (!proposal) {
+    return { success: false, message: 'Propuesta no encontrada o expirada.' };
+  }
+
+  // Check expiry
+  if (Date.now() > proposal.expiresAt) {
+    pendingProposals.delete(String(runId));
+    return { success: false, message: 'Propuesta expirada.' };
+  }
+
+  let paramsApplied = {};
+  let configAfter = { ...proposal.configBefore };
+  let statusMessage = '';
+
+  if (decision === 'apply') {
+    for (const p of proposal.accepted) {
+      paramsApplied[p.paramName] = p.proposedValue;
+      configAfter[p.paramName] = p.proposedValue;
+    }
+    const tuneName = `auto-tune-${new Date().toISOString().slice(0, 10)}`;
+    const desc = `Auto-tuned ${proposal.accepted.length} params (approved by ${source})`;
+    await saveActiveConfig(supabase, configAfter, tuneName, desc);
+    statusMessage = `✅ *Auto-tune aplicado*\n${proposal.accepted.length} parámetros actualizados (por ${source}).`;
+    logger.info('Auto-tune proposal approved', { runId, source, params: Object.keys(paramsApplied) });
+
+  } else if (decision === 'blend') {
+    for (const p of proposal.accepted) {
+      const blended = (p.currentValue + p.proposedValue) * TUNER_CONFIG.blendRatio;
+      const range = PARAM_RANGES[p.paramName];
+      let value = blended;
+      if (range) {
+        value = Math.max(range.min, Math.min(range.max, blended));
+        value = Math.round(value / range.step) * range.step;
+        value = Math.round(value * 1000) / 1000;
+      }
+      paramsApplied[p.paramName] = value;
+      configAfter[p.paramName] = value;
+    }
+    const tuneName = `auto-tune-blend-${new Date().toISOString().slice(0, 10)}`;
+    const desc = `Blended ${proposal.accepted.length} params 50/50 (approved by ${source})`;
+    await saveActiveConfig(supabase, configAfter, tuneName, desc);
+    statusMessage = `🔀 *Auto-tune blended*\nMezcla 50/50 aplicada (por ${source}).`;
+    logger.info('Auto-tune proposal blended', { runId, source, params: Object.keys(paramsApplied) });
+
+  } else {
+    statusMessage = `❌ *Auto-tune rechazado* (por ${source}).`;
+    logger.info('Auto-tune proposal rejected', { runId, source });
+  }
+
+  // Update DB record
+  try {
+    const update = {
+      status: decision === 'reject' ? 'rejected' : 'completed',
+      approved_by: source,
+      approved_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+    };
+    if (decision !== 'reject') {
+      update.params_applied = paramsApplied;
+      update.params_after = configAfter;
+    }
+    await supabase.from('auto_tune_runs').update(update).eq('id', runId);
+  } catch (_) { /* non-critical */ }
+
+  // Notify Telegram
+  if (bot && bot.isActive() && proposal.messageIds) {
+    for (const [chatId, msgId] of Object.entries(proposal.messageIds)) {
+      bot.editMessage(chatId, msgId, statusMessage).catch(() => {});
+    }
+  }
+
+  pendingProposals.delete(String(runId));
+
+  return { success: true, message: statusMessage, decision, paramsApplied };
+}
+
+/**
+ * Cleanup expired proposals.
+ */
+async function cleanupExpiredProposals(supabase, bot = null) {
+  const now = Date.now();
+  for (const [runId, proposal] of pendingProposals) {
+    if (now > proposal.expiresAt) {
+      logger.info('Auto-tune proposal expired', { runId });
+      await approveProposal(supabase, runId, 'reject', 'expired', bot);
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POST-APPLY PERFORMANCE MONITORING
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Check performance of recently applied auto-tune changes.
+ * If Sharpe dropped > 20% in 48h, auto-revert.
+ */
+async function checkPostApplyPerformance(supabase, bot = null) {
+  try {
+    // Find completed runs with params applied, between 24h-72h ago
+    const from = new Date(Date.now() - 72 * 3600 * 1000).toISOString();
+    const to = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+
+    const { data: runs } = await supabase
+      .from('auto_tune_runs')
+      .select('id, params_applied, params_before, completed_at, performance_after')
+      .eq('status', 'completed')
+      .not('params_applied', 'is', null)
+      .is('performance_after', null) // Not yet checked
+      .gte('completed_at', from)
+      .lte('completed_at', to)
+      .limit(3);
+
+    if (!runs || runs.length === 0) return;
+
+    for (const run of runs) {
+      // Get paper trading performance since the tune was applied
+      const { data: trades } = await supabase
+        .from('paper_trades')
+        .select('realized_pnl')
+        .eq('status', 'closed')
+        .gte('closed_at', run.completed_at);
+
+      if (!trades || trades.length < 5) {
+        // Not enough trades to evaluate
+        continue;
+      }
+
+      const pnls = trades.map(t => parseFloat(t.realized_pnl) || 0);
+      const mean = pnls.reduce((s, v) => s + v, 0) / pnls.length;
+      const variance = pnls.reduce((s, v) => s + (v - mean) ** 2, 0) / pnls.length;
+      const stdDev = Math.sqrt(variance) || 1;
+      const postSharpe = Math.round((mean / stdDev) * Math.sqrt(365) * 100) / 100;
+
+      // Save performance_after
+      const performanceAfter = {
+        trades: trades.length,
+        sharpe: postSharpe,
+        totalPnl: Math.round(pnls.reduce((s, v) => s + v, 0) * 100) / 100,
+        checkedAt: new Date().toISOString(),
+      };
+
+      await supabase
+        .from('auto_tune_runs')
+        .update({ performance_after: performanceAfter })
+        .eq('id', run.id);
+
+      // Check if we need to revert (compare vs a baseline — if Sharpe is very negative)
+      if (postSharpe < -0.5 && pnls.length >= 10) {
+        logger.warn('Post-apply performance poor, reverting', {
+          runId: run.id,
+          postSharpe,
+          trades: trades.length,
+        });
+
+        // Revert to params_before
+        if (run.params_before) {
+          const revertName = `auto-revert-${new Date().toISOString().slice(0, 10)}`;
+          const revertDesc = `Auto-reverted due to poor post-apply performance (Sharpe: ${postSharpe})`;
+          await saveActiveConfig(supabase, run.params_before, revertName, revertDesc);
+
+          await supabase
+            .from('auto_tune_runs')
+            .update({ status: 'reverted' })
+            .eq('id', run.id);
+
+          // Notify via Telegram
+          if (bot && bot.isActive()) {
+            const message =
+              `⚠️ *AUTO-REVERT*\n\n` +
+              `Post-tune Sharpe: ${postSharpe} (${trades.length} trades)\n` +
+              `Parámetros revertidos al estado anterior.\n` +
+              `Run: ${run.id}`;
+            bot.broadcastAlert({
+              asset: 'sistema',
+              action: 'HOLD',
+              score: 0,
+              confidence: 100,
+              price: 0,
+              reasons: message,
+            }).catch(() => {});
+          }
+        }
+      } else {
+        logger.info('Post-apply performance OK', {
+          runId: run.id,
+          postSharpe,
+          trades: trades.length,
+        });
+      }
+    }
+  } catch (err) {
+    logger.debug('checkPostApplyPerformance error', { error: err.message });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // MAIN AUTO-TUNE RUNNER
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -288,6 +671,7 @@ function parseAIDecision(text) {
  * @param {string} [options.trigger='scheduled'] - 'scheduled' or 'manual'
  * @param {string} [options.asset='bitcoin'] - Asset to optimize against
  * @param {Function} [options.onProgress] - Progress callback
+ * @param {Object} [options.bot] - Telegram bot instance for approval flow
  * @returns {Object} Run result summary
  */
 async function runAutoTune(supabase, options = {}) {
@@ -299,8 +683,10 @@ async function runAutoTune(supabase, options = {}) {
     trigger = 'scheduled',
     asset = 'bitcoin',
     onProgress = null,
+    bot = null,
   } = options;
 
+  const approvalMode = APPROVAL_MODE;
   isRunning = true;
   let runId = null;
 
@@ -343,12 +729,15 @@ async function runAutoTune(supabase, options = {}) {
     const configBefore = { ...currentConfig };
 
     logger.info('Auto-tune started', {
-      trigger, asset, marketRegime, configSource,
+      trigger, asset, marketRegime, configSource, approvalMode,
       lookback: TUNER_CONFIG.lookbackDays,
       params: PRIORITY_PARAMS.length,
     });
 
-    // ─── 5. Optimize each priority parameter ─────────────────────────
+    // ─── 5. Get enhanced context for AI ──────────────────────────────
+    const enhancedContext = await getEnhancedContext(supabase, asset);
+
+    // ─── 6. Optimize each priority parameter ─────────────────────────
     const paramResults = [];
     let optimizedCount = 0;
 
@@ -425,15 +814,13 @@ async function runAutoTune(supabase, options = {}) {
       }
     }
 
-    // ─── 6. Filter accepted proposals ────────────────────────────────
+    // ─── 7. Filter accepted proposals ────────────────────────────────
     let accepted = paramResults.filter(p => p.accepted);
 
     // Max params per run guard
     if (accepted.length > TUNER_CONFIG.maxParamsPerRun) {
-      // Keep the ones with highest improvement
       accepted.sort((a, b) => (b.improvementPct || 0) - (a.improvementPct || 0));
       accepted = accepted.slice(0, TUNER_CONFIG.maxParamsPerRun);
-      // Mark the rest as rejected
       for (const p of paramResults) {
         if (p.accepted && !accepted.includes(p)) {
           p.accepted = false;
@@ -452,7 +839,7 @@ async function runAutoTune(supabase, options = {}) {
       maxChangeGuard: accepted.length <= TUNER_CONFIG.maxParamsPerRun,
     };
 
-    // ─── 7. AI Review (Nivel 2) ──────────────────────────────────────
+    // ─── 8. AI Review (Nivel 2 — Enhanced) ───────────────────────────
     let aiReview = null;
     if (accepted.length > 0) {
       if (onProgress) onProgress({ phase: 'ai_review', accepted: accepted.length });
@@ -463,6 +850,10 @@ async function runAutoTune(supabase, options = {}) {
         asset,
         configSource,
         recentTradeCount: accepted[0]?.trades || 0,
+        // Enhanced context fields
+        paperPerformance: enhancedContext.paperPerformance,
+        signalAccuracy: enhancedContext.signalAccuracy,
+        recentTuneRuns: enhancedContext.recentTuneRuns,
       });
 
       if (aiReview) {
@@ -471,7 +862,7 @@ async function runAutoTune(supabase, options = {}) {
           reasoning: aiReview.reasoning?.substring(0, 100),
         });
 
-        // Apply AI decision
+        // Apply AI decision to filter proposals
         if (aiReview.decision === 'REJECT') {
           for (const p of accepted) {
             p.accepted = false;
@@ -479,21 +870,17 @@ async function runAutoTune(supabase, options = {}) {
           }
           accepted = [];
         } else if (aiReview.decision === 'BLEND') {
-          // Blend 50/50
           for (const p of accepted) {
             const blended = Math.round((p.currentValue + p.proposedValue) * TUNER_CONFIG.blendRatio * 1000) / 1000;
-            // Ensure blended is within PARAM_RANGES
             const range = PARAM_RANGES[p.paramName];
             if (range) {
               p.proposedValue = Math.max(range.min, Math.min(range.max, blended));
-              // Snap to step
               p.proposedValue = Math.round(p.proposedValue / range.step) * range.step;
               p.proposedValue = Math.round(p.proposedValue * 1000) / 1000;
             }
             p.reason = 'AI blended';
           }
         } else if (aiReview.modifiedParams) {
-          // AI specified which params to apply
           for (const p of accepted) {
             if (!aiReview.modifiedParams.includes(p.paramName)) {
               p.accepted = false;
@@ -505,11 +892,36 @@ async function runAutoTune(supabase, options = {}) {
       }
     }
 
-    // ─── 8. Apply accepted changes ───────────────────────────────────
+    // ─── 9. Apply or wait for approval ───────────────────────────────
     let paramsApplied = {};
     let configAfter = { ...currentConfig };
+    let status = 'completed';
 
-    if (accepted.length > 0) {
+    if (accepted.length > 0 && approvalMode === 'telegram' && bot?.isActive()) {
+      // ─── TELEGRAM APPROVAL MODE: store and wait ─────────────
+      status = 'pending_approval';
+
+      const messageIds = await sendTelegramProposal(bot, runId, accepted, aiReview, {
+        marketRegime, asset,
+      });
+
+      pendingProposals.set(String(runId), {
+        accepted,
+        configBefore,
+        configAfter: null, // Will be computed on approval
+        context: { marketRegime, asset, aiReview },
+        expiresAt: Date.now() + TUNER_CONFIG.proposalTtlMs,
+        messageIds: messageIds || {},
+      });
+
+      logger.info('Auto-tune pending Telegram approval', {
+        runId,
+        proposals: accepted.length,
+        expiresIn: '4h',
+      });
+
+    } else if (accepted.length > 0) {
+      // ─── AUTO MODE: apply immediately ──────────────────────
       for (const p of accepted) {
         paramsApplied[p.paramName] = p.proposedValue;
         configAfter[p.paramName] = p.proposedValue;
@@ -532,39 +944,44 @@ async function runAutoTune(supabase, options = {}) {
       });
     }
 
-    if (onProgress) onProgress({ phase: 'completed', accepted: accepted.length });
+    if (onProgress) onProgress({ phase: status === 'pending_approval' ? 'pending_approval' : 'completed', accepted: accepted.length });
 
-    // ─── 9. Update run record ────────────────────────────────────────
+    // ─── 10. Update run record ───────────────────────────────────────
     const runResult = {
       runId,
-      status: 'completed',
+      status,
       trigger,
       asset,
       marketRegime,
+      approvalMode,
       paramResults,
       safetyChecks,
       aiReview,
       paramsApplied: Object.keys(paramsApplied).length > 0 ? paramsApplied : null,
       paramsBefore: configBefore,
-      paramsAfter: accepted.length > 0 ? configAfter : null,
-      completedAt: new Date().toISOString(),
+      paramsAfter: accepted.length > 0 && status === 'completed' ? configAfter : null,
+      completedAt: status === 'completed' ? new Date().toISOString() : null,
     };
 
     if (runId) {
       try {
+        const dbUpdate = {
+          status,
+          market_regime: marketRegime,
+          param_results: paramResults,
+          safety_checks: safetyChecks,
+          ai_review: aiReview,
+          params_before: configBefore,
+        };
+        if (status === 'completed') {
+          dbUpdate.completed_at = runResult.completedAt;
+          dbUpdate.params_applied = runResult.paramsApplied;
+          dbUpdate.params_after = runResult.paramsAfter;
+          dbUpdate.approved_by = 'auto';
+        }
         await supabase
           .from('auto_tune_runs')
-          .update({
-            completed_at: runResult.completedAt,
-            status: 'completed',
-            market_regime: marketRegime,
-            param_results: paramResults,
-            safety_checks: safetyChecks,
-            ai_review: aiReview,
-            params_applied: runResult.paramsApplied,
-            params_before: configBefore,
-            params_after: runResult.paramsAfter,
-          })
+          .update(dbUpdate)
           .eq('id', runId);
       } catch (_) { /* non-critical */ }
     }
@@ -617,10 +1034,37 @@ async function getAutoTuneHistory(supabase, limit = 10) {
 }
 
 /**
+ * Get pending proposals for API/frontend.
+ */
+function getPendingProposals() {
+  const pending = [];
+  const now = Date.now();
+  for (const [runId, p] of pendingProposals) {
+    if (now < p.expiresAt) {
+      pending.push({
+        runId,
+        accepted: p.accepted,
+        context: p.context,
+        expiresAt: new Date(p.expiresAt).toISOString(),
+        remainingMs: p.expiresAt - now,
+      });
+    }
+  }
+  return pending;
+}
+
+/**
  * Check if auto-tune is currently running.
  */
 function isAutoTuneRunning() {
   return isRunning;
+}
+
+/**
+ * Get current approval mode.
+ */
+function getApprovalMode() {
+  return APPROVAL_MODE;
 }
 
 module.exports = {
@@ -629,8 +1073,17 @@ module.exports = {
   getActiveConfig,
   saveActiveConfig,
   isAutoTuneRunning,
+  getApprovalMode,
   PRIORITY_PARAMS,
   TUNER_CONFIG,
+  // Approval flow
+  approveProposal,
+  getPendingProposals,
+  cleanupExpiredProposals,
+  // Post-apply monitoring
+  checkPostApplyPerformance,
+  // Enhanced context
+  getEnhancedContext,
   // Exported for testing
   evaluateProposal,
   checkCooldown,
