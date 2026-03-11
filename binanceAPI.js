@@ -532,9 +532,100 @@ async function fetchLongShortRatio(symbol, period = '1h') {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// BYBIT V5 API — Fallback for derivatives data when Binance is geo-blocked
+// No API key required for public market endpoints
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const BYBIT_BASE = 'https://api.bybit.com';
+let derivativesProvider = 'binance'; // 'binance' or 'bybit' — auto-switches on 451
+
+/**
+ * Fetch funding rate from Bybit V5 API
+ */
+async function fetchFundingRateBybit(symbol) {
+  const res = await axios.get(`${BYBIT_BASE}/v5/market/funding/history`, {
+    params: { category: 'linear', symbol: symbol.toUpperCase(), limit: 1 },
+    timeout: 10000
+  });
+  const item = res.data?.result?.list?.[0];
+  if (!item) throw new Error('No Bybit funding data');
+  return {
+    fundingRate: parseFloat(item.fundingRate) || 0,
+    fundingTime: parseInt(item.fundingRateTimestamp) || Date.now(),
+    markPrice: 0 // Bybit funding endpoint doesn't return mark price
+  };
+}
+
+/**
+ * Fetch open interest from Bybit V5 API
+ */
+async function fetchOpenInterestBybit(symbol) {
+  const res = await axios.get(`${BYBIT_BASE}/v5/market/open-interest`, {
+    params: { category: 'linear', symbol: symbol.toUpperCase(), intervalTime: '1h', limit: 1 },
+    timeout: 10000
+  });
+  const item = res.data?.result?.list?.[0];
+  if (!item) throw new Error('No Bybit OI data');
+  return {
+    openInterest: parseFloat(item.openInterest) || 0,
+    symbol: symbol.toUpperCase(),
+    time: parseInt(item.timestamp) || Date.now()
+  };
+}
+
+/**
+ * Fetch long/short account ratio from Bybit V5 API
+ */
+async function fetchLongShortRatioBybit(symbol, period = '1h') {
+  const res = await axios.get(`${BYBIT_BASE}/v5/market/account-ratio`, {
+    params: { category: 'linear', symbol: symbol.toUpperCase(), period, limit: 1 },
+    timeout: 10000
+  });
+  const item = res.data?.result?.list?.[0];
+  if (!item) return { longShortRatio: 1, longAccount: 0.5, shortAccount: 0.5, timestamp: null };
+  const buyRatio = parseFloat(item.buyRatio) || 0.5;
+  const sellRatio = parseFloat(item.sellRatio) || 0.5;
+  return {
+    longShortRatio: sellRatio > 0 ? Math.round((buyRatio / sellRatio) * 1000) / 1000 : 1,
+    longAccount: buyRatio,
+    shortAccount: sellRatio,
+    timestamp: parseInt(item.timestamp) || null
+  };
+}
+
+/**
+ * Fetch historical funding rates from Bybit V5 (for backtester)
+ */
+async function fetchHistoricalFundingBybit(symbol, startMs, endMs) {
+  const results = [];
+  let endCursor = endMs;
+  const MAX_PAGES = 20;
+
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const res = await axios.get(`${BYBIT_BASE}/v5/market/funding/history`, {
+      params: { category: 'linear', symbol: symbol.toUpperCase(), endTime: endCursor, limit: 200 },
+      timeout: 15000
+    });
+    const list = res.data?.result?.list || [];
+    if (list.length === 0) break;
+
+    for (const item of list) {
+      const ts = parseInt(item.fundingRateTimestamp);
+      if (ts < startMs) { page = MAX_PAGES; break; } // Stop pagination
+      results.push({ fundingTime: ts, fundingRate: parseFloat(item.fundingRate) || 0 });
+    }
+
+    endCursor = parseInt(list[list.length - 1].fundingRateTimestamp) - 1;
+    await new Promise(r => setTimeout(r, 200)); // Be nice to Bybit
+  }
+
+  return results.sort((a, b) => a.fundingTime - b.fundingTime);
+}
+
 /**
  * Fetch all derivatives data for a CoinGecko asset ID
- * Aggregates funding rate, open interest, and long/short ratio in parallel
+ * Tries Binance first, auto-falls back to Bybit on geo-block (451/403)
  * @param {string} coinGeckoId - e.g. 'bitcoin'
  * @returns {Promise<Object|null>} Derivatives data or null if not available
  */
@@ -542,15 +633,52 @@ async function fetchDerivativesData(coinGeckoId) {
   const symbol = FUTURES_SYMBOL_MAP[coinGeckoId];
   if (!symbol) return null; // No futures for this asset (e.g. PAXG)
 
+  // Try Binance first (unless already switched to Bybit)
+  if (derivativesProvider === 'binance') {
+    try {
+      const [funding, oi, lsRatio] = await Promise.all([
+        fetchFundingRate(symbol),
+        fetchOpenInterest(symbol),
+        fetchLongShortRatio(symbol)
+      ]);
+
+      const fundingRatePercent = funding.fundingRate * 100;
+      const fundingRateAnnualized = fundingRatePercent * 3 * 365;
+
+      return {
+        fundingRate: funding.fundingRate,
+        fundingRatePercent: Math.round(fundingRatePercent * 10000) / 10000,
+        fundingRateAnnualized: Math.round(fundingRateAnnualized * 100) / 100,
+        openInterest: oi.openInterest,
+        longShortRatio: lsRatio.longShortRatio,
+        longAccount: lsRatio.longAccount,
+        shortAccount: lsRatio.shortAccount,
+        markPrice: funding.markPrice,
+        source: 'binance',
+        timestamp: new Date().toISOString()
+      };
+    } catch (error) {
+      // If geo-blocked, permanently switch to Bybit for this session
+      if (error.message?.includes('All Binance Futures') || error.message?.includes('451') || error.message?.includes('403')) {
+        logger.warn('Binance Futures geo-blocked — switching to Bybit derivatives');
+        derivativesProvider = 'bybit';
+      } else {
+        logger.warn('Derivatives data fetch failed (Binance)', { coinGeckoId, error: error.message });
+        // Don't switch provider for transient errors, fall through to Bybit as one-time fallback
+      }
+    }
+  }
+
+  // Bybit fallback
   try {
     const [funding, oi, lsRatio] = await Promise.all([
-      fetchFundingRate(symbol),
-      fetchOpenInterest(symbol),
-      fetchLongShortRatio(symbol)
+      fetchFundingRateBybit(symbol),
+      fetchOpenInterestBybit(symbol),
+      fetchLongShortRatioBybit(symbol)
     ]);
 
     const fundingRatePercent = funding.fundingRate * 100;
-    const fundingRateAnnualized = fundingRatePercent * 3 * 365; // 3 funding periods/day
+    const fundingRateAnnualized = fundingRatePercent * 3 * 365;
 
     return {
       fundingRate: funding.fundingRate,
@@ -560,11 +688,12 @@ async function fetchDerivativesData(coinGeckoId) {
       longShortRatio: lsRatio.longShortRatio,
       longAccount: lsRatio.longAccount,
       shortAccount: lsRatio.shortAccount,
-      markPrice: funding.markPrice,
+      markPrice: funding.markPrice || 0,
+      source: 'bybit',
       timestamp: new Date().toISOString()
     };
   } catch (error) {
-    logger.warn('Derivatives data fetch failed', { coinGeckoId, error: error.message });
+    logger.warn('Derivatives data fetch failed (Bybit fallback)', { coinGeckoId, error: error.message });
     return null;
   }
 }
@@ -689,7 +818,12 @@ module.exports = {
   fetchLongShortRatio,
   fetchDerivativesData,
   fetchOrderBookDepth,
+  fetchHistoricalFundingBybit,
+  fetchFundingRateBybit,
+  fetchOpenInterestBybit,
+  fetchLongShortRatioBybit,
   SYMBOL_MAP,
   FUTURES_SYMBOL_MAP,
-  VALID_INTERVALS
+  VALID_INTERVALS,
+  getDerivativesProvider: () => derivativesProvider
 };

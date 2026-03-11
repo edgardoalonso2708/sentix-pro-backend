@@ -261,8 +261,22 @@ async function fetchHistoricalFundingRate(asset, startMs, endMs) {
 
     return allRates;
   } catch (err) {
-    logger.warn('Failed to fetch historical funding rates', { asset, error: err.message });
-    return [];
+    // If Binance fails (geo-block), try Bybit
+    logger.warn(`Binance historical funding failed: ${err.message} — trying Bybit`);
+    try {
+      const { fetchHistoricalFundingBybit, FUTURES_SYMBOL_MAP: FM } = require('./binanceAPI');
+      const bybitData = await fetchHistoricalFundingBybit(futuresSymbol, startMs, endMs);
+      const mapped = bybitData.map(r => ({ timestamp: r.fundingTime, fundingRate: r.fundingRate }));
+      logger.info('Historical funding rates fetched (Bybit fallback)', {
+        asset, points: mapped.length,
+        from: mapped.length > 0 ? new Date(mapped[0].timestamp).toISOString().slice(0, 10) : 'N/A',
+        to: mapped.length > 0 ? new Date(mapped[mapped.length - 1].timestamp).toISOString().slice(0, 10) : 'N/A'
+      });
+      return mapped;
+    } catch (bybitErr) {
+      logger.warn('Failed to fetch historical funding rates (both providers)', { asset, error: bybitErr.message });
+      return [];
+    }
   }
 }
 
