@@ -20,6 +20,7 @@ const { SCHEDULE_CONFIG } = require('../strategyConfig');
 const { MSG, sendToParent, installWorkerIPC } = require('../shared/ipc');
 const { LRUCache } = require('../shared/lruCache');
 const { metrics } = require('../shared/metrics');
+const { recordSignalOutcome, checkPendingOutcomes } = require('../signalAccuracy');
 
 // ─── SUPABASE CLIENT ──────────────────────────────────────────────────────
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY);
@@ -222,6 +223,12 @@ async function generateSignals() {
   logger.info('Signals generated', { total: cachedSignals.length, actionable });
 
   await persistSignals(cachedSignals);
+
+  // Record signal outcomes for accuracy tracking (non-blocking)
+  for (const s of cachedSignals) {
+    if (s.action === 'HOLD') continue;
+    recordSignalOutcome(supabase, s).catch(() => {});
+  }
 
   // Send signals to orchestrator → api.js (for SSE broadcast)
   sendToParent(MSG.SIGNALS_UPDATE, cachedSignals);
@@ -550,6 +557,21 @@ async function processAlerts() {
       }
     } catch (ptError) {
       logger.warn('Paper trading evaluation failed', { error: ptError.message });
+    }
+
+    // ─── CHECK PENDING SIGNAL OUTCOMES (accuracy tracking) ─────────────
+    try {
+      await checkPendingOutcomes(supabase, async (asset) => {
+        if (!cachedMarketData) return null;
+        // Try crypto first, then metals
+        const crypto = cachedMarketData.crypto?.[asset.toLowerCase()];
+        if (crypto?.price) return crypto.price;
+        const metal = cachedMarketData.metals?.[asset.toLowerCase()];
+        if (metal?.price) return metal.price;
+        return null;
+      });
+    } catch (accErr) {
+      logger.debug('Signal accuracy check failed', { error: accErr.message });
     }
 
   } catch (error) {

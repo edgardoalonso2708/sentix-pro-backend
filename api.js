@@ -60,6 +60,7 @@ const { runBacktest } = require('./backtester');
 const { startOptimizationJob, getJobStatus, getAllJobs, PARAM_RANGES } = require('./optimizer');
 const { DEFAULT_STRATEGY_CONFIG, SCHEDULE_CONFIG } = require('./strategyConfig');
 const { enrichSignalWithTTL } = require('./scheduleUtils');
+const { getAccuracyMetrics } = require('./signalAccuracy');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -378,6 +379,25 @@ app.get('/api/signals', async (req, res) => {
   // Enrich with TTL/freshness metadata on every request
   const enriched = signals.map(s => enrichSignalWithTTL(s, SCHEDULE_CONFIG));
   res.json(enriched);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SIGNAL ACCURACY
+// ═══════════════════════════════════════════════════════════════════════════════
+
+app.get('/api/signals/accuracy', async (req, res) => {
+  try {
+    const days = Math.min(Math.max(parseInt(req.query.days) || 30, 1), 90);
+    const asset = req.query.asset ? sanitizeInput(req.query.asset) : null;
+    const result = await getAccuracyMetrics(supabase, { days, asset });
+    if (result.error) {
+      return res.status(500).json({ error: result.error });
+    }
+    res.json(result);
+  } catch (err) {
+    logger.warn('Signal accuracy endpoint failed', { error: err.message });
+    res.status(500).json({ error: 'Failed to fetch accuracy metrics' });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
