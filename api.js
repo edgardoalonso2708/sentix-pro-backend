@@ -282,7 +282,7 @@ app.get('/', (req, res) => {
     services: {
       telegram: bot.isActive() ? `active (${bot.getSubscribers().length} subscribers)` : 'not configured',
       email: resend ? 'active' : 'not configured',
-      database: SUPABASE_URL ? 'connected' : 'not configured',
+      database: SUPABASE_URL ? `connected (${process.env.SUPABASE_SERVICE_ROLE_KEY ? 'service_role' : 'anon'} key)` : 'not configured',
       sse: `active (${sseClients.size} clients)`,  // Phase 1: SSE status
       binance: 'active (real OHLCV)',  // Phase 1: Binance data
       featureStore: 'active'  // Phase 1: Feature computation
@@ -1530,10 +1530,11 @@ app.post('/api/backtest/run', async (req, res) => {
             logger.info(`Backtest progress: ${recordId}`, { progress: pVal, asset });
           }
 
-          // Also try DB if available (only for numeric progress)
-          if (useDB && typeof pVal === 'number' && !isNaN(pVal)) {
+          // Also try DB if available (only for numeric progress, throttle to every 20%)
+          if (useDB && typeof pVal === 'number' && !isNaN(pVal) && pVal % 20 === 0) {
             try {
-              await supabase.from('backtest_results').update({ progress: pVal }).eq('id', recordId);
+              const { error: progErr } = await supabase.from('backtest_results').update({ progress: pVal }).eq('id', recordId);
+              if (progErr) logger.warn('Backtest progress DB update failed', { recordId, error: progErr.message });
             } catch (_) { /* ignore */ }
           }
         });
@@ -1577,7 +1578,7 @@ app.post('/api/backtest/run', async (req, res) => {
         // Try to save to DB
         if (useDB) {
           try {
-            await supabase.from('backtest_results').update({
+            const { error: updateErr } = await supabase.from('backtest_results').update({
               status: 'completed', progress: 100,
               total_trades: metrics.totalTrades, win_count: metrics.winCount,
               loss_count: metrics.lossCount, win_rate: metrics.winRate,
@@ -1591,7 +1592,9 @@ app.post('/api/backtest/run', async (req, res) => {
               kelly_sizing: result.kellySizing || null,
               completed_at: new Date().toISOString()
             }).eq('id', recordId);
-          } catch (_) { /* saved in memory */ }
+            if (updateErr) logger.error('Backtest DB update failed', { recordId, error: updateErr.message, code: updateErr.code });
+            else logger.info('Backtest saved to DB', { recordId });
+          } catch (dbErr) { logger.error('Backtest DB update exception', { recordId, error: dbErr.message }); }
         }
 
         logger.info(`Backtest completed: ${recordId}`, {
@@ -1609,10 +1612,11 @@ app.post('/api/backtest/run', async (req, res) => {
         });
         if (useDB) {
           try {
-            await supabase.from('backtest_results').update({
+            const { error: failErr } = await supabase.from('backtest_results').update({
               status: 'failed', error_message: errMsg.slice(0, 500),
               completed_at: new Date().toISOString()
             }).eq('id', recordId);
+            if (failErr) logger.error('Backtest failure DB update failed', { recordId, error: failErr.message });
           } catch (_) { /* ignore */ }
         }
         broadcastSSE('backtest_complete', { id: recordId, asset, status: 'failed', error: errMsg });
