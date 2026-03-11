@@ -18,6 +18,7 @@ const { classifyAxiosError, Provider } = require('../errors');
 const { isWithinTradingHours } = require('../scheduleUtils');
 const { SCHEDULE_CONFIG } = require('../strategyConfig');
 const { MSG, sendToParent, installWorkerIPC } = require('../shared/ipc');
+const { LRUCache } = require('../shared/lruCache');
 
 // ─── SUPABASE CLIENT ──────────────────────────────────────────────────────
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
@@ -378,24 +379,14 @@ function buildSignalEmailHTML(signal) {
 // ALERT DEDUPLICATION
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const recentAlertKeys = new Map();
-const ALERT_DEDUP_TTL = 30 * 60 * 1000;
-const MAX_ALERT_KEYS = 500;
+const recentAlertKeys = new LRUCache({ maxSize: 500, ttl: 30 * 60 * 1000, name: 'alertDedup' });
 
 function isAlertDuplicate(key) {
-  const ts = recentAlertKeys.get(key);
-  if (ts && (Date.now() - ts) < ALERT_DEDUP_TTL) return true;
-  if (recentAlertKeys.size > MAX_ALERT_KEYS) {
-    const now = Date.now();
-    for (const [k, v] of recentAlertKeys) {
-      if (now - v > ALERT_DEDUP_TTL) recentAlertKeys.delete(k);
-    }
-  }
-  return false;
+  return recentAlertKeys.has(key);
 }
 
 function markAlertSent(key) {
-  recentAlertKeys.set(key, Date.now());
+  recentAlertKeys.set(key, true);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

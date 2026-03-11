@@ -6,13 +6,13 @@
 
 const { logger } = require('./logger');
 const { fetchOHLCVCandles } = require('./technicalAnalysis');
+const { LRUCache } = require('./shared/lruCache');
 
 /**
- * Feature store cache
- * Structure: Map<assetId, { features, timestamp }>
+ * Feature store cache — LRU with TTL
+ * Max 200 entries (10 assets × ~5 intervals × 4x headroom)
  */
-const featureCache = new Map();
-const FEATURE_TTL = 5 * 60 * 1000; // 5 minutes
+const featureCache = new LRUCache({ maxSize: 200, ttl: 5 * 60 * 1000, name: 'features' });
 
 /**
  * Calculate returns over different periods
@@ -254,21 +254,18 @@ async function computeFeatures(assetId, interval = '1h', limit = 200) {
  */
 async function getFeatures(assetId, interval = '1h', forceRefresh = false) {
   const cacheKey = `${assetId}-${interval}`;
-  const cached = featureCache.get(cacheKey);
 
-  // Return cached if fresh
-  if (!forceRefresh && cached && (Date.now() - cached.timestamp) < FEATURE_TTL) {
-    return cached.features;
+  // LRUCache.get() returns undefined if expired or missing
+  if (!forceRefresh) {
+    const cached = featureCache.get(cacheKey);
+    if (cached) return cached;
   }
 
   // Compute fresh features
   const features = await computeFeatures(assetId, interval);
 
   if (features) {
-    featureCache.set(cacheKey, {
-      features,
-      timestamp: Date.now()
-    });
+    featureCache.set(cacheKey, features);
   }
 
   return features;
@@ -314,24 +311,7 @@ function clearCache() {
  * @returns {Object} Cache stats
  */
 function getCacheStats() {
-  const entries = [];
-  const now = Date.now();
-
-  for (const [key, value] of featureCache.entries()) {
-    entries.push({
-      key,
-      age: now - value.timestamp,
-      fresh: (now - value.timestamp) < FEATURE_TTL
-    });
-  }
-
-  return {
-    size: featureCache.size,
-    ttl: FEATURE_TTL,
-    entries: entries.length,
-    fresh: entries.filter(e => e.fresh).length,
-    stale: entries.filter(e => !e.fresh).length
-  };
+  return featureCache.stats();
 }
 
 module.exports = {

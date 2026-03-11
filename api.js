@@ -9,6 +9,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const { MSG } = require('./shared/ipc');
+const { LRUCache } = require('./shared/lruCache');
 const { runBacktestInThread, runOptimizeInThread, getStats: getComputeStats, terminateAll: terminateComputeWorkers } = require('./workers/compute');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
@@ -39,7 +40,7 @@ const {
 const { Resend } = require('resend');
 const { logger } = require('./logger');
 const { classifyAxiosError, Provider } = require('./errors');
-const { getFeatures, getFeaturesForAssets } = require('./featureStore');
+const { getFeatures, getFeaturesForAssets, getCacheStats } = require('./featureStore');
 const {
   getOrCreateConfig,
   updateConfig,
@@ -317,6 +318,12 @@ app.get('/api/health', async (req, res) => {
   // 4. Services
   checks.telegram = bot.isActive() ? 'active' : 'disabled';
   checks.email = resend ? 'active' : 'disabled';
+
+  // 5. Cache stats
+  checks.caches = {
+    backtests: backtestStore.stats(),
+    features: getCacheStats()
+  };
 
   res.status(healthy ? 200 : 503).json({
     status: healthy ? 'healthy' : 'degraded',
@@ -1377,16 +1384,8 @@ app.delete('/api/paper/trades/:userId', async (req, res) => {
 // BACKTEST API ROUTES
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// In-memory backtest store (bounded LRU — max 50 entries)
-const backtestStore = new Map();
-const MAX_BACKTEST_STORE = 50;
-function backtestStoreSet(key, value) {
-  backtestStore.set(key, value);
-  if (backtestStore.size > MAX_BACKTEST_STORE) {
-    const oldest = backtestStore.keys().next().value;
-    backtestStore.delete(oldest);
-  }
-}
+// In-memory backtest store — LRU eviction, max 50 entries
+const backtestStore = new LRUCache({ maxSize: 50, name: 'backtests' });
 
 // Concurrent job tracking
 let activeBacktestJobs = 0;
@@ -1472,7 +1471,7 @@ app.post('/api/backtest/run', async (req, res) => {
     }
 
     // Store initial state in memory
-    backtestStoreSet(recordId, {
+    backtestStore.set(recordId, {
       id: recordId, user_id: userId, asset, days, step_interval: stepInterval,
       initial_capital: capital, status: 'running', progress: 0,
       created_at: new Date().toISOString()
@@ -1531,7 +1530,7 @@ app.post('/api/backtest/run', async (req, res) => {
         };
 
         // Save to memory
-        backtestStoreSet(recordId, completed);
+        backtestStore.set(recordId, completed);
 
         // Try to save to DB
         if (useDB) {
@@ -1561,7 +1560,7 @@ app.post('/api/backtest/run', async (req, res) => {
 
       } catch (err) {
         logger.error(`Backtest failed: ${recordId}`, { error: err.message });
-        backtestStoreSet(recordId, {
+        backtestStore.set(recordId, {
           ...backtestStore.get(recordId), status: 'failed',
           error_message: err.message, completed_at: new Date().toISOString()
         });
