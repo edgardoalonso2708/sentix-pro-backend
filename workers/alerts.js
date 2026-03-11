@@ -21,6 +21,7 @@ const { MSG, sendToParent, installWorkerIPC } = require('../shared/ipc');
 const { LRUCache } = require('../shared/lruCache');
 const { metrics } = require('../shared/metrics');
 const { recordSignalOutcome, checkPendingOutcomes } = require('../signalAccuracy');
+const { runAutoTune, getActiveConfig, isAutoTuneRunning } = require('../autoTuner');
 
 // ─── SUPABASE CLIENT ──────────────────────────────────────────────────────
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY);
@@ -53,6 +54,18 @@ async function generateSignals() {
   if (!cachedMarketData || !cachedMarketData.crypto || Object.keys(cachedMarketData.crypto).length === 0) {
     logger.warn('No crypto data available for signal generation');
     return allSignals;
+  }
+
+  // Load active strategy config (auto-tuned or default)
+  let activeStrategyConfig = null;
+  try {
+    const { config, source } = await getActiveConfig(supabase);
+    if (source === 'saved') {
+      activeStrategyConfig = config;
+      logger.debug('Using auto-tuned strategy config');
+    }
+  } catch (_) {
+    // Fall back to defaults (null = use DEFAULT_STRATEGY_CONFIG)
   }
 
   const fearGreed = cachedMarketData.macro?.fearGreed || 50;
@@ -89,7 +102,7 @@ async function generateSignals() {
 
       const signal = await generateMultiTimeframeSignal(
         assetId, data.price, data.change24h, data.volume24h,
-        fearGreed, derivativesData, macroData, null, null, orderBookData
+        fearGreed, derivativesData, macroData, null, activeStrategyConfig, orderBookData
       );
 
       signal.assetClass = 'crypto';
@@ -639,6 +652,46 @@ cronTask = cron.schedule('*/5 * * * *', async () => {
     await processAlerts();
   } finally {
     isProcessingAlerts = false;
+  }
+});
+
+// Cron: auto-parameter tuning daily at 3:00 AM
+cron.schedule('0 3 * * *', async () => {
+  if (isAutoTuneRunning()) {
+    logger.debug('Skipping auto-tune — already running');
+    return;
+  }
+  logger.info('Starting scheduled auto-tune');
+  try {
+    const result = await runAutoTune(supabase, { trigger: 'scheduled' });
+    if (result.error) {
+      logger.warn('Scheduled auto-tune failed', { error: result.error });
+    } else if (result.skipped) {
+      logger.info('Scheduled auto-tune skipped', { reason: result.reason });
+    } else {
+      const applied = result.paramsApplied ? Object.keys(result.paramsApplied).length : 0;
+      logger.info('Scheduled auto-tune completed', {
+        applied,
+        aiDecision: result.aiReview?.decision || 'N/A',
+        regime: result.marketRegime,
+      });
+      // Notify via Telegram
+      if (bot.isActive() && applied > 0) {
+        const paramList = Object.entries(result.paramsApplied)
+          .map(([k, v]) => `  • ${k}: ${v}`)
+          .join('\n');
+        bot.broadcastAlert({
+          asset: '🤖 AUTO-TUNE',
+          action: 'UPDATE',
+          strengthLabel: `${applied} params`,
+          confidence: 100,
+          price: 0,
+          reasons: `Auto-tune completed (${result.marketRegime} regime).\n${applied} params updated:\n${paramList}${result.aiReview ? `\nAI: ${result.aiReview.decision}` : ''}`,
+        }).catch(() => {});
+      }
+    }
+  } catch (err) {
+    logger.error('Scheduled auto-tune error', { error: err.message });
   }
 });
 

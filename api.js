@@ -59,6 +59,7 @@ const {
 } = require('./paperTrading');
 const { runBacktest } = require('./backtester');
 const { startOptimizationJob, getJobStatus, getAllJobs, PARAM_RANGES } = require('./optimizer');
+const { runAutoTune, getAutoTuneHistory, getActiveConfig, isAutoTuneRunning, PRIORITY_PARAMS } = require('./autoTuner');
 const { DEFAULT_STRATEGY_CONFIG, SCHEDULE_CONFIG } = require('./strategyConfig');
 const { enrichSignalWithTTL } = require('./scheduleUtils');
 const { getAccuracyMetrics } = require('./signalAccuracy');
@@ -1822,6 +1823,85 @@ const handleBacktestDelete = async (req, res) => {
 };
 app.delete('/api/backtest', handleBacktestDelete);
 app.post('/api/backtest/delete', handleBacktestDelete);
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AUTO-PARAMETER TUNING ENDPOINTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /api/autotune/history — Get auto-tune run history
+ */
+app.get('/api/autotune/history', async (req, res) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit) || 10, 50);
+    const { history, error } = await getAutoTuneHistory(supabase, limit);
+    if (error) return res.status(500).json({ error: error.message || 'Failed to fetch history' });
+    res.json({ history });
+  } catch (err) {
+    logger.error('Auto-tune history fetch failed', { error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/autotune/config — Get active strategy config
+ */
+app.get('/api/autotune/config', async (req, res) => {
+  try {
+    const { config, source } = await getActiveConfig(supabase);
+    res.json({
+      config,
+      source,
+      priorityParams: PRIORITY_PARAMS,
+      isRunning: isAutoTuneRunning(),
+    });
+  } catch (err) {
+    logger.error('Active config fetch failed', { error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /api/autotune/run — Trigger a manual auto-tune run
+ */
+app.post('/api/autotune/run', async (req, res) => {
+  try {
+    if (isAutoTuneRunning()) {
+      return res.status(409).json({ error: 'Auto-tune is already running' });
+    }
+
+    const asset = sanitizeInput(req.body.asset || 'bitcoin');
+
+    // Start async (don't await — it takes minutes)
+    res.json({ status: 'started', message: 'Auto-tune started, check /api/autotune/history for results' });
+
+    // Run in background
+    runAutoTune(supabase, { trigger: 'manual', asset }).catch(err => {
+      logger.error('Manual auto-tune failed', { error: err.message });
+    });
+  } catch (err) {
+    logger.error('Auto-tune trigger failed', { error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /api/autotune/reset — Reset to default strategy config
+ */
+app.post('/api/autotune/reset', async (req, res) => {
+  try {
+    // Deactivate all saved configs
+    await supabase
+      .from('saved_strategy_configs')
+      .update({ is_active: false, updated_at: new Date().toISOString() })
+      .eq('is_active', true);
+
+    res.json({ status: 'reset', message: 'Strategy config reset to defaults' });
+  } catch (err) {
+    logger.error('Config reset failed', { error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // STRATEGY OPTIMIZATION ENDPOINTS
