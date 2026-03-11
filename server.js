@@ -860,10 +860,24 @@ async function sendEmailAlert(to, subject, htmlBody) {
     return { success: false, error: 'Email not configured (RESEND_API_KEY missing)' };
   }
 
+  // Support single email string, comma-separated string, or array
+  let recipients;
+  if (Array.isArray(to)) {
+    recipients = to.map(e => e.trim()).filter(Boolean);
+  } else if (typeof to === 'string' && to.includes(',')) {
+    recipients = to.split(',').map(e => e.trim()).filter(Boolean);
+  } else {
+    recipients = [to].filter(Boolean);
+  }
+
+  if (recipients.length === 0) {
+    return { success: false, error: 'No valid email recipients' };
+  }
+
   try {
     const { data, error } = await resend.emails.send({
       from: 'SENTIX PRO <onboarding@resend.dev>',
-      to: [to],
+      to: recipients,
       subject,
       html: htmlBody
     });
@@ -873,7 +887,7 @@ async function sendEmailAlert(to, subject, htmlBody) {
       return { success: false, error: error.message || 'Email send failed' };
     }
 
-    logger.info('Email sent', { to, id: data?.id });
+    logger.info('Email sent', { to: recipients, id: data?.id });
     return { success: true, id: data?.id };
   } catch (error) {
     logger.error('Email exception', { provider: Provider.RESEND, error: error.message });
@@ -1059,8 +1073,12 @@ async function processAlerts() {
 
       // Send via email (if user enabled)
       if (filter.email_enabled !== false && resend) {
+        // Use user-configured emails if set, otherwise fall back to ALERT_EMAIL env var
+        const emailRecipients = (filter.alert_emails && filter.alert_emails.trim())
+          ? filter.alert_emails
+          : ALERT_EMAIL;
         const emailResult = await sendEmailAlert(
-          ALERT_EMAIL,
+          emailRecipients,
           `${signal.action === 'BUY' ? '🟢' : '🔴'} SENTIX PRO: ${signal.action} ${signal.asset} (${signal.confidence}%)`,
           buildSignalEmailHTML(signal)
         );
@@ -1457,6 +1475,7 @@ app.get('/api/alert-filters/:userId', async (req, res) => {
         min_score: 25,
         telegram_enabled: true,
         email_enabled: true,
+        alert_emails: '',
         quiet_start: null,
         quiet_end: null,
         cooldown_minutes: 20,
@@ -1482,7 +1501,7 @@ app.put('/api/alert-filters/:userId', async (req, res) => {
 
     const {
       assets, actions, min_confidence, min_score,
-      telegram_enabled, email_enabled,
+      telegram_enabled, email_enabled, alert_emails,
       quiet_start, quiet_end, cooldown_minutes, enabled
     } = req.body;
 
@@ -1513,6 +1532,7 @@ app.put('/api/alert-filters/:userId', async (req, res) => {
     if (quiet_end !== undefined) payload.quiet_end = quiet_end;
     if (cooldown_minutes !== undefined) payload.cooldown_minutes = cooldown_minutes;
     if (enabled !== undefined) payload.enabled = enabled;
+    if (alert_emails !== undefined) payload.alert_emails = alert_emails;
 
     const { data, error } = await supabase
       .from('alert_filters')
@@ -2167,6 +2187,34 @@ app.post('/api/paper/close/:tradeId', async (req, res) => {
     res.json({ trade: closedTrade, pnl });
   } catch (error) {
     logger.error('Paper manual close failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete closed paper trades by asset name
+app.delete('/api/paper/trades/:userId', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+    const { asset } = req.query;
+    if (!asset) return res.status(400).json({ error: 'asset query parameter required' });
+
+    const { data, error } = await supabase
+      .from('paper_trades')
+      .delete()
+      .eq('user_id', userId)
+      .eq('status', 'closed')
+      .ilike('asset', `%${asset}%`);
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    // Count deleted (Supabase may not return count on delete without .select())
+    logger.info('Paper trades deleted by asset', { userId, asset, deleted: data?.length || 'unknown' });
+    res.json({ success: true, asset, message: `Closed trades for "${asset}" deleted` });
+  } catch (error) {
+    logger.error('Paper trade delete by asset failed', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });

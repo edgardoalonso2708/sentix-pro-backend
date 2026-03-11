@@ -170,7 +170,8 @@ async function updateConfig(supabase, userId, updates) {
       'max_daily_loss_percent', 'cooldown_minutes', 'min_confluence',
       'min_rr_ratio', 'allowed_strength', 'is_enabled',
       'max_position_percent', 'partial_close_ratio', 'max_holding_hours',
-      'move_sl_to_breakeven_after_tp1'
+      'move_sl_to_breakeven_after_tp1',
+      'daily_pnl', 'daily_pnl_reset_at'
     ];
 
     const filtered = {};
@@ -1314,6 +1315,14 @@ async function evaluateAndExecute(supabase, userId, signals, marketData) {
     }
 
     for (const signal of signals) {
+      // Skip non-crypto assets (metals are reference-only, not tradeable)
+      if (signal.assetClass === 'metal' ||
+          (signal.asset && (signal.asset.includes('GOLD') || signal.asset.includes('SILVER') ||
+           signal.asset.includes('XAU') || signal.asset.includes('XAG')))) {
+        result.skipped.push({ asset: signal.asset, reason: 'Non-crypto asset (reference only)' });
+        continue;
+      }
+
       // Evaluate signal eligibility
       const { eligible, reason } = evaluateSignalForTrade(signal, config);
       if (!eligible) {
@@ -1366,6 +1375,17 @@ async function monitorAndManage(supabase, userId, marketData) {
     const { config } = await getOrCreateConfig(supabase, userId);
     if (!config || !config.is_enabled) {
       return { checked: 0, closedTrades: [], partialCloses: [] };
+    }
+
+    // Reset daily P&L if new day (same logic as checkSafetyLimits)
+    const resetAt = new Date(config.daily_pnl_reset_at);
+    const now = new Date();
+    if (resetAt.toISOString().slice(0, 10) !== now.toISOString().slice(0, 10)) {
+      await supabase
+        .from('paper_config')
+        .update({ daily_pnl: 0, daily_pnl_reset_at: now.toISOString() })
+        .eq('user_id', userId);
+      config.daily_pnl = 0;
     }
 
     // Check max daily loss - emergency close all if breached
