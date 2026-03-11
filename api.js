@@ -1731,8 +1731,13 @@ app.delete('/api/backtest', async (req, res) => {
       if (backtestStore.delete(id)) memDeleted++;
     }
 
+    const totalDeleted = Math.max(dbDeleted, memDeleted);
     logger.info('Backtests deleted', { dbDeleted, memDeleted, ids });
-    res.json({ deleted: Math.max(dbDeleted, memDeleted), ids });
+
+    if (totalDeleted === 0) {
+      return res.status(404).json({ error: 'No backtests found to delete', ids });
+    }
+    res.json({ deleted: totalDeleted, ids });
   } catch (error) {
     logger.error('Backtest delete failed', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
