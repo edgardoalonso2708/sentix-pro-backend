@@ -2295,6 +2295,7 @@ app.post('/api/backtest/run', async (req, res) => {
           profit_factor: metrics.profitFactor, sharpe_ratio: metrics.sharpeRatio,
           avg_holding_hours: metrics.avgHoldingBars, trades: result.trades,
           equity_curve: result.equityCurve, metrics: metrics,
+          monte_carlo: result.monteCarlo || null,
           completed_at: new Date().toISOString(), created_at: backtestStore.get(recordId)?.created_at
         };
 
@@ -2313,6 +2314,7 @@ app.post('/api/backtest/run', async (req, res) => {
               profit_factor: metrics.profitFactor, sharpe_ratio: metrics.sharpeRatio,
               avg_holding_hours: metrics.avgHoldingBars, trades: result.trades,
               equity_curve: result.equityCurve, metrics: metrics,
+              monte_carlo: result.monteCarlo || null,
               completed_at: new Date().toISOString()
             }).eq('id', recordId);
           } catch (_) { /* saved in memory */ }

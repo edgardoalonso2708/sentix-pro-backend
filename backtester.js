@@ -9,6 +9,7 @@ const { fetchKlines, SYMBOL_MAP, FUTURES_SYMBOL_MAP } = require('./binanceAPI');
 const { generateMultiTimeframeSignal } = require('./technicalAnalysis');
 const { evaluateSignalForTrade, calculatePositionSize, DEFAULT_CONFIG } = require('./paperTrading');
 const { SLIPPAGE, COMMISSION, TOTAL_COST } = require('./constants');
+const { runMonteCarloSimulation } = require('./monteCarloSim');
 
 // ─── CONSTANTS ──────────────────────────────────────────────────────────────
 
@@ -1191,6 +1192,12 @@ async function runBacktest(options, onProgress = null) {
   // ─── 6. Calculate metrics ────────────────────────────────────────────
   const metrics = calculateBacktestMetrics(completedTrades, equityCurve, capital, days);
 
+  // Monte Carlo bootstrap resampling (1000 paths)
+  const monteCarlo = runMonteCarloSimulation(completedTrades, capital, {
+    simulations: 1000,
+    seed: 42
+  });
+
   const duration = ((Date.now() - startTime) / 1000).toFixed(1);
 
   logger.info('Backtest completed', {
@@ -1227,6 +1234,7 @@ async function runBacktest(options, onProgress = null) {
   return {
     config: { asset, days, stepInterval, capital, riskPerTrade, maxOpenPositions, minConfluence, minRR, allowedStrength, cooldownBars, strategyConfig },
     metrics,
+    monteCarlo,
     trades: cleanTrades,
     equityCurve,
     duration: parseFloat(duration),
