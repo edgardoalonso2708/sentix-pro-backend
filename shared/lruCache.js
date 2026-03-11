@@ -123,6 +123,19 @@ class LRUCache {
     return result;
   }
 
+  /**
+   * Return all non-expired values (without keys).
+   */
+  values() {
+    const result = [];
+    for (const entry of this._map.values()) {
+      if (!this._isExpired(entry)) {
+        result.push(entry.value);
+      }
+    }
+    return result;
+  }
+
   /** @private */
   _isExpired(entry) {
     return this._ttl > 0 && (Date.now() - entry.createdAt) >= this._ttl;

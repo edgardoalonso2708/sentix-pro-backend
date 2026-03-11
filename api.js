@@ -1507,7 +1507,7 @@ app.post('/api/backtest/run', async (req, res) => {
     (async () => {
       try {
         const result = await runBacktest({
-          asset, days, interval: stepInterval, capital, riskPerTrade,
+          asset, days, stepInterval, capital, riskPerTrade,
           maxOpenPositions, minConfluence, minRR, allowedStrength,
           cooldownBars, fearGreed: 50, derivativesData: null, macroData: null,
           kellySizing
@@ -1667,9 +1667,55 @@ app.get('/api/backtest/history/:userId', async (req, res) => {
       }
     }
 
+    // Mark stale 'running' records as failed (older than 30 min)
+    const STALE_MS = 30 * 60 * 1000;
+    const now = Date.now();
+    results = results.map(r => {
+      if (r.status === 'running' && r.created_at && (now - new Date(r.created_at).getTime()) > STALE_MS) {
+        // Also try to update DB in background
+        if (supabase) {
+          supabase.from('backtest_results').update({ status: 'failed', error_message: 'Timed out' }).eq('id', r.id).then(() => {});
+        }
+        return { ...r, status: 'failed', error_message: 'Timed out' };
+      }
+      return r;
+    });
+
     res.json(results.slice(0, 20));
   } catch (error) {
     logger.error('Backtest history failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ─── Delete backtests ─────────────────────────────────────────────────────────
+app.delete('/api/backtest', async (req, res) => {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: 'ids array required' });
+    }
+
+    let dbDeleted = 0;
+    let memDeleted = 0;
+
+    // Delete from Supabase
+    try {
+      const { data, error } = await supabase
+        .from('backtest_results')
+        .delete()
+        .in('id', ids);
+      if (!error) dbDeleted = ids.length;
+    } catch (_) { /* DB unavailable */ }
+
+    // Delete from memory
+    for (const id of ids) {
+      if (backtestStore.delete(id)) memDeleted++;
+    }
+
+    res.json({ deleted: Math.max(dbDeleted, memDeleted), ids });
+  } catch (error) {
+    logger.error('Backtest delete failed', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
