@@ -1502,11 +1502,13 @@ app.post('/api/backtest/run', async (req, res) => {
     // Return immediately
     res.json({ id: recordId, status: 'running' });
 
-    // Execute backtest asynchronously (with 10min timeout)
-    const BACKTEST_TIMEOUT_MS = 10 * 60 * 1000;
+    // Execute backtest asynchronously (with 5min timeout)
+    const BACKTEST_TIMEOUT_MS = 5 * 60 * 1000;
     activeBacktestJobs++;
+    logger.info(`Backtest job started: ${recordId}`, { asset, days, stepInterval, activeBacktestJobs });
     (async () => {
       try {
+        let lastProgressUpdate = 0;
         const backtestPromise = runBacktest({
           asset, days, stepInterval, capital, riskPerTrade,
           maxOpenPositions, minConfluence, minRR, allowedStrength,
@@ -1521,8 +1523,14 @@ app.post('/api/backtest/run', async (req, res) => {
             entry.progress = progress;
           }
 
-          // Also try DB if available (only for numeric progress)
+          // Log progress every 20%
           const pVal = entry?.progress;
+          if (typeof pVal === 'number' && pVal - lastProgressUpdate >= 20) {
+            lastProgressUpdate = pVal;
+            logger.info(`Backtest progress: ${recordId}`, { progress: pVal, asset });
+          }
+
+          // Also try DB if available (only for numeric progress)
           if (useDB && typeof pVal === 'number' && !isNaN(pVal)) {
             try {
               await supabase.from('backtest_results').update({ progress: pVal }).eq('id', recordId);
@@ -1593,21 +1601,24 @@ app.post('/api/backtest/run', async (req, res) => {
         broadcastSSE('backtest_complete', { id: recordId, asset, status: 'completed' });
 
       } catch (err) {
-        logger.error(`Backtest failed: ${recordId}`, { error: err.message });
+        const errMsg = err.message || String(err);
+        logger.error(`Backtest failed: ${recordId}`, { error: errMsg, stack: err.stack?.slice(0, 500) });
         backtestStore.set(recordId, {
           ...backtestStore.get(recordId), status: 'failed',
-          error_message: err.message, completed_at: new Date().toISOString()
+          error_message: errMsg, completed_at: new Date().toISOString()
         });
         if (useDB) {
           try {
             await supabase.from('backtest_results').update({
-              status: 'failed', error_message: err.message,
+              status: 'failed', error_message: errMsg.slice(0, 500),
               completed_at: new Date().toISOString()
             }).eq('id', recordId);
           } catch (_) { /* ignore */ }
         }
+        broadcastSSE('backtest_complete', { id: recordId, asset, status: 'failed', error: errMsg });
       } finally {
         activeBacktestJobs = Math.max(0, activeBacktestJobs - 1);
+        logger.info(`Backtest job ended: ${recordId}`, { activeBacktestJobs });
       }
     })();
 
@@ -1679,8 +1690,8 @@ app.get('/api/backtest/history/:userId', async (req, res) => {
       }
     }
 
-    // Mark stale 'running' records as failed (older than 30 min)
-    const STALE_MS = 30 * 60 * 1000;
+    // Mark stale 'running' records as failed (older than 10 min)
+    const STALE_MS = 10 * 60 * 1000;
     const now = Date.now();
     results = results.map(r => {
       if (r.status === 'running' && r.created_at && (now - new Date(r.created_at).getTime()) > STALE_MS) {
@@ -1701,7 +1712,8 @@ app.get('/api/backtest/history/:userId', async (req, res) => {
 });
 
 // ─── Delete backtests ─────────────────────────────────────────────────────────
-app.delete('/api/backtest', async (req, res) => {
+// Support both DELETE and POST (some proxies strip body from DELETE requests)
+const handleBacktestDelete = async (req, res) => {
   try {
     const { ids } = req.body;
     if (!Array.isArray(ids) || ids.length === 0) {
@@ -1742,7 +1754,9 @@ app.delete('/api/backtest', async (req, res) => {
     logger.error('Backtest delete failed', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
-});
+};
+app.delete('/api/backtest', handleBacktestDelete);
+app.post('/api/backtest/delete', handleBacktestDelete);
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // STRATEGY OPTIMIZATION ENDPOINTS
