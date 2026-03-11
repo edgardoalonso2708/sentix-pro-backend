@@ -19,11 +19,11 @@ function applySlippage(price, isBuy) {
 const DEFAULT_CONFIG = {
   initial_capital: 10000,
   current_capital: 10000,
-  risk_per_trade: 0.02,          // 2%
+  risk_per_trade: 0.01,          // 1% — conservative for crypto volatility
   max_open_positions: 3,
   max_daily_loss_percent: 0.05,  // 5%
   cooldown_minutes: 30,
-  min_confluence: 2,
+  min_confluence: 3,             // require 3+ aligned factors (was 2)
   min_rr_ratio: 1.5,
   allowed_strength: ['STRONG BUY', 'STRONG SELL'],
   is_enabled: true,
@@ -42,7 +42,7 @@ const CONFIG_VALIDATION = {
   max_open_positions:    { min: 1,     max: 10,   type: 'integer' },
   max_daily_loss_percent:{ min: 0.01,  max: 0.20, type: 'number' },
   cooldown_minutes:      { min: 5,     max: 1440, type: 'integer' },
-  min_confluence:        { min: 1,     max: 3,    type: 'integer' },
+  min_confluence:        { min: 2,     max: 5,    type: 'integer' },
   min_rr_ratio:          { min: 0.5,   max: 5.0,  type: 'number' },
   initial_capital:       { min: 100,   max: 10000000, type: 'number' },
   max_position_percent:  { min: 0.05,  max: 0.50, type: 'number' },
@@ -1342,6 +1342,37 @@ async function evaluateAndExecute(supabase, userId, signals, marketData) {
       if (!stillSafe) {
         result.skipped.push({ asset: signal.asset, reason: newSafetyReason });
         break; // No point checking more signals
+      }
+
+      // Check position correlation before opening (avoid concentrated risk)
+      try {
+        const { data: openPositions } = await supabase.from('paper_trades')
+          .select('asset, direction').eq('user_id', userId).in('status', ['open', 'partial']);
+        if (openPositions && openPositions.length >= 2) {
+          const newAsset = signal.asset.toLowerCase();
+          const existingAssets = openPositions.map(p => p.asset.toLowerCase());
+          const sameDirection = openPositions.filter(p => {
+            const sigDir = signal.action === 'BUY' ? 'long' : 'short';
+            return p.direction === sigDir;
+          });
+          // Block if 2+ same-direction positions exist in correlated crypto assets
+          // (crypto pairs have ~0.85+ correlation)
+          const cryptoAssets = ['bitcoin', 'ethereum', 'solana', 'cardano', 'ripple', 'polkadot',
+            'avalanche-2', 'dogecoin', 'binancecoin', 'chainlink'];
+          const isCrypto = cryptoAssets.some(c => newAsset.includes(c));
+          const existingCryptoSameDir = sameDirection.filter(p =>
+            cryptoAssets.some(c => p.asset.toLowerCase().includes(c))
+          );
+          if (isCrypto && existingCryptoSameDir.length >= 2) {
+            result.skipped.push({
+              asset: signal.asset,
+              reason: `Correlation risk: ${existingCryptoSameDir.length} same-direction crypto positions open (high correlation)`
+            });
+            continue;
+          }
+        }
+      } catch (corrErr) {
+        logger.debug('Correlation check failed, proceeding', { error: corrErr.message });
       }
 
       // Calculate position size

@@ -124,7 +124,7 @@ const DEFAULT_STRATEGY_CONFIG = {
   tfRanging15mWeight: 0.40,         // 15m weight when ranging
 
   // ─── Position Sizing ────────────────────────────────────────────
-  riskPerTrade: 0.02,       // 2% of capital per trade
+  riskPerTrade: 0.01,       // 1% of capital per trade (conservative for crypto)
   maxPositionPct: 0.30,     // Max 30% of capital in single position
   maxOpenPositions: 3,
   dailyLossLimit: 0.05,     // 5% max daily loss
