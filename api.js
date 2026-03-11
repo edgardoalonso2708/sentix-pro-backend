@@ -62,6 +62,9 @@ const { enrichSignalWithTTL } = require('./scheduleUtils');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
+// Trust proxy when behind Railway/Vercel reverse proxy
+app.set('trust proxy', 1);
+
 // ─── MIDDLEWARE ────────────────────────────────────────────────────────────
 const allowedOrigins = [
   process.env.FRONTEND_URL,
@@ -174,30 +177,16 @@ async function initializeDatabase() {
           CREATE INDEX IF NOT EXISTS idx_portfolios_wallet_id ON portfolios(wallet_id);
           CREATE INDEX IF NOT EXISTS idx_portfolios_user_wallet ON portfolios(user_id, wallet_id);
 
-          ALTER TABLE IF EXISTS wallets DISABLE ROW LEVEL SECURITY;
-          ALTER TABLE IF EXISTS portfolios DISABLE ROW LEVEL SECURITY;
         `
       });
 
       if (createError) {
         logger.warn('Auto-create tables via RPC failed (may need manual SQL execution)', { error: createError.message });
-        // This is expected if exec_sql RPC doesn't exist - tables need manual creation
       } else {
         logger.info('Database tables created successfully');
       }
     } else {
       logger.info('Database tables verified OK');
-
-      // Ensure RLS is disabled (in case migration enabled it)
-      // This only works with service_role key
-      await supabase.rpc('exec_sql', {
-        sql: `
-          ALTER TABLE IF EXISTS wallets DISABLE ROW LEVEL SECURITY;
-          ALTER TABLE IF EXISTS portfolios DISABLE ROW LEVEL SECURITY;
-        `
-      }).catch(() => {
-        // Silently ignore - RPC may not exist
-      });
     }
   } catch (err) {
     logger.warn('Database initialization check failed', { error: err.message });
