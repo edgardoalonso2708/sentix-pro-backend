@@ -140,19 +140,19 @@ async function fetchCryptoPrices() {
   }
 
   try {
-    logger.info('Falling back to CoinCap API');
+    logger.info('Falling back to Binance ticker API');
     const _t1 = Date.now();
-    const cryptoData = await fetchFromCoinCap();
+    const cryptoData = await fetchFromBinanceTickers();
     if (Object.keys(cryptoData).length > 0) {
       lastSuccessfulCrypto = cryptoData;
-      metrics.counter('provider.coincap.success');
-      metrics.histogram('provider.coincap.latency', Date.now() - _t1);
-      logger.info('CoinCap fallback OK', { assets: Object.keys(cryptoData).length });
+      metrics.counter('provider.binance_ticker.success');
+      metrics.histogram('provider.binance_ticker.latency', Date.now() - _t1);
+      logger.info('Binance ticker fallback OK', { assets: Object.keys(cryptoData).length });
       return cryptoData;
     }
   } catch (error) {
-    metrics.counter('provider.coincap.error');
-    logger.providerError(classifyAxiosError(error, Provider.COINCAP, 'assets'));
+    metrics.counter('provider.binance_ticker.error');
+    logger.warn('Binance ticker fallback failed', { error: error.message });
   }
 
   if (Object.keys(lastSuccessfulCrypto).length > 0) {
@@ -163,25 +163,33 @@ async function fetchCryptoPrices() {
   return {};
 }
 
-async function fetchFromCoinCap() {
-  const ids = Object.values(COINCAP_IDS).join(',');
+// Binance ticker fallback — replaces dead CoinCap API
+const BINANCE_TICKER_MAP = {
+  bitcoin: 'BTCUSDT', ethereum: 'ETHUSDT', binancecoin: 'BNBUSDT',
+  solana: 'SOLUSDT', cardano: 'ADAUSDT', ripple: 'XRPUSDT',
+  polkadot: 'DOTUSDT', dogecoin: 'DOGEUSDT', 'avalanche-2': 'AVAXUSDT',
+  chainlink: 'LINKUSDT'
+};
+
+async function fetchFromBinanceTickers() {
+  const symbols = Object.values(BINANCE_TICKER_MAP);
   const response = await apiClient.get(
-    `https://api.coincap.io/v2/assets`,
-    {
-      params: { ids, limit: 15 },
-      timeout: 10000
-    }
+    'https://api.binance.com/api/v3/ticker/24hr',
+    { params: { symbols: JSON.stringify(symbols) }, timeout: 10000 }
   );
   const result = {};
-  for (const asset of response.data.data || []) {
-    const cgKey = Object.entries(COINCAP_IDS).find(([, v]) => v === asset.id)?.[0];
+  for (const ticker of response.data || []) {
+    const cgKey = Object.entries(BINANCE_TICKER_MAP).find(([, v]) => v === ticker.symbol)?.[0];
     if (cgKey && CRYPTO_ASSETS[cgKey]) {
+      const price = parseFloat(ticker.lastPrice) || 0;
+      const openPrice = parseFloat(ticker.openPrice) || 0;
+      const change24h = openPrice > 0 ? ((price - openPrice) / openPrice) * 100 : 0;
       result[cgKey] = {
         symbol: CRYPTO_ASSETS[cgKey].toUpperCase(),
-        price: parseFloat(asset.priceUsd) || 0,
-        change24h: parseFloat(asset.changePercent24Hr) || 0,
-        volume24h: parseFloat(asset.volumeUsd24Hr) || 0,
-        marketCap: parseFloat(asset.marketCapUsd) || 0
+        price,
+        change24h: Math.round(change24h * 100) / 100,
+        volume24h: parseFloat(ticker.quoteVolume) || 0,
+        marketCap: 0 // Binance doesn't provide market cap
       };
     }
   }

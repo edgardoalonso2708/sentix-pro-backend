@@ -408,11 +408,11 @@ describe('resolveCurrentPrice', () => {
 describe('DEFAULT_CONFIG', () => {
   test('has correct default values', () => {
     expect(DEFAULT_CONFIG.initial_capital).toBe(10000);
-    expect(DEFAULT_CONFIG.risk_per_trade).toBe(0.02);
+    expect(DEFAULT_CONFIG.risk_per_trade).toBe(0.01);
     expect(DEFAULT_CONFIG.max_open_positions).toBe(3);
     expect(DEFAULT_CONFIG.max_daily_loss_percent).toBe(0.05);
     expect(DEFAULT_CONFIG.cooldown_minutes).toBe(30);
-    expect(DEFAULT_CONFIG.min_confluence).toBe(2);
+    expect(DEFAULT_CONFIG.min_confluence).toBe(3);
     expect(DEFAULT_CONFIG.min_rr_ratio).toBe(1.5);
     expect(DEFAULT_CONFIG.allowed_strength).toEqual(['STRONG BUY', 'STRONG SELL']);
     expect(DEFAULT_CONFIG.is_enabled).toBe(true);

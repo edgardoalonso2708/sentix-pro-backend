@@ -52,7 +52,9 @@ const {
   getOpenPositions,
   executeFullClose,
   resolveCurrentPrice,
-  getPositionCorrelations
+  getPositionCorrelations,
+  getEquityCurve,
+  cleanupOldSnapshots
 } = require('./paperTrading');
 const { runBacktest } = require('./backtester');
 const { startOptimizationJob, getJobStatus, getAllJobs, PARAM_RANGES } = require('./optimizer');
@@ -1387,6 +1389,38 @@ app.delete('/api/paper/trades/:userId', async (req, res) => {
     res.json({ success: true, asset, message: `Closed trades for "${asset}" deleted` });
   } catch (error) {
     logger.error('Paper trade delete by asset failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Real-time equity curve for paper trading
+app.get('/api/paper/equity/:userId', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+    const days = Math.min(parseInt(req.query.days) || 7, 30);
+    const { curve, error } = await getEquityCurve(supabase, userId, days);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ curve });
+  } catch (error) {
+    logger.error('Equity curve fetch failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Cleanup old equity snapshots (called periodically or manually)
+app.delete('/api/paper/equity/:userId', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+    const keepDays = parseInt(req.query.keepDays) || 7;
+    await cleanupOldSnapshots(supabase, userId, keepDays);
+    res.json({ success: true, message: `Snapshots older than ${keepDays} days cleaned up` });
+  } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
   }
 });

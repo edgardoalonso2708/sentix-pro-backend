@@ -1122,6 +1122,90 @@ async function getOpenPositions(supabase, userId, marketData = null) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// REAL-TIME EQUITY CURVE
+// Records periodic snapshots of capital + unrealized PnL
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Throttle: record at most once every 5 minutes per user
+const lastSnapshotTime = new Map();
+const SNAPSHOT_INTERVAL_MS = 5 * 60 * 1000;
+
+async function recordEquitySnapshot(supabase, userId, config, marketData) {
+  try {
+    const now = Date.now();
+    const lastTime = lastSnapshotTime.get(userId) || 0;
+    if (now - lastTime < SNAPSHOT_INTERVAL_MS) return;
+
+    const capital = parseFloat(config.current_capital || 0);
+
+    // Calculate total unrealized PnL from open positions
+    const { positions } = await getOpenPositions(supabase, userId, marketData);
+    const unrealized = positions.reduce((sum, p) => sum + (p.unrealizedPnl || 0), 0);
+    const equity = Math.round((capital + unrealized) * 100) / 100;
+
+    await supabase
+      .from('paper_equity_snapshots')
+      .insert({
+        user_id: userId,
+        capital: Math.round(capital * 100) / 100,
+        unrealized: Math.round(unrealized * 100) / 100,
+        equity,
+        open_count: positions.length
+      });
+
+    lastSnapshotTime.set(userId, now);
+    logger.debug('Equity snapshot recorded', { userId, equity, openPositions: positions.length });
+  } catch (err) {
+    // Non-critical — don't break the monitoring cycle
+    logger.debug('Equity snapshot failed', { error: err.message });
+  }
+}
+
+async function getEquityCurve(supabase, userId, days = 7) {
+  try {
+    const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+
+    const { data, error } = await supabase
+      .from('paper_equity_snapshots')
+      .select('timestamp, capital, unrealized, equity, open_count')
+      .eq('user_id', userId)
+      .gte('timestamp', since)
+      .order('timestamp', { ascending: true });
+
+    if (error) {
+      logger.error('getEquityCurve error', { error: error.message });
+      return { curve: [], error };
+    }
+
+    // Downsample if too many points (keep ~500 max for chart performance)
+    const MAX_POINTS = 500;
+    let curve = data || [];
+    if (curve.length > MAX_POINTS) {
+      const step = Math.ceil(curve.length / MAX_POINTS);
+      curve = curve.filter((_, i) => i % step === 0 || i === curve.length - 1);
+    }
+
+    return { curve, error: null };
+  } catch (err) {
+    logger.error('getEquityCurve exception', { error: err.message });
+    return { curve: [], error: err };
+  }
+}
+
+async function cleanupOldSnapshots(supabase, userId, keepDays = 7) {
+  try {
+    const cutoff = new Date(Date.now() - keepDays * 24 * 60 * 60 * 1000).toISOString();
+    await supabase
+      .from('paper_equity_snapshots')
+      .delete()
+      .eq('user_id', userId)
+      .lt('timestamp', cutoff);
+  } catch (err) {
+    logger.debug('Snapshot cleanup failed', { error: err.message });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // POSITION CORRELATION ANALYSIS
 // Pearson correlation between open position price returns
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1456,6 +1540,9 @@ async function monitorAndManage(supabase, userId, marketData) {
       return { checked: openTrades?.length || 0, closedTrades, partialCloses: [] };
     }
 
+    // Record equity snapshot (throttled, non-blocking)
+    recordEquitySnapshot(supabase, userId, config, marketData).catch(() => {});
+
     return await monitorOpenPositions(supabase, userId, marketData);
   } catch (err) {
     logger.error('monitorAndManage exception', { error: err.message });
@@ -1500,6 +1587,11 @@ module.exports = {
   getPerformanceMetrics,
   getTradeHistory,
   getOpenPositions,
+
+  // Equity Curve
+  recordEquitySnapshot,
+  getEquityCurve,
+  cleanupOldSnapshots,
 
   // Correlation
   calculateLogReturns,
