@@ -48,6 +48,7 @@ const {
   updateConfig,
   resetPaperAccount,
   getPerformanceMetrics,
+  getAdvancedPerformance,
   getTradeHistory,
   getOpenPositions,
   executeFullClose,
@@ -1327,6 +1328,23 @@ app.get('/api/paper/performance/:userId', async (req, res) => {
     res.json({ metrics });
   } catch (error) {
     logger.error('Paper performance fetch failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Advanced performance analytics (breakdowns by asset, hour, day, exit reason, etc.)
+app.get('/api/paper/performance-advanced/:userId', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+    const days = Math.min(Math.max(parseInt(req.query.days) || 90, 0), 365);
+    const { data, error } = await getAdvancedPerformance(supabase, userId, days);
+    if (error) return res.status(500).json({ error: error.message || 'Failed to get advanced metrics' });
+    res.json(data);
+  } catch (error) {
+    logger.error('Advanced performance fetch failed', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });

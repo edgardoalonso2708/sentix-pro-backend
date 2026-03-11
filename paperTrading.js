@@ -1047,6 +1047,163 @@ async function getPerformanceMetrics(supabase, userId) {
   }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADVANCED PERFORMANCE ANALYTICS
+// Breakdowns by asset, hour, day of week, exit reason, direction, P&L distribution
+// ═══════════════════════════════════════════════════════════════════════════════
+
+async function getAdvancedPerformance(supabase, userId, days = 90) {
+  try {
+    let query = supabase
+      .from('paper_trades')
+      .select('asset, direction, entry_at, exit_at, realized_pnl, realized_pnl_percent, exit_reason, entry_signal_strength')
+      .eq('user_id', userId)
+      .eq('status', 'closed')
+      .order('exit_at', { ascending: false });
+
+    if (days > 0) {
+      const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+      query = query.gte('exit_at', since);
+    }
+
+    const { data, error } = await query;
+    if (error) {
+      if (error.code === '42P01') return { data: null, error: null };
+      return { data: null, error };
+    }
+    if (!data || data.length < 1) {
+      return { data: { total: 0 }, error: null };
+    }
+
+    // --- Single-pass aggregation ---
+    const assetMap = {};
+    const hourMap = {};      // 0-23
+    const dowMap = {};       // 0-6 (Sun=0)
+    const reasonMap = {};
+    const dirMap = { LONG: { trades: 0, wins: 0, totalPnl: 0 }, SHORT: { trades: 0, wins: 0, totalPnl: 0 } };
+    const monthMap = {};
+    const pnlBuckets = {};   // keyed by bucket label
+
+    const DOW_LABELS = ['Dom', 'Lun', 'Mar', 'Mie', 'Jue', 'Vie', 'Sab'];
+
+    for (const t of data) {
+      const pnl = parseFloat(t.realized_pnl || 0);
+      const pnlPct = parseFloat(t.realized_pnl_percent || 0);
+      const isWin = pnl > 0;
+      const entryDate = new Date(t.entry_at);
+      const exitDate = t.exit_at ? new Date(t.exit_at) : null;
+      const holdMs = exitDate ? (exitDate - entryDate) : 0;
+      const holdHours = holdMs / 3600000;
+
+      // By Asset
+      const asset = t.asset || 'Unknown';
+      if (!assetMap[asset]) assetMap[asset] = { asset, trades: 0, wins: 0, losses: 0, totalPnl: 0, sumHoldHours: 0 };
+      assetMap[asset].trades++;
+      if (isWin) assetMap[asset].wins++; else assetMap[asset].losses++;
+      assetMap[asset].totalPnl += pnl;
+      assetMap[asset].sumHoldHours += holdHours;
+
+      // By Hour (entry hour UTC)
+      const hour = entryDate.getUTCHours();
+      if (!hourMap[hour]) hourMap[hour] = { hour, trades: 0, wins: 0, totalPnl: 0 };
+      hourMap[hour].trades++;
+      if (isWin) hourMap[hour].wins++;
+      hourMap[hour].totalPnl += pnl;
+
+      // By Day of Week (entry)
+      const dow = entryDate.getUTCDay();
+      if (!dowMap[dow]) dowMap[dow] = { day: dow, label: DOW_LABELS[dow], trades: 0, wins: 0, totalPnl: 0 };
+      dowMap[dow].trades++;
+      if (isWin) dowMap[dow].wins++;
+      dowMap[dow].totalPnl += pnl;
+
+      // By Exit Reason
+      const reason = t.exit_reason || 'unknown';
+      if (!reasonMap[reason]) reasonMap[reason] = { reason, count: 0, wins: 0, sumPnl: 0, sumPnlPct: 0 };
+      reasonMap[reason].count++;
+      if (isWin) reasonMap[reason].wins++;
+      reasonMap[reason].sumPnl += pnl;
+      reasonMap[reason].sumPnlPct += pnlPct;
+
+      // By Direction
+      const dir = t.direction || 'LONG';
+      if (dirMap[dir]) {
+        dirMap[dir].trades++;
+        if (isWin) dirMap[dir].wins++;
+        dirMap[dir].totalPnl += pnl;
+      }
+
+      // By Month
+      const month = (t.exit_at || t.entry_at).substring(0, 7);
+      if (!monthMap[month]) monthMap[month] = { month, trades: 0, wins: 0, totalPnl: 0 };
+      monthMap[month].trades++;
+      if (isWin) monthMap[month].wins++;
+      monthMap[month].totalPnl += pnl;
+
+      // P&L Distribution (1% buckets from <-10% to >+10%)
+      let bucketIdx;
+      if (pnlPct <= -10) bucketIdx = -11;
+      else if (pnlPct >= 10) bucketIdx = 10;
+      else bucketIdx = Math.floor(pnlPct);
+      const bucketLabel = bucketIdx <= -11 ? '<-10%' : bucketIdx >= 10 ? '>+10%' : `${bucketIdx}% to ${bucketIdx + 1}%`;
+      if (!pnlBuckets[bucketIdx]) pnlBuckets[bucketIdx] = { bucket: bucketLabel, idx: bucketIdx, count: 0 };
+      pnlBuckets[bucketIdx].count++;
+    }
+
+    // Format outputs
+    const round2 = v => Math.round(v * 100) / 100;
+    const wr = (wins, total) => total > 0 ? Math.round((wins / total) * 10000) / 100 : 0;
+
+    const byAsset = Object.values(assetMap)
+      .map(a => ({ ...a, winRate: wr(a.wins, a.trades), totalPnl: round2(a.totalPnl), avgPnl: round2(a.totalPnl / a.trades), avgHoldHours: round2(a.sumHoldHours / a.trades) }))
+      .sort((a, b) => b.totalPnl - a.totalPnl);
+
+    // Fill all 24 hours
+    const byHour = Array.from({ length: 24 }, (_, h) => {
+      const d = hourMap[h] || { hour: h, trades: 0, wins: 0, totalPnl: 0 };
+      return { ...d, winRate: wr(d.wins, d.trades), totalPnl: round2(d.totalPnl) };
+    });
+
+    // Fill all 7 days
+    const byDayOfWeek = Array.from({ length: 7 }, (_, i) => {
+      const d = dowMap[i] || { day: i, label: DOW_LABELS[i], trades: 0, wins: 0, totalPnl: 0 };
+      return { ...d, winRate: wr(d.wins, d.trades), totalPnl: round2(d.totalPnl) };
+    });
+
+    const byExitReason = Object.values(reasonMap)
+      .map(r => ({ reason: r.reason, count: r.count, winRate: wr(r.wins, r.count), avgPnl: round2(r.sumPnl / r.count), avgPnlPct: round2(r.sumPnlPct / r.count) }))
+      .sort((a, b) => b.count - a.count);
+
+    const byDirection = {};
+    for (const [dir, d] of Object.entries(dirMap)) {
+      byDirection[dir] = { trades: d.trades, wins: d.wins, winRate: wr(d.wins, d.trades), totalPnl: round2(d.totalPnl) };
+    }
+
+    const pnlDistribution = Object.values(pnlBuckets).sort((a, b) => a.idx - b.idx).map(({ bucket, count }) => ({ bucket, count }));
+
+    const tradesByMonth = Object.values(monthMap)
+      .map(m => ({ ...m, winRate: wr(m.wins, m.trades), totalPnl: round2(m.totalPnl) }))
+      .sort((a, b) => a.month.localeCompare(b.month));
+
+    return {
+      data: {
+        total: data.length,
+        byAsset,
+        byHour,
+        byDayOfWeek,
+        byExitReason,
+        byDirection,
+        pnlDistribution,
+        tradesByMonth
+      },
+      error: null
+    };
+  } catch (err) {
+    logger.error('getAdvancedPerformance exception', { error: err.message });
+    return { data: null, error: err };
+  }
+}
+
 async function getTradeHistory(supabase, userId, options = {}) {
   try {
     const { status, asset, limit = 50, offset = 0 } = options;
@@ -1585,6 +1742,7 @@ module.exports = {
 
   // Analytics
   getPerformanceMetrics,
+  getAdvancedPerformance,
   getTradeHistory,
   getOpenPositions,
 
