@@ -11,6 +11,7 @@ const { evaluateSignalForTrade, calculatePositionSize, DEFAULT_CONFIG } = requir
 const { SLIPPAGE, COMMISSION, TOTAL_COST } = require('./constants');
 const { runMonteCarloSimulation } = require('./monteCarloSim');
 const { runStatisticalTests } = require('./statisticalTests');
+const { buildSizingOptions } = require('./kellySizing');
 
 // ─── CONSTANTS ──────────────────────────────────────────────────────────────
 
@@ -853,7 +854,8 @@ async function runBacktest(options, onProgress = null) {
     derivativesData = null,
     macroData = null,
     strategyConfig = null,
-    preloadedCandles = null  // For optimizer: skip re-fetching
+    preloadedCandles = null,  // For optimizer: skip re-fetching
+    kellySizing = null         // Kelly Criterion / volatility targeting config
   } = options;
 
   const startTime = Date.now();
@@ -1115,8 +1117,13 @@ async function runBacktest(options, onProgress = null) {
         .reduce((s, t) => s + t.pnl, 0);
       if (dailyPnl <= -dailyLossLimit) continue;
 
-      // Calculate position size
-      const posSize = calculatePositionSize(tempConfig, signal);
+      // Calculate position size (with optional Kelly/vol adjustments)
+      let sizingOptions = null;
+      if (kellySizing) {
+        const currentATRPercent = parseFloat(signal.indicators?.atrPercent) || 0;
+        sizingOptions = buildSizingOptions(completedTrades, currentATRPercent, kellySizing);
+      }
+      const posSize = calculatePositionSize(tempConfig, signal, sizingOptions);
       if (posSize.positionSizeUsd <= 0) continue;
 
       // Apply slippage to entry
@@ -1146,7 +1153,8 @@ async function runBacktest(options, onProgress = null) {
         rawScore: signal.rawScore,
         confluence: signal.timeframes?.confluence || 'unknown',
         maxFavorable: 0,
-        maxAdverse: 0
+        maxAdverse: 0,
+        sizingMeta: posSize.sizing || null
       };
 
       openTrades.push(newTrade);
@@ -1202,6 +1210,36 @@ async function runBacktest(options, onProgress = null) {
   // Statistical significance tests (p-values, confidence intervals)
   const significance = runStatisticalTests(completedTrades, monteCarlo);
 
+  // Kelly Criterion / Volatility Targeting summary
+  let kellySizingSummary = null;
+  if (kellySizing) {
+    const tradesWithKelly = completedTrades.filter(t => t.sizingMeta?.kellyApplied);
+    const tradesWithVol = completedTrades.filter(t => t.sizingMeta?.volApplied);
+    const kellyFractions = tradesWithKelly.map(t => t.sizingMeta.kellyFraction).filter(Boolean);
+    const volScales = tradesWithVol.map(t => t.sizingMeta.volScale).filter(Boolean);
+
+    kellySizingSummary = {
+      kellyEnabled: !!kellySizing.kelly?.enabled,
+      volTargetingEnabled: !!kellySizing.volatilityTargeting?.enabled,
+      tradesWithKelly: tradesWithKelly.length,
+      tradesWithoutKelly: completedTrades.length - tradesWithKelly.length,
+      avgKellyFraction: kellyFractions.length > 0
+        ? Math.round((kellyFractions.reduce((s, f) => s + f, 0) / kellyFractions.length) * 10000) / 10000
+        : null,
+      minKellyFraction: kellyFractions.length > 0
+        ? Math.round(Math.min(...kellyFractions) * 10000) / 10000
+        : null,
+      maxKellyFraction: kellyFractions.length > 0
+        ? Math.round(Math.max(...kellyFractions) * 10000) / 10000
+        : null,
+      tradesWithVolScale: tradesWithVol.length,
+      avgVolScale: volScales.length > 0
+        ? Math.round((volScales.reduce((s, v) => s + v, 0) / volScales.length) * 100) / 100
+        : null,
+      kellyConfig: kellySizing
+    };
+  }
+
   const duration = ((Date.now() - startTime) / 1000).toFixed(1);
 
   logger.info('Backtest completed', {
@@ -1232,7 +1270,8 @@ async function runBacktest(options, onProgress = null) {
     score: t.score,
     confluence: t.confluence,
     maxFavorable: t.maxFavorable,
-    maxAdverse: t.maxAdverse
+    maxAdverse: t.maxAdverse,
+    sizingMeta: t.sizingMeta || null
   }));
 
   return {
@@ -1240,6 +1279,7 @@ async function runBacktest(options, onProgress = null) {
     metrics,
     monteCarlo,
     significance,
+    kellySizing: kellySizingSummary,
     trades: cleanTrades,
     equityCurve,
     duration: parseFloat(duration),

@@ -329,7 +329,7 @@ function evaluateSignalForTrade(signal, config) {
   return { eligible: true, reason: 'All criteria met' };
 }
 
-function calculatePositionSize(config, signal) {
+function calculatePositionSize(config, signal, sizingOptions = null) {
   const entryPrice = signal.tradeLevels.entry;
   const stopLoss = signal.tradeLevels.stopLoss;
   const riskPerUnit = Math.abs(entryPrice - stopLoss);
@@ -338,9 +338,27 @@ function calculatePositionSize(config, signal) {
     return { positionSizeUsd: 0, quantity: 0, riskAmount: 0 };
   }
 
-  const riskAmount = config.current_capital * config.risk_per_trade;
+  // Kelly Criterion: replace fixed risk_per_trade with data-driven fraction
+  let effectiveRiskPerTrade = config.risk_per_trade;
+  let kellyApplied = false;
+  if (sizingOptions?.kellyResult?.applied && sizingOptions.kellyResult.kellyFraction != null) {
+    effectiveRiskPerTrade = sizingOptions.kellyResult.kellyFraction;
+    kellyApplied = true;
+  }
+
+  const riskAmount = config.current_capital * effectiveRiskPerTrade;
   let quantity = riskAmount / riskPerUnit;
   let positionSizeUsd = quantity * entryPrice;
+
+  // Volatility targeting: scale position size by inverse volatility ratio
+  let volApplied = false;
+  let volScale = 1.0;
+  if (sizingOptions?.volResult?.applied) {
+    volScale = sizingOptions.volResult.volScale;
+    positionSizeUsd *= volScale;
+    quantity = positionSizeUsd / entryPrice;
+    volApplied = true;
+  }
 
   // Cap at configurable % of capital (default 30%)
   const maxPositionPct = config.max_position_percent || DEFAULT_CONFIG.max_position_percent;
@@ -353,7 +371,17 @@ function calculatePositionSize(config, signal) {
   return {
     positionSizeUsd: Math.round(positionSizeUsd * 100) / 100,
     quantity: quantity,
-    riskAmount: Math.round(riskAmount * 100) / 100
+    riskAmount: Math.round(riskAmount * 100) / 100,
+    // Sizing metadata (only when sizing options provided)
+    ...(sizingOptions ? {
+      sizing: {
+        kellyApplied,
+        kellyFraction: sizingOptions.kellyResult?.kellyFraction || null,
+        volApplied,
+        volScale: volApplied ? Math.round(volScale * 10000) / 10000 : null,
+        effectiveRiskPerTrade: Math.round(effectiveRiskPerTrade * 10000) / 10000
+      }
+    } : {})
   };
 }
 

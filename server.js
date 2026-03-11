@@ -2211,7 +2211,8 @@ app.post('/api/backtest/run', async (req, res) => {
       stepInterval = '4h',
       allowedStrength = ['STRONG BUY', 'STRONG SELL'],
       cooldownBars = 6,
-      userId = 'default-user'
+      userId = 'default-user',
+      kellySizing = null
     } = req.body;
 
     // Validate inputs
@@ -2221,6 +2222,22 @@ app.post('/api/backtest/run', async (req, res) => {
     if (typeof riskPerTrade !== 'number' || riskPerTrade < 0.001 || riskPerTrade > 0.10) return res.status(400).json({ error: 'riskPerTrade must be between 0.001 and 0.10' });
     if (!Number.isInteger(maxOpenPositions) || maxOpenPositions < 1 || maxOpenPositions > 10) return res.status(400).json({ error: 'maxOpenPositions must be between 1 and 10' });
     if (!Array.isArray(allowedStrength)) return res.status(400).json({ error: 'allowedStrength must be an array' });
+
+    // Validate Kelly Criterion / Volatility Targeting config
+    if (kellySizing != null) {
+      if (typeof kellySizing !== 'object') return res.status(400).json({ error: 'kellySizing must be an object or null' });
+      if (kellySizing.kelly) {
+        if (kellySizing.kelly.fraction !== undefined && (kellySizing.kelly.fraction < 0.1 || kellySizing.kelly.fraction > 1.0))
+          return res.status(400).json({ error: 'kellySizing.kelly.fraction must be between 0.1 and 1.0' });
+        if (kellySizing.kelly.minTrades !== undefined && (kellySizing.kelly.minTrades < 5 || kellySizing.kelly.minTrades > 200))
+          return res.status(400).json({ error: 'kellySizing.kelly.minTrades must be between 5 and 200' });
+      }
+      if (kellySizing.volatilityTargeting) {
+        if (kellySizing.volatilityTargeting.targetATRPercent !== undefined &&
+            (kellySizing.volatilityTargeting.targetATRPercent < 0.5 || kellySizing.volatilityTargeting.targetATRPercent > 10))
+          return res.status(400).json({ error: 'kellySizing.volatilityTargeting.targetATRPercent must be between 0.5 and 10' });
+      }
+    }
 
     // Try to create record in Supabase first
     let recordId = null;
@@ -2269,7 +2286,8 @@ app.post('/api/backtest/run', async (req, res) => {
         const result = await runBacktest({
           asset, days, interval: stepInterval, capital, riskPerTrade,
           maxOpenPositions, minConfluence, minRR, allowedStrength,
-          cooldownBars, fearGreed: 50, derivativesData: null, macroData: null
+          cooldownBars, fearGreed: 50, derivativesData: null, macroData: null,
+          kellySizing
         }, async (progress) => {
           // Update progress in memory
           const entry = backtestStore.get(recordId);
@@ -2306,6 +2324,7 @@ app.post('/api/backtest/run', async (req, res) => {
           equity_curve: result.equityCurve, metrics: metrics,
           monte_carlo: mcForClient,
           significance: result.significance || null,
+          kelly_sizing: result.kellySizing || null,
           completed_at: new Date().toISOString(), created_at: backtestStore.get(recordId)?.created_at
         };
 
@@ -2326,6 +2345,7 @@ app.post('/api/backtest/run', async (req, res) => {
               equity_curve: result.equityCurve, metrics: metrics,
               monte_carlo: mcForClient,
               significance: result.significance || null,
+              kelly_sizing: result.kellySizing || null,
               completed_at: new Date().toISOString()
             }).eq('id', recordId);
           } catch (_) { /* saved in memory */ }
