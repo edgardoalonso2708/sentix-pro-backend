@@ -48,7 +48,7 @@ describe('simulateTradeExecution', () => {
 
   describe('LONG trades', () => {
 
-    test('hits stop loss when price drops below SL (gap-through slippage)', () => {
+    test('hits stop loss when price drops below SL (gap-through with realistic model)', () => {
       const trade = makeTrade({ entryPrice: 100000, stopLoss: 97000 });
       const candles = [
         makeCandle(1000, 100000, 100500, 99500, 100200), // entry candle
@@ -58,11 +58,11 @@ describe('simulateTradeExecution', () => {
 
       const result = simulateTradeExecution(trade, candles, 0);
 
-      // Gap-through: gapFill = (97000 + 96500) / 2 = 96750
-      const gapFill = (97000 + 96500) / 2;
-      expect(result.exitReason).toBe('stop_loss');
+      // New model: gap-through + SL overshoot + per-asset cost → worse fill than old model
+      expect(result.exitReason).toMatch(/^stop_loss/);
       expect(result.exitIndex).toBe(2);
-      expect(result.exitPrice).toBeCloseTo(gapFill * (1 - TOTAL_COST), 2);
+      expect(result.exitPrice).toBeLessThan(97000); // Must be worse than SL price
+      expect(result.exitPrice).toBeGreaterThan(95000); // But reasonable
       expect(result.pnl).toBeLessThan(0);
       expect(result.holdingBars).toBe(2);
     });
@@ -144,7 +144,7 @@ describe('simulateTradeExecution', () => {
       expect(result.pnl).toBeLessThan(0);
     });
 
-    test('calculates slippage correctly on exit (with gap-through)', () => {
+    test('calculates realistic slippage on exit (gap-through + overshoot + per-asset cost)', () => {
       const trade = makeTrade({ entryPrice: 100000, stopLoss: 97000 });
       const candles = [
         makeCandle(1000, 100000, 100500, 99500, 100200),
@@ -153,9 +153,11 @@ describe('simulateTradeExecution', () => {
 
       const result = simulateTradeExecution(trade, candles, 0);
 
-      // Gap-through: gapFill = (97000 + 96500) / 2 = 96750, then * (1 - TOTAL_COST)
-      const gapFill = (97000 + 96500) / 2;
-      expect(result.exitPrice).toBeCloseTo(gapFill * (1 - TOTAL_COST), 2);
+      // New model: gap fill + SL overshoot + per-asset cost → exit worse than old model
+      const oldModelPrice = ((97000 + 96500) / 2) * (1 - TOTAL_COST);
+      expect(result.exitPrice).toBeLessThan(oldModelPrice); // New model is more pessimistic
+      expect(result.exitPrice).toBeGreaterThan(95000); // Still reasonable
+      expect(result.exitReason).toMatch(/^stop_loss/);
     });
   });
 
@@ -163,7 +165,7 @@ describe('simulateTradeExecution', () => {
 
   describe('SHORT trades', () => {
 
-    test('hits stop loss when price rises above SL (gap-through slippage)', () => {
+    test('hits stop loss when price rises above SL (gap-through with realistic model)', () => {
       const trade = makeTrade({
         direction: 'SHORT',
         entryPrice: 100000, stopLoss: 103000,
@@ -177,10 +179,10 @@ describe('simulateTradeExecution', () => {
 
       const result = simulateTradeExecution(trade, candles, 0);
 
-      // Gap-through: gapFill = (103000 + 103500) / 2 = 103250
-      const gapFill = (103000 + 103500) / 2;
-      expect(result.exitReason).toBe('stop_loss');
-      expect(result.exitPrice).toBeCloseTo(gapFill * (1 + TOTAL_COST), 2);
+      // New model: gap fill + overshoot + per-asset cost → worse fill than old
+      expect(result.exitReason).toMatch(/^stop_loss/);
+      expect(result.exitPrice).toBeGreaterThan(103000); // Must be worse than SL price for shorts
+      expect(result.exitPrice).toBeLessThan(106000); // But reasonable
       expect(result.pnl).toBeLessThan(0);
     });
 

@@ -8,7 +8,7 @@ const axios = require('axios');
 const { fetchKlines, SYMBOL_MAP, FUTURES_SYMBOL_MAP } = require('./binanceAPI');
 const { generateMultiTimeframeSignal } = require('./technicalAnalysis');
 const { evaluateSignalForTrade, calculatePositionSize, DEFAULT_CONFIG } = require('./paperTrading');
-const { SLIPPAGE, COMMISSION, TOTAL_COST } = require('./constants');
+const { SLIPPAGE, COMMISSION, TOTAL_COST, getAssetCost, simulateGapRisk, SL_OVERSHOOT } = require('./constants');
 const { runMonteCarloSimulation } = require('./monteCarloSim');
 const { runStatisticalTests } = require('./statisticalTests');
 const { buildSizingOptions } = require('./kellySizing');
@@ -475,6 +475,7 @@ function simulateTradeExecution(trade, candles, startIndex) {
   const tp2 = trade.takeProfit2;
   const trailingActivation = trade.trailingActivation;
   const trailingDistance = Math.abs(entryPrice - trade.trailingStop);
+  const assetCost = trade._assetCost || TOTAL_COST; // Per-asset or legacy
 
   let status = 'open'; // open → partial → closed
   let trailingActive = false;
@@ -487,6 +488,7 @@ function simulateTradeExecution(trade, candles, startIndex) {
   let partialCloseIndex = null;
   let maxFavorable = 0;
   let maxAdverse = 0;
+  let gapEvent = false;
 
   for (let i = startIndex + 1; i < candles.length; i++) {
     const candle = candles[i];
@@ -504,29 +506,52 @@ function simulateTradeExecution(trade, candles, startIndex) {
       maxAdverse = Math.min(maxAdverse, worstCase);
 
       // CONSERVATIVE: Check SL first (if same candle hits both, SL wins)
-      // Gap-through: if low < stopLoss, price gapped through → worse fill
+      // Realistic fill: gap risk + SL overshoot + per-asset slippage
       if (low <= stopLoss) {
-        const gapFill = low < stopLoss ? (stopLoss + low) / 2 : stopLoss; // Model gap slippage
-        const exitPrice = gapFill * (1 - TOTAL_COST); // Slippage + commission on exit
+        let fillPrice = stopLoss;
+
+        // 1) Gap-through: if candle low < SL, price gapped → average fill
+        if (low < stopLoss) {
+          fillPrice = (stopLoss + low) / 2;
+        }
+
+        // 2) Gap risk event: deterministic 2% chance of severe gap (flash crash)
+        const gapSeed = i * 1000 + Math.round(entryPrice);
+        const gap = simulateGapRisk(stopLoss, gapSeed);
+        if (gap.gapped) {
+          fillPrice = stopLoss * (1 - gap.overshootPct); // Worse fill for longs
+          gapEvent = true;
+        }
+
+        // 3) SL overshoot: baseline + volatility-scaled component
+        const candleRange = (high - low) / ((high + low) / 2); // Candle range as %
+        const overshoot = SL_OVERSHOOT.baseOvershootPct + candleRange * SL_OVERSHOOT.volatilityMultiplier;
+        fillPrice *= (1 - overshoot);
+
+        // 4) Per-asset execution cost
+        const exitPrice = fillPrice * (1 - assetCost);
         const pnl = ((exitPrice - entryPrice) * remainingQty) + partialPnl;
         return {
           exitIndex: i,
           exitTimestamp: candle.timestamp,
           exitPrice,
-          exitReason: 'stop_loss',
+          exitReason: gap.gapped ? 'stop_loss_gap' : 'stop_loss',
           pnl: Math.round(pnl * 100) / 100,
           pnlPercent: Math.round((pnl / trade.positionSizeUsd) * 10000) / 100,
           maxFavorable: Math.round(maxFavorable * 100) / 100,
           maxAdverse: Math.round(maxAdverse * 100) / 100,
           holdingBars: i - startIndex,
           partialClosePrice,
-          partialCloseIndex
+          partialCloseIndex,
+          gapEvent: gap.gapped,
+          gapOvershootPct: gap.gapped ? Math.round(gap.overshootPct * 10000) / 100 : 0
         };
       }
 
       // Check trailing stop (if active)
       if (trailingActive && low <= trailingStopCurrent) {
-        const exitPrice = trailingStopCurrent * (1 - TOTAL_COST);
+        const overshoot = SL_OVERSHOOT.baseOvershootPct;
+        const exitPrice = trailingStopCurrent * (1 - overshoot) * (1 - assetCost);
         const pnl = ((exitPrice - entryPrice) * remainingQty) + partialPnl;
         return {
           exitIndex: i, exitTimestamp: candle.timestamp, exitPrice,
@@ -541,7 +566,7 @@ function simulateTradeExecution(trade, candles, startIndex) {
 
       // Check TP1 (partial close - 50%)
       if (status === 'open' && high >= tp1) {
-        const closePrice = tp1 * (1 - TOTAL_COST);
+        const closePrice = tp1 * (1 - assetCost);
         const closeQty = quantity / 2;
         partialPnl = (closePrice - entryPrice) * closeQty;
         remainingQty = quantity - closeQty;
@@ -552,7 +577,7 @@ function simulateTradeExecution(trade, candles, startIndex) {
 
       // Check TP2 (full close of remaining)
       if (status === 'partial' && tp2 && high >= tp2) {
-        const exitPrice = tp2 * (1 - TOTAL_COST);
+        const exitPrice = tp2 * (1 - assetCost);
         const pnl = ((exitPrice - entryPrice) * remainingQty) + partialPnl;
         return {
           exitIndex: i, exitTimestamp: candle.timestamp, exitPrice,
@@ -588,25 +613,48 @@ function simulateTradeExecution(trade, candles, startIndex) {
       maxFavorable = Math.max(maxFavorable, bestCase + partialPnl);
       maxAdverse = Math.min(maxAdverse, worstCase);
 
-      // SL (price goes UP) — gap-through modeling
+      // SL (price goes UP) — realistic fill: gap risk + overshoot + per-asset cost
       if (high >= stopLoss) {
-        const gapFill = high > stopLoss ? (stopLoss + high) / 2 : stopLoss;
-        const exitPrice = gapFill * (1 + TOTAL_COST);
+        let fillPrice = stopLoss;
+
+        // 1) Gap-through
+        if (high > stopLoss) {
+          fillPrice = (stopLoss + high) / 2;
+        }
+
+        // 2) Gap risk event
+        const gapSeed = i * 1000 + Math.round(entryPrice);
+        const gap = simulateGapRisk(stopLoss, gapSeed);
+        if (gap.gapped) {
+          fillPrice = stopLoss * (1 + gap.overshootPct); // Worse fill for shorts (price goes up)
+          gapEvent = true;
+        }
+
+        // 3) SL overshoot
+        const candleRange = (high - low) / ((high + low) / 2);
+        const overshoot = SL_OVERSHOOT.baseOvershootPct + candleRange * SL_OVERSHOOT.volatilityMultiplier;
+        fillPrice *= (1 + overshoot);
+
+        // 4) Per-asset execution cost
+        const exitPrice = fillPrice * (1 + assetCost);
         const pnl = ((entryPrice - exitPrice) * remainingQty) + partialPnl;
         return {
           exitIndex: i, exitTimestamp: candle.timestamp, exitPrice,
-          exitReason: 'stop_loss',
+          exitReason: gap.gapped ? 'stop_loss_gap' : 'stop_loss',
           pnl: Math.round(pnl * 100) / 100,
           pnlPercent: Math.round((pnl / trade.positionSizeUsd) * 10000) / 100,
           maxFavorable: Math.round(maxFavorable * 100) / 100,
           maxAdverse: Math.round(maxAdverse * 100) / 100,
-          holdingBars: i - startIndex, partialClosePrice, partialCloseIndex
+          holdingBars: i - startIndex, partialClosePrice, partialCloseIndex,
+          gapEvent: gap.gapped,
+          gapOvershootPct: gap.gapped ? Math.round(gap.overshootPct * 10000) / 100 : 0
         };
       }
 
       // Trailing stop (price goes UP)
       if (trailingActive && high >= trailingStopCurrent) {
-        const exitPrice = trailingStopCurrent * (1 + TOTAL_COST);
+        const overshoot = SL_OVERSHOOT.baseOvershootPct;
+        const exitPrice = trailingStopCurrent * (1 + overshoot) * (1 + assetCost);
         const pnl = ((entryPrice - exitPrice) * remainingQty) + partialPnl;
         return {
           exitIndex: i, exitTimestamp: candle.timestamp, exitPrice,
@@ -621,7 +669,7 @@ function simulateTradeExecution(trade, candles, startIndex) {
 
       // TP1 (price goes DOWN)
       if (status === 'open' && low <= tp1) {
-        const closePrice = tp1 * (1 + TOTAL_COST);
+        const closePrice = tp1 * (1 + assetCost);
         const closeQty = quantity / 2;
         partialPnl = (entryPrice - closePrice) * closeQty;
         remainingQty = quantity - closeQty;
@@ -632,7 +680,7 @@ function simulateTradeExecution(trade, candles, startIndex) {
 
       // TP2 (price goes DOWN)
       if (status === 'partial' && tp2 && low <= tp2) {
-        const exitPrice = tp2 * (1 + TOTAL_COST);
+        const exitPrice = tp2 * (1 + assetCost);
         const pnl = ((entryPrice - exitPrice) * remainingQty) + partialPnl;
         return {
           exitIndex: i, exitTimestamp: candle.timestamp, exitPrice,
@@ -838,7 +886,24 @@ function calculateBacktestMetrics(completedTrades, equityCurve, initialCapital, 
     avgHoldingBars: Math.round(completedTrades.reduce((s, t) => s + t.holdingBars, 0) / completedTrades.length),
     tradesPerMonth: Math.round((completedTrades.length / days) * 30 * 10) / 10,
     maxConsecutiveWins: maxConsWins,
-    maxConsecutiveLosses: maxConsLosses
+    maxConsecutiveLosses: maxConsLosses,
+    // Realism metrics
+    realism: {
+      gapEvents: completedTrades.filter(t => t.gapEvent).length,
+      gapEventPct: completedTrades.length > 0
+        ? Math.round((completedTrades.filter(t => t.gapEvent).length / completedTrades.length) * 10000) / 100
+        : 0,
+      avgGapOvershoot: (() => {
+        const gaps = completedTrades.filter(t => t.gapEvent && t.gapOvershootPct);
+        return gaps.length > 0
+          ? Math.round((gaps.reduce((s, t) => s + t.gapOvershootPct, 0) / gaps.length) * 100) / 100
+          : 0;
+      })(),
+      slStopLosses: completedTrades.filter(t => t.exitReason === 'stop_loss' || t.exitReason === 'stop_loss_gap').length,
+      perAssetSlippage: true,
+      slOvershootModel: true,
+      gapRiskModel: true
+    }
   };
 }
 
@@ -1140,16 +1205,18 @@ async function runBacktest(options, onProgress = null) {
       const posSize = calculatePositionSize(tempConfig, signal, sizingOptions);
       if (posSize.positionSizeUsd <= 0) continue;
 
-      // Apply slippage to entry
+      // Apply per-asset slippage to entry
+      const assetCost = getAssetCost(asset);
       const slippedEntry = signal.action === 'BUY'
-        ? signal.tradeLevels.entry * (1 + TOTAL_COST)
-        : signal.tradeLevels.entry * (1 - TOTAL_COST);
+        ? signal.tradeLevels.entry * (1 + assetCost)
+        : signal.tradeLevels.entry * (1 - assetCost);
 
       // Open trade
       const newTrade = {
         asset: signal.asset,
         direction: signal.action === 'BUY' ? 'LONG' : 'SHORT',
         entryPrice: slippedEntry,
+        _assetCost: assetCost,  // Pass to simulateTradeExecution
         stopLoss: signal.tradeLevels.stopLoss,
         takeProfit1: signal.tradeLevels.takeProfit1,
         takeProfit2: signal.tradeLevels.takeProfit2,

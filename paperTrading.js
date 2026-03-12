@@ -4,16 +4,15 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const { logger } = require('./logger');
-const { SLIPPAGE, COMMISSION } = require('./constants');
+const { SLIPPAGE, COMMISSION, getAssetCost } = require('./constants');
 const { buildSizingOptions } = require('./kellySizing');
 
 // ─── EXECUTION SIMULATION ───────────────────────────────────────────────────
 
-function applySlippage(price, isBuy) {
-  // BUY: fill higher (worse), SELL: fill lower (worse)
-  const slip = isBuy ? (1 + SLIPPAGE) : (1 - SLIPPAGE);
-  const comm = (1 + COMMISSION); // commission always worsens the effective price
-  return isBuy ? price * slip * comm : price * slip / comm;
+function applySlippage(price, isBuy, asset = null) {
+  // Per-asset slippage when asset is provided, else legacy flat rate
+  const cost = asset ? getAssetCost(asset) : (SLIPPAGE + COMMISSION);
+  return isBuy ? price * (1 + cost) : price * (1 - cost);
 }
 
 // ─── DEFAULT CONFIGURATION ──────────────────────────────────────────────────
@@ -595,7 +594,7 @@ async function openTrade(supabase, userId, signal, positionSize) {
 
     // Apply slippage + commission to entry (simulates real execution)
     const isBuy = direction === 'LONG';
-    const slippedEntry = applySlippage(signal.tradeLevels.entry, isBuy);
+    const slippedEntry = applySlippage(signal.tradeLevels.entry, isBuy, signal.asset);
 
     const tradeData = {
       user_id: userId,
@@ -825,7 +824,7 @@ async function monitorOpenPositions(supabase, userId, marketData, config = null)
         const holdingMs = Date.now() - new Date(trade.entry_at).getTime();
         if (holdingMs > maxHoldingHours * 3600 * 1000) {
           const isExitBuy = trade.direction === 'SHORT';
-          const slippedClosePrice = applySlippage(currentPrice, isExitBuy);
+          const slippedClosePrice = applySlippage(currentPrice, isExitBuy, trade.asset);
           const closeResult = await executeFullClose(supabase, trade, slippedClosePrice, 'time_expiry');
           if (closeResult.closedTrade) {
             result.closedTrades.push(closeResult.closedTrade);
@@ -857,7 +856,7 @@ async function monitorOpenPositions(supabase, userId, marketData, config = null)
 
       // Apply slippage + commission on exit (LONG closes are sells, SHORT closes are buys)
       const isExitBuy = trade.direction === 'SHORT'; // SHORT exit = buy back
-      const slippedClosePrice = applySlippage(currentPrice, isExitBuy);
+      const slippedClosePrice = applySlippage(currentPrice, isExitBuy, trade.asset);
 
       switch (check.action) {
         case 'stop_loss': {
@@ -1815,7 +1814,7 @@ async function monitorAndManage(supabase, userId, marketData) {
           if (price) {
             // Apply slippage to emergency closes (liquidations have WORSE slippage)
             const isExitBuy = trade.direction === 'SHORT';
-            const slippedPrice = applySlippage(price, isExitBuy);
+            const slippedPrice = applySlippage(price, isExitBuy, trade.asset);
             const { closedTrade } = await executeFullClose(supabase, trade, slippedPrice, 'max_daily_loss');
             if (closedTrade) closedTrades.push(closedTrade);
           }
