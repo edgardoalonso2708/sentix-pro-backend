@@ -2,7 +2,8 @@
 // SENTIX PRO - STRATEGY OPTIMIZER
 // Grid search engine that tests parameter variations against historical data
 // Uses the backtester to evaluate each config and ranks by Sharpe ratio
-// Walk-forward validation (70/30 train/test) to detect overfitting
+// Walk-forward validation: single split (30-59d) or rolling windows (60d+)
+// Rolling WF: sliding train/test windows + parameter stability scoring
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const { logger } = require('./logger');
@@ -26,6 +27,7 @@ function generateParamValues(range) {
 }
 
 // ─── Walk-Forward Validation Helpers ─────────────────────────────────────────
+// Single split (legacy 70/30) and rolling multi-window walk-forward
 
 /**
  * Split pre-loaded candle arrays into train and test sets.
@@ -93,6 +95,266 @@ function computeValidationSplit(days, trainRatio = 0.7) {
     testDays,
     trainRatio
   };
+}
+
+// ─── Rolling Walk-Forward Windows ────────────────────────────────────────────
+
+/**
+ * Compute rolling walk-forward windows for multi-period validation.
+ *
+ * Uses a rolling (sliding) approach where each fold has a fixed-size
+ * training window and test window that slide forward through time:
+ *
+ *  |---train1---|--test1--|
+ *       |---train2---|--test2--|
+ *            |---train3---|--test3--|
+ *
+ * This tests parameter stability across different market regimes.
+ *
+ * @param {number} days - Total historical days
+ * @param {Object} [options]
+ * @param {number} [options.numFolds=3] - Desired number of test folds
+ * @param {number} [options.minTrainDays=30] - Minimum training period
+ * @param {number} [options.minTestDays=7] - Minimum test period per fold
+ * @returns {{ rolling: boolean, windows?: Array, numFolds?, trainDays?, testDaysPerFold?, reason? }}
+ */
+function computeRollingWindows(days, options = {}) {
+  const {
+    numFolds: requestedFolds = 3,
+    minTrainDays = 30,
+    minTestDays = 7
+  } = options;
+
+  const MIN_DAYS_FOR_ROLLING = 60;
+
+  if (days < MIN_DAYS_FOR_ROLLING) {
+    return {
+      rolling: false,
+      reason: `Rolling walk-forward requiere >= ${MIN_DAYS_FOR_ROLLING} días (tienes ${days})`
+    };
+  }
+
+  // Calculate test period per fold: ~15% of total, bounded
+  let testDaysPerFold = Math.max(minTestDays, Math.floor(days * 0.15));
+  testDaysPerFold = Math.min(testDaysPerFold, 30); // Cap at 30 days per fold
+
+  // Determine how many folds we can fit
+  // Total = trainDays + numFolds * stepSize, where stepSize = testDaysPerFold
+  // trainDays = days - numFolds * testDaysPerFold (for non-overlapping test zones)
+  let numFolds = requestedFolds;
+  let trainDays = days - numFolds * testDaysPerFold;
+
+  // Reduce folds if training period too short
+  while (trainDays < minTrainDays && numFolds > 1) {
+    numFolds--;
+    trainDays = days - numFolds * testDaysPerFold;
+  }
+
+  if (trainDays < minTrainDays || numFolds < 2) {
+    return {
+      rolling: false,
+      reason: `No se pueden crear suficientes ventanas rolling: trainDays=${trainDays}, folds=${numFolds}`
+    };
+  }
+
+  // Generate rolling windows
+  // Window i: train slides forward by testDaysPerFold each time
+  // Train: [i * step, i * step + trainDays]
+  // Test:  [i * step + trainDays, i * step + trainDays + testDaysPerFold]
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const startTs = now - days * DAY_MS;
+  const stepDays = testDaysPerFold; // Each window slides by one test period
+
+  const windows = [];
+  for (let i = 0; i < numFolds; i++) {
+    const trainStartTs = startTs + i * stepDays * DAY_MS;
+    const trainEndTs = trainStartTs + trainDays * DAY_MS;
+    const testEndTs = trainEndTs + testDaysPerFold * DAY_MS;
+
+    windows.push({
+      fold: i + 1,
+      trainStartTs,
+      trainEndTs,       // Also = testStartTs
+      testEndTs,
+      trainDays,
+      testDays: testDaysPerFold,
+      trainLabel: `Day ${i * stepDays + 1}–${i * stepDays + trainDays}`,
+      testLabel: `Day ${i * stepDays + trainDays + 1}–${i * stepDays + trainDays + testDaysPerFold}`
+    });
+  }
+
+  return {
+    rolling: true,
+    windows,
+    numFolds,
+    trainDays,
+    testDaysPerFold,
+    stepDays,
+    totalDays: days
+  };
+}
+
+/**
+ * Split candles for a specific rolling window (train and test periods).
+ *
+ * @param {Object} candles - { '1h': [], '4h': [], '15m': [] }
+ * @param {Object} window - Single window from computeRollingWindows
+ * @returns {{ train: Object, test: Object, splitInfo: Object }}
+ */
+function splitCandlesForWindow(candles, window) {
+  const train = {};
+  const test = {};
+  const splitInfo = {};
+
+  for (const tf of ['1h', '4h', '15m']) {
+    const arr = candles[tf] || [];
+
+    // Train: candles within [trainStartTs, trainEndTs]
+    const trainCandles = arr.filter(
+      c => c.timestamp >= window.trainStartTs && c.timestamp <= window.trainEndTs
+    );
+
+    // Test: ALL candles up to testEndTs (warm-up + test period)
+    // Candles before trainEndTs serve as indicator warm-up for the test period
+    const testCandles = arr.filter(c => c.timestamp <= window.testEndTs);
+
+    train[tf] = trainCandles;
+    test[tf] = testCandles;
+    splitInfo[tf] = {
+      total: arr.length,
+      trainCount: trainCandles.length,
+      testCount: testCandles.length
+    };
+  }
+
+  return { train, test, splitInfo };
+}
+
+/**
+ * Compute parameter stability score across rolling windows.
+ * Low stdDev = parameter is stable across different market conditions = good.
+ *
+ * @param {Array<Object>} windowResults - Array of { fold, bestValue, bestSharpe, ... }
+ * @returns {Object} { mean, stdDev, cv, stabilityScore, bestValues, consistent }
+ */
+function computeParameterStability(windowResults) {
+  const bestValues = windowResults
+    .filter(w => w.bestValue !== null && w.bestValue !== undefined)
+    .map(w => w.bestValue);
+
+  if (bestValues.length < 2) {
+    return {
+      mean: bestValues[0] || null,
+      stdDev: 0,
+      cv: 0,
+      stabilityScore: 1.0,
+      bestValues,
+      consistent: true,
+      detail: 'Insuficientes ventanas para análisis de estabilidad'
+    };
+  }
+
+  const mean = bestValues.reduce((s, v) => s + v, 0) / bestValues.length;
+  const variance = bestValues.reduce((s, v) => s + (v - mean) ** 2, 0) / bestValues.length;
+  const stdDev = Math.sqrt(variance);
+  const cv = mean !== 0 ? stdDev / Math.abs(mean) : 0; // Coefficient of variation
+
+  // Stability score: 1.0 = perfectly stable, 0.0 = wildly unstable
+  // cv < 0.1 → very stable, cv > 0.5 → unstable
+  const stabilityScore = Math.max(0, Math.min(1, 1 - cv * 2));
+
+  return {
+    mean: Math.round(mean * 1000) / 1000,
+    stdDev: Math.round(stdDev * 1000) / 1000,
+    cv: Math.round(cv * 1000) / 1000,
+    stabilityScore: Math.round(stabilityScore * 100) / 100,
+    bestValues,
+    consistent: cv < 0.25,
+    detail: cv < 0.1
+      ? 'Parámetro muy estable — alta confianza en generalización'
+      : cv < 0.25
+        ? 'Parámetro moderadamente estable — confianza aceptable'
+        : cv < 0.5
+          ? 'Parámetro inestable — los resultados podrían no generalizar'
+          : 'Parámetro muy inestable — alta probabilidad de sobreajuste'
+  };
+}
+
+/**
+ * Aggregate OOS results across rolling windows to find the best param value.
+ * Uses average OOS Sharpe across all folds where the param was tested.
+ *
+ * @param {Array<Object>} allWindowResults - Array of { fold, paramResults: [{ value, oosMetrics }] }
+ * @param {number} minTrades - Minimum trades per fold to count
+ * @returns {Array<Object>} Sorted by avgOosSharpe descending
+ */
+function aggregateRollingResults(allWindowResults, minTrades = 5) {
+  // Collect all unique param values
+  const valueMap = new Map(); // value → { sharpes: [], totalTrades: [], pnls: [] }
+
+  for (const wr of allWindowResults) {
+    for (const pr of wr.paramResults) {
+      if (!valueMap.has(pr.value)) {
+        valueMap.set(pr.value, { sharpes: [], trades: [], pnls: [], winRates: [] });
+      }
+      const entry = valueMap.get(pr.value);
+      if (pr.oosMetrics && !pr.oosMetrics.error) {
+        entry.sharpes.push(pr.oosMetrics.sharpe);
+        entry.trades.push(pr.oosMetrics.totalTrades);
+        entry.pnls.push(pr.oosMetrics.totalPnlPercent);
+        entry.winRates.push(pr.oosMetrics.winRate);
+      }
+    }
+  }
+
+  const aggregated = [];
+  for (const [value, data] of valueMap) {
+    const validFolds = data.sharpes.length;
+    const avgTrades = validFolds > 0
+      ? data.trades.reduce((s, t) => s + t, 0) / validFolds
+      : 0;
+
+    if (validFolds === 0 || avgTrades < minTrades) {
+      aggregated.push({
+        value,
+        avgOosSharpe: -999,
+        avgOosPnlPct: 0,
+        avgWinRate: 0,
+        validFolds: 0,
+        totalFolds: allWindowResults.length,
+        insufficient: true
+      });
+      continue;
+    }
+
+    const avgSharpe = data.sharpes.reduce((s, v) => s + v, 0) / validFolds;
+    const avgPnl = data.pnls.reduce((s, v) => s + v, 0) / validFolds;
+    const avgWinRate = data.winRates.reduce((s, v) => s + v, 0) / validFolds;
+
+    // Sharpe consistency: penalize high variance across folds
+    const sharpeMean = avgSharpe;
+    const sharpeVar = data.sharpes.reduce((s, v) => s + (v - sharpeMean) ** 2, 0) / validFolds;
+    const sharpeStd = Math.sqrt(sharpeVar);
+
+    aggregated.push({
+      value,
+      avgOosSharpe: Math.round(avgSharpe * 100) / 100,
+      avgOosPnlPct: Math.round(avgPnl * 100) / 100,
+      avgWinRate: Math.round(avgWinRate * 10) / 10,
+      sharpeStd: Math.round(sharpeStd * 100) / 100,
+      validFolds,
+      totalFolds: allWindowResults.length,
+      insufficient: false,
+      // Composite score: avg Sharpe penalized by inconsistency
+      compositeScore: Math.round((avgSharpe - 0.5 * sharpeStd) * 100) / 100
+    });
+  }
+
+  // Sort by composite score (Sharpe penalized by variance)
+  aggregated.sort((a, b) => b.compositeScore - a.compositeScore);
+
+  return aggregated;
 }
 
 /**
@@ -196,13 +458,12 @@ function errorMetrics(errorMsg) {
 /**
  * Run a single-parameter grid search optimization with walk-forward validation.
  *
- * When days >= 30, splits data into 70% train / 30% test:
- *   1. Grid search on train period (in-sample)
- *   2. Validate each value on test period (out-of-sample)
- *   3. Rank by OOS Sharpe to resist overfitting
- *   4. Compute overfitting diagnostics (degradation, rank correlation)
- *
- * When days < 30, runs classic full-period optimization (backward compatible).
+ * Validation modes (automatic based on days):
+ *   - days < 30:  No validation — full-period optimization (backward compatible)
+ *   - 30 ≤ days < 60: Single 70/30 train/test split
+ *   - days ≥ 60:  Rolling walk-forward with multiple sliding windows
+ *     + parameter stability scoring across windows
+ *     + composite ranking (avg OOS Sharpe penalized by variance)
  *
  * @param {Object} options
  * @param {string} options.asset - CoinGecko asset ID (e.g., 'bitcoin')
@@ -234,6 +495,7 @@ async function runOptimization(options) {
   }
 
   const testValues = generateParamValues(paramRange);
+  const baseStrategyConfig = mergeConfig(baseConfig);
 
   logger.info('Starting optimization', {
     asset, days, paramName,
@@ -258,16 +520,29 @@ async function runOptimization(options) {
     '15m': preloadedCandles['15m']?.length
   });
 
-  // ─── 2. Compute validation split ──────────────────────────────────────
-  const split = computeValidationSplit(days);
+  // ─── 2. Decide validation mode ────────────────────────────────────────
+  const rollingConfig = computeRollingWindows(days);
+  const split = rollingConfig.rolling ? null : computeValidationSplit(days);
+  const useRolling = rollingConfig.rolling;
+  const useSingleSplit = !useRolling && split && split.validationEnabled;
+
+  // ─── Route to rolling walk-forward or single-split ────────────────────
+  if (useRolling) {
+    return await _runRollingOptimization({
+      asset, days, paramName, paramRange, testValues, baseStrategyConfig,
+      capital, preloadedCandles, rollingConfig, jobId, onProgress, startTime
+    });
+  }
+
+  // ─── Single-split or no-validation path (existing logic) ──────────────
   let trainCandles, testCandlesFull;
 
-  if (split.validationEnabled) {
+  if (useSingleSplit) {
     const splitResult = splitCandlesByTimestamp(preloadedCandles, split.splitTimestamp);
     trainCandles = splitResult.train;
     testCandlesFull = splitResult.test;
 
-    logger.info('Walk-forward validation enabled', {
+    logger.info('Walk-forward validation enabled (single split)', {
       trainDays: split.trainDays,
       testDays: split.testDays,
       splitDate: new Date(split.splitTimestamp).toISOString(),
@@ -278,15 +553,14 @@ async function runOptimization(options) {
 
   // ─── 3. Grid search: In-Sample (train or full period) ────────────────
   let results = [];
-  const baseStrategyConfig = mergeConfig(baseConfig);
-  const totalSteps = split.validationEnabled ? testValues.length * 2 : testValues.length;
+  const totalSteps = useSingleSplit ? testValues.length * 2 : testValues.length;
   let stepsDone = 0;
 
   for (let i = 0; i < testValues.length; i++) {
     const value = testValues[i];
     const testConfig = { ...baseStrategyConfig, [paramName]: value };
 
-    const phaseLabel = split.validationEnabled ? 'IS' : '';
+    const phaseLabel = useSingleSplit ? 'IS' : '';
     const progress = {
       phase: 'testing',
       message: `Probando ${phaseLabel} ${paramRange.label}: ${value} (${i + 1}/${testValues.length})`.trim(),
@@ -303,7 +577,7 @@ async function runOptimization(options) {
 
     let isMetrics;
     try {
-      const candlesForIS = split.validationEnabled ? trainCandles : preloadedCandles;
+      const candlesForIS = useSingleSplit ? trainCandles : preloadedCandles;
 
       const backtestResult = await runBacktest({
         asset,
@@ -358,7 +632,7 @@ async function runOptimization(options) {
   }
 
   // ─── 4. Validation: Out-of-Sample (test period) ──────────────────────
-  if (split.validationEnabled) {
+  if (useSingleSplit) {
     for (let i = 0; i < testValues.length; i++) {
       const value = testValues[i];
       const testConfig = { ...baseStrategyConfig, [paramName]: value };
@@ -412,15 +686,14 @@ async function runOptimization(options) {
 
   // Ranking metric: OOS Sharpe if validation, else IS Sharpe
   const getRankSharpe = (r) => {
-    if (split.validationEnabled && r.outOfSample && !r.outOfSample.error) {
+    if (useSingleSplit && r.outOfSample && !r.outOfSample.error) {
       return r.outOfSample.sharpe;
     }
     return r.sharpe; // IS sharpe (backward compat)
   };
 
   const getTradeCount = (r) => {
-    if (split.validationEnabled && r.outOfSample && !r.outOfSample.error) {
-      // For ranking, require minimum trades in BOTH periods
+    if (useSingleSplit && r.outOfSample && !r.outOfSample.error) {
       return Math.min(r.totalTrades, r.outOfSample.totalTrades);
     }
     return r.totalTrades;
@@ -439,7 +712,7 @@ async function runOptimization(options) {
 
   // ─── 6. Compute overfitting metrics ──────────────────────────────────
   let overfitMetrics = null;
-  if (split.validationEnabled) {
+  if (useSingleSplit) {
     overfitMetrics = computeOverfitMetrics(results);
   }
 
@@ -465,9 +738,10 @@ async function runOptimization(options) {
     duration: parseFloat(duration),
     completedAt: new Date().toISOString(),
 
-    // NEW: Walk-forward validation metadata
-    validation: split.validationEnabled ? {
+    // Walk-forward validation metadata
+    validation: useSingleSplit ? {
       enabled: true,
+      mode: 'single_split',
       trainDays: split.trainDays,
       testDays: split.testDays,
       trainRatio: split.trainRatio,
@@ -481,7 +755,7 @@ async function runOptimization(options) {
       ...(overfitMetrics || {})
     } : {
       enabled: false,
-      reason: split.reason
+      reason: split ? split.reason : 'No validation needed'
     }
   };
 
@@ -490,11 +764,272 @@ async function runOptimization(options) {
     bestValue: bestResult?.value,
     bestIsSharpe: bestResult?.sharpe,
     bestOosSharpe: bestResult?.outOfSample?.sharpe ?? 'N/A',
-    validationEnabled: split.validationEnabled,
+    validationEnabled: useSingleSplit,
     overfitWarning: overfitMetrics?.overfitWarning ?? false
   });
 
   if (onProgress) onProgress({ phase: 'completed', message: 'Optimización completada' });
+
+  return optimizationResult;
+}
+
+// ─── Rolling Walk-Forward Optimization ──────────────────────────────────────
+
+/**
+ * Internal: Run optimization with rolling walk-forward windows.
+ * For each window, grid-search all param values on train, validate on test.
+ * Aggregate across windows to find the most robust param value.
+ *
+ * @private
+ */
+async function _runRollingOptimization({
+  asset, days, paramName, paramRange, testValues, baseStrategyConfig,
+  capital, preloadedCandles, rollingConfig, jobId, onProgress, startTime
+}) {
+  const { windows, numFolds, trainDays, testDaysPerFold } = rollingConfig;
+
+  logger.info('Rolling walk-forward optimization started', {
+    paramName, numFolds, trainDays, testDaysPerFold,
+    windows: windows.map(w => w.testLabel)
+  });
+
+  // Total steps: (IS grid + OOS grid) × numFolds
+  const totalSteps = testValues.length * 2 * numFolds;
+  let stepsDone = 0;
+  const allWindowResults = [];
+  const defaultValue = DEFAULT_STRATEGY_CONFIG[paramName];
+
+  // Process each rolling window
+  for (const window of windows) {
+    const foldLabel = `Fold ${window.fold}/${numFolds}`;
+    const { train: trainCandles, test: testCandles } = splitCandlesForWindow(preloadedCandles, window);
+
+    logger.info(`Rolling WF: ${foldLabel}`, {
+      train: window.trainLabel,
+      test: window.testLabel,
+      trainCandles1h: trainCandles['1h'].length,
+      testCandles1h: testCandles['1h'].length
+    });
+
+    const foldResults = [];
+
+    // ─── IS grid search for this window ───────────────────────────────
+    for (let i = 0; i < testValues.length; i++) {
+      const value = testValues[i];
+      const testConfig = { ...baseStrategyConfig, [paramName]: value };
+
+      const progress = {
+        phase: 'testing',
+        message: `${foldLabel} IS: ${paramRange.label}=${value} (${i + 1}/${testValues.length})`,
+        current: ++stepsDone,
+        total: totalSteps,
+        paramName,
+        currentValue: value,
+        fold: window.fold,
+        numFolds
+      };
+
+      if (jobId && activeJobs.has(jobId)) Object.assign(activeJobs.get(jobId), progress);
+      if (onProgress) onProgress(progress);
+
+      let isMetrics;
+      try {
+        const backtestResult = await runBacktest({
+          asset,
+          days: window.trainDays,
+          capital,
+          strategyConfig: testConfig,
+          preloadedCandles: trainCandles,
+          stepInterval: '4h',
+          riskPerTrade: testConfig.riskPerTrade || 0.02,
+          maxOpenPositions: testConfig.maxOpenPositions || 3,
+          cooldownBars: 6,
+          fearGreed: 50
+        });
+        isMetrics = extractMetrics(backtestResult);
+      } catch (err) {
+        logger.warn(`Rolling WF ${foldLabel} IS failed`, { value, error: err.message });
+        isMetrics = errorMetrics(err.message);
+      }
+
+      foldResults.push({ value, isMetrics, oosMetrics: null });
+    }
+
+    // ─── OOS validation for this window ───────────────────────────────
+    for (let i = 0; i < testValues.length; i++) {
+      const value = testValues[i];
+      const testConfig = { ...baseStrategyConfig, [paramName]: value };
+
+      const progress = {
+        phase: 'validating',
+        message: `${foldLabel} OOS: ${paramRange.label}=${value} (${i + 1}/${testValues.length})`,
+        current: ++stepsDone,
+        total: totalSteps,
+        paramName,
+        currentValue: value,
+        fold: window.fold,
+        numFolds
+      };
+
+      if (jobId && activeJobs.has(jobId)) Object.assign(activeJobs.get(jobId), progress);
+      if (onProgress) onProgress(progress);
+
+      try {
+        const oosResult = await runBacktest({
+          asset,
+          days: window.testDays,
+          capital,
+          strategyConfig: testConfig,
+          preloadedCandles: testCandles,
+          stepInterval: '4h',
+          riskPerTrade: testConfig.riskPerTrade || 0.02,
+          maxOpenPositions: testConfig.maxOpenPositions || 3,
+          cooldownBars: 6,
+          fearGreed: 50
+        });
+        foldResults[i].oosMetrics = extractMetrics(oosResult);
+      } catch (err) {
+        logger.warn(`Rolling WF ${foldLabel} OOS failed`, { value, error: err.message });
+        foldResults[i].oosMetrics = errorMetrics(err.message);
+      }
+    }
+
+    // Find best value for this fold (by OOS Sharpe)
+    const validFoldResults = foldResults.filter(
+      r => r.oosMetrics && !r.oosMetrics.error && r.oosMetrics.totalTrades >= 5
+    );
+    const bestInFold = validFoldResults.length > 0
+      ? validFoldResults.reduce((best, r) => r.oosMetrics.sharpe > best.oosMetrics.sharpe ? r : best)
+      : null;
+
+    allWindowResults.push({
+      fold: window.fold,
+      trainLabel: window.trainLabel,
+      testLabel: window.testLabel,
+      bestValue: bestInFold?.value ?? null,
+      bestSharpe: bestInFold?.oosMetrics?.sharpe ?? null,
+      paramResults: foldResults
+    });
+
+    logger.info(`Rolling WF ${foldLabel} completed`, {
+      bestValue: bestInFold?.value ?? 'none',
+      bestOosSharpe: bestInFold?.oosMetrics?.sharpe ?? 'N/A'
+    });
+  }
+
+  // ─── Aggregate across all windows ───────────────────────────────────
+  const aggregated = aggregateRollingResults(allWindowResults);
+  const stability = computeParameterStability(allWindowResults);
+
+  // Build per-value IS/OOS from first fold for backward compat
+  const firstFold = allWindowResults[0];
+  const results = testValues.map((value, i) => {
+    const fr = firstFold.paramResults[i];
+    const agg = aggregated.find(a => a.value === value);
+    const isM = fr.isMetrics || errorMetrics('no data');
+    return {
+      value,
+      // Backward compat flat fields (IS from first fold)
+      sharpe: isM.sharpe,
+      sortino: isM.sortino,
+      calmar: isM.calmar,
+      expectancy: isM.expectancy,
+      profitFactor: isM.profitFactor,
+      winRate: isM.winRate,
+      totalTrades: isM.totalTrades,
+      totalPnl: isM.totalPnl,
+      totalPnlPercent: isM.totalPnlPercent,
+      maxDrawdownPercent: isM.maxDrawdownPercent,
+      avgHoldingBars: isM.avgHoldingBars,
+      maxConsecutiveLosses: isM.maxConsecutiveLosses,
+      statisticallySignificant: isM.statisticallySignificant,
+      ...(isM.error ? { error: isM.error } : {}),
+      inSample: isM,
+      outOfSample: fr.oosMetrics,
+      // Rolling-specific
+      rolling: agg || null
+    };
+  });
+
+  // Best = highest composite score across all rolling windows
+  const bestAgg = aggregated.find(a => !a.insufficient);
+  const bestValue = bestAgg?.value ?? results[0]?.value;
+  const bestResult = results.find(r => r.value === bestValue);
+  const defaultResult = results.find(r => r.value === defaultValue);
+
+  // Overfit metrics from first fold's IS/OOS pairs
+  const overfitMetrics = computeOverfitMetrics(
+    firstFold.paramResults.map(pr => ({
+      value: pr.value,
+      inSample: pr.isMetrics,
+      outOfSample: pr.oosMetrics
+    }))
+  );
+
+  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+
+  const optimizationResult = {
+    asset,
+    days,
+    paramName,
+    paramLabel: paramRange.label,
+    paramDescription: paramRange.description,
+    defaultValue,
+    bestValue,
+    bestSharpe: bestResult?.sharpe ?? null,
+    defaultSharpe: defaultResult?.sharpe ?? null,
+    improvement: (defaultResult && bestResult)
+      ? Math.round((bestResult.sharpe - defaultResult.sharpe) * 100) / 100
+      : null,
+    results,
+    baseConfig: baseStrategyConfig,
+    duration: parseFloat(duration),
+    completedAt: new Date().toISOString(),
+
+    // Rolling walk-forward validation metadata
+    validation: {
+      enabled: true,
+      mode: 'rolling',
+      numFolds,
+      trainDays,
+      testDaysPerFold,
+      rankedBy: 'Composite Score (avg OOS Sharpe − 0.5 × σ)',
+      bestCompositeScore: bestAgg?.compositeScore ?? null,
+      bestAvgOosSharpe: bestAgg?.avgOosSharpe ?? null,
+      defaultCompositeScore: aggregated.find(a => a.value === defaultValue)?.compositeScore ?? null,
+
+      // Parameter stability across windows
+      parameterStability: stability,
+
+      // Per-window summaries
+      windowSummaries: allWindowResults.map(wr => ({
+        fold: wr.fold,
+        trainLabel: wr.trainLabel,
+        testLabel: wr.testLabel,
+        bestValue: wr.bestValue,
+        bestOosSharpe: wr.bestSharpe
+      })),
+
+      // Aggregated rankings (all param values ranked by composite)
+      aggregatedRanking: aggregated.slice(0, 10), // Top 10
+
+      // Overfitting diagnostics (from first fold)
+      ...overfitMetrics
+    }
+  };
+
+  logger.info('Rolling walk-forward optimization completed', {
+    paramName,
+    duration: duration + 's',
+    numFolds,
+    bestValue,
+    bestComposite: bestAgg?.compositeScore ?? 'N/A',
+    stabilityScore: stability.stabilityScore,
+    consistent: stability.consistent,
+    overfitWarning: overfitMetrics.overfitWarning
+  });
+
+  if (onProgress) onProgress({ phase: 'completed', message: 'Optimización rolling completada' });
 
   return optimizationResult;
 }
@@ -598,5 +1133,10 @@ module.exports = {
   splitCandlesByTimestamp,
   computeValidationSplit,
   computeOverfitMetrics,
+  // Rolling walk-forward (exported for testing)
+  computeRollingWindows,
+  splitCandlesForWindow,
+  computeParameterStability,
+  aggregateRollingResults,
   PARAM_RANGES
 };

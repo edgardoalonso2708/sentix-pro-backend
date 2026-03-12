@@ -7,6 +7,10 @@ const {
   splitCandlesByTimestamp,
   computeValidationSplit,
   computeOverfitMetrics,
+  computeRollingWindows,
+  splitCandlesForWindow,
+  computeParameterStability,
+  aggregateRollingResults,
   PARAM_RANGES
 } = require('../optimizer');
 const { DEFAULT_STRATEGY_CONFIG } = require('../strategyConfig');
@@ -435,5 +439,318 @@ describe('computeOverfitMetrics', () => {
     const metrics = computeOverfitMetrics(results);
     expect(metrics.rankCorrelation).toBeLessThan(0);
     expect(metrics.overfitWarning).toBe(true); // low rank correlation
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Rolling Walk-Forward: computeRollingWindows Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('computeRollingWindows', () => {
+  test('returns rolling=false for days < 60', () => {
+    const result = computeRollingWindows(50);
+    expect(result.rolling).toBe(false);
+    expect(result.reason).toBeDefined();
+  });
+
+  test('returns rolling=true for days >= 60 with multiple windows', () => {
+    const result = computeRollingWindows(90);
+    expect(result.rolling).toBe(true);
+    expect(result.windows.length).toBeGreaterThanOrEqual(2);
+    expect(result.numFolds).toBeGreaterThanOrEqual(2);
+    expect(result.trainDays).toBeGreaterThanOrEqual(30);
+    expect(result.testDaysPerFold).toBeGreaterThanOrEqual(7);
+  });
+
+  test('windows have non-overlapping test periods', () => {
+    const result = computeRollingWindows(120);
+    expect(result.rolling).toBe(true);
+
+    for (let i = 1; i < result.windows.length; i++) {
+      const prev = result.windows[i - 1];
+      const curr = result.windows[i];
+      // Test periods should not overlap: prev test end <= curr test start (= curr trainEnd)
+      expect(prev.testEndTs).toBeLessThanOrEqual(curr.trainEndTs);
+    }
+  });
+
+  test('all windows cover valid time ranges', () => {
+    const result = computeRollingWindows(90);
+    expect(result.rolling).toBe(true);
+
+    for (const w of result.windows) {
+      expect(w.trainStartTs).toBeLessThan(w.trainEndTs);
+      expect(w.trainEndTs).toBeLessThan(w.testEndTs);
+      expect(w.trainDays).toBeGreaterThanOrEqual(30);
+      expect(w.testDays).toBeGreaterThanOrEqual(7);
+      expect(w.fold).toBeGreaterThanOrEqual(1);
+      expect(w.trainLabel).toBeDefined();
+      expect(w.testLabel).toBeDefined();
+    }
+  });
+
+  test('total days covered = trainDays + numFolds × testDaysPerFold', () => {
+    const result = computeRollingWindows(90);
+    expect(result.rolling).toBe(true);
+    const totalCovered = result.trainDays + result.numFolds * result.testDaysPerFold;
+    expect(totalCovered).toBe(90);
+  });
+
+  test('reduces folds when not enough days for requested folds', () => {
+    // With 60 days and 3 folds, train might be too short → should reduce
+    const result = computeRollingWindows(60, { numFolds: 5 });
+    if (result.rolling) {
+      expect(result.numFolds).toBeLessThan(5);
+      expect(result.trainDays).toBeGreaterThanOrEqual(30);
+    }
+  });
+
+  test('handles large day counts with 3 folds', () => {
+    const result = computeRollingWindows(365);
+    expect(result.rolling).toBe(true);
+    expect(result.numFolds).toBe(3);
+    expect(result.trainDays).toBeGreaterThan(200);
+    expect(result.testDaysPerFold).toBeLessThanOrEqual(30);
+  });
+
+  test('windows slide forward by stepDays', () => {
+    const result = computeRollingWindows(120);
+    expect(result.rolling).toBe(true);
+
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const stepMs = result.stepDays * DAY_MS;
+
+    for (let i = 1; i < result.windows.length; i++) {
+      const prevStart = result.windows[i - 1].trainStartTs;
+      const currStart = result.windows[i].trainStartTs;
+      expect(currStart - prevStart).toBeCloseTo(stepMs, -3); // within 1s tolerance
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Rolling Walk-Forward: splitCandlesForWindow Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('splitCandlesForWindow', () => {
+  const HOUR_MS = 3600000;
+  const DAY_MS = 86400000;
+  const BASE_TS = 1700000000000;
+
+  const makeCandles = (count, intervalMs, startTs = BASE_TS) =>
+    Array.from({ length: count }, (_, i) => ({
+      timestamp: startTs + i * intervalMs,
+      open: 100, high: 101, low: 99, close: 100, volume: 1000
+    }));
+
+  test('splits candles correctly for a window', () => {
+    const candles = {
+      '1h': makeCandles(200, HOUR_MS),
+      '4h': makeCandles(50, HOUR_MS * 4),
+      '15m': makeCandles(800, HOUR_MS / 4)
+    };
+
+    const window = {
+      trainStartTs: BASE_TS + 10 * HOUR_MS,
+      trainEndTs: BASE_TS + 100 * HOUR_MS,
+      testEndTs: BASE_TS + 130 * HOUR_MS
+    };
+
+    const { train, test, splitInfo } = splitCandlesForWindow(candles, window);
+
+    // Train candles should be within [trainStart, trainEnd]
+    expect(train['1h'].length).toBeGreaterThan(0);
+    expect(train['1h'].every(c => c.timestamp >= window.trainStartTs && c.timestamp <= window.trainEndTs)).toBe(true);
+
+    // Test candles should include warm-up (before trainEnd) + test period
+    expect(test['1h'].length).toBeGreaterThan(train['1h'].length);
+    expect(test['1h'].every(c => c.timestamp <= window.testEndTs)).toBe(true);
+
+    // Split info should have counts
+    expect(splitInfo['1h'].trainCount).toBe(train['1h'].length);
+    expect(splitInfo['1h'].testCount).toBe(test['1h'].length);
+  });
+
+  test('handles empty candle arrays', () => {
+    const candles = { '1h': [], '4h': [], '15m': [] };
+    const window = { trainStartTs: BASE_TS, trainEndTs: BASE_TS + DAY_MS, testEndTs: BASE_TS + 2 * DAY_MS };
+
+    const { train, test } = splitCandlesForWindow(candles, window);
+    expect(train['1h'].length).toBe(0);
+    expect(test['1h'].length).toBe(0);
+  });
+
+  test('train and test sets are different arrays', () => {
+    const candles = { '1h': makeCandles(100, HOUR_MS), '4h': [], '15m': [] };
+    const window = {
+      trainStartTs: BASE_TS,
+      trainEndTs: BASE_TS + 50 * HOUR_MS,
+      testEndTs: BASE_TS + 70 * HOUR_MS
+    };
+
+    const { train, test } = splitCandlesForWindow(candles, window);
+    expect(train['1h']).not.toBe(test['1h']);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Rolling Walk-Forward: computeParameterStability Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('computeParameterStability', () => {
+  test('perfectly stable parameter (same best in all windows)', () => {
+    const windowResults = [
+      { fold: 1, bestValue: 30 },
+      { fold: 2, bestValue: 30 },
+      { fold: 3, bestValue: 30 }
+    ];
+    const result = computeParameterStability(windowResults);
+    expect(result.stdDev).toBe(0);
+    expect(result.cv).toBe(0);
+    expect(result.stabilityScore).toBe(1.0);
+    expect(result.consistent).toBe(true);
+    expect(result.mean).toBe(30);
+  });
+
+  test('moderately stable parameter', () => {
+    const windowResults = [
+      { fold: 1, bestValue: 28 },
+      { fold: 2, bestValue: 30 },
+      { fold: 3, bestValue: 32 }
+    ];
+    const result = computeParameterStability(windowResults);
+    expect(result.mean).toBe(30);
+    expect(result.stdDev).toBeGreaterThan(0);
+    expect(result.cv).toBeGreaterThan(0);
+    expect(result.cv).toBeLessThan(0.25); // moderately stable
+    expect(result.consistent).toBe(true);
+  });
+
+  test('unstable parameter (wildly different across windows)', () => {
+    const windowResults = [
+      { fold: 1, bestValue: 10 },
+      { fold: 2, bestValue: 40 },
+      { fold: 3, bestValue: 5 }
+    ];
+    const result = computeParameterStability(windowResults);
+    expect(result.cv).toBeGreaterThan(0.25);
+    expect(result.consistent).toBe(false);
+    expect(result.stabilityScore).toBeLessThan(0.8);
+  });
+
+  test('handles single window gracefully', () => {
+    const windowResults = [{ fold: 1, bestValue: 25 }];
+    const result = computeParameterStability(windowResults);
+    expect(result.mean).toBe(25);
+    expect(result.stdDev).toBe(0);
+    expect(result.stabilityScore).toBe(1.0);
+  });
+
+  test('handles null bestValue windows', () => {
+    const windowResults = [
+      { fold: 1, bestValue: 30 },
+      { fold: 2, bestValue: null },
+      { fold: 3, bestValue: 32 }
+    ];
+    const result = computeParameterStability(windowResults);
+    expect(result.bestValues).toHaveLength(2); // null filtered out
+    expect(result.mean).toBeCloseTo(31);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Rolling Walk-Forward: aggregateRollingResults Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('aggregateRollingResults', () => {
+  test('ranks by composite score (avg Sharpe penalized by variance)', () => {
+    const allWindowResults = [
+      {
+        fold: 1,
+        paramResults: [
+          { value: 1, oosMetrics: { sharpe: 2.0, totalTrades: 20, totalPnlPercent: 10, winRate: 60 } },
+          { value: 2, oosMetrics: { sharpe: 1.5, totalTrades: 20, totalPnlPercent: 8, winRate: 55 } }
+        ]
+      },
+      {
+        fold: 2,
+        paramResults: [
+          { value: 1, oosMetrics: { sharpe: 0.5, totalTrades: 15, totalPnlPercent: 2, winRate: 50 } },
+          { value: 2, oosMetrics: { sharpe: 1.3, totalTrades: 15, totalPnlPercent: 7, winRate: 53 } }
+        ]
+      }
+    ];
+
+    const result = aggregateRollingResults(allWindowResults);
+    expect(result.length).toBe(2);
+
+    // Value 2 is more consistent (1.5, 1.3) vs value 1 (2.0, 0.5)
+    // Value 2 should rank higher due to lower variance penalty
+    const val2 = result.find(r => r.value === 2);
+    const val1 = result.find(r => r.value === 1);
+    expect(val2.compositeScore).toBeGreaterThan(val1.compositeScore);
+  });
+
+  test('marks insufficient when trades below minimum', () => {
+    const allWindowResults = [
+      {
+        fold: 1,
+        paramResults: [
+          { value: 1, oosMetrics: { sharpe: 2.0, totalTrades: 3, totalPnlPercent: 10, winRate: 60 } }
+        ]
+      }
+    ];
+
+    const result = aggregateRollingResults(allWindowResults);
+    expect(result[0].insufficient).toBe(true);
+    expect(result[0].avgOosSharpe).toBe(-999);
+  });
+
+  test('handles errored OOS metrics', () => {
+    const allWindowResults = [
+      {
+        fold: 1,
+        paramResults: [
+          { value: 1, oosMetrics: { sharpe: 1.5, totalTrades: 20, totalPnlPercent: 5, winRate: 55 } },
+          { value: 2, oosMetrics: { error: 'failed', sharpe: -999 } }
+        ]
+      },
+      {
+        fold: 2,
+        paramResults: [
+          { value: 1, oosMetrics: { sharpe: 1.2, totalTrades: 15, totalPnlPercent: 4, winRate: 52 } },
+          { value: 2, oosMetrics: { sharpe: 1.0, totalTrades: 15, totalPnlPercent: 3, winRate: 50 } }
+        ]
+      }
+    ];
+
+    const result = aggregateRollingResults(allWindowResults);
+    const val1 = result.find(r => r.value === 1);
+    const val2 = result.find(r => r.value === 2);
+
+    // Value 1 has 2 valid folds, value 2 has only 1
+    expect(val1.validFolds).toBe(2);
+    expect(val2.validFolds).toBe(1);
+  });
+
+  test('calculates sharpeStd correctly', () => {
+    const allWindowResults = [
+      {
+        fold: 1,
+        paramResults: [
+          { value: 1, oosMetrics: { sharpe: 2.0, totalTrades: 20, totalPnlPercent: 10, winRate: 60 } }
+        ]
+      },
+      {
+        fold: 2,
+        paramResults: [
+          { value: 1, oosMetrics: { sharpe: 2.0, totalTrades: 20, totalPnlPercent: 10, winRate: 60 } }
+        ]
+      }
+    ];
+
+    const result = aggregateRollingResults(allWindowResults);
+    // Identical Sharpe across folds → stdDev = 0
+    expect(result[0].sharpeStd).toBe(0);
   });
 });
