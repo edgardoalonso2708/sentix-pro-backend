@@ -80,6 +80,8 @@ const {
   getRiskDashboard
 } = require('./riskEngine');
 const { requireAuth, optionalAuth } = require('./authMiddleware');
+const { requireRole, getProfile, invalidateProfileCache } = require('./roleMiddleware');
+const { logAudit, auditContext } = require('./auditLogger');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -1395,6 +1397,13 @@ app.post('/api/paper/config/:userId', async (req, res) => {
     }
     const { config, error } = await updateConfig(supabase, userId, req.body);
     if (error) return res.status(400).json({ error: error.message || error });
+
+    await logAudit(supabase, {
+      userId: req.userId, action: 'config_change',
+      resource: 'paper_config', details: { changes: req.body },
+      ...auditContext(req)
+    });
+
     res.json({ config });
   } catch (error) {
     logger.error('Paper config update failed', { error: error.message });
@@ -1550,6 +1559,12 @@ app.post('/api/paper/close/:tradeId', async (req, res) => {
     // Notify
     await broadcastPaperTradeNotification(closedTrade, 'close');
     broadcastSSE('paper_trade', { action: 'closed', trades: [closedTrade] });
+
+    await logAudit(supabase, {
+      userId: req.userId, action: 'trade_closed',
+      resource: 'paper_trades', details: { tradeId: closedTrade.id, asset: closedTrade.asset, pnl },
+      ...auditContext(req)
+    });
 
     res.json({ trade: closedTrade, pnl });
   } catch (error) {
@@ -1788,6 +1803,13 @@ app.post('/api/risk/:userId/kill-switch', async (req, res) => {
 
     // Broadcast via SSE
     broadcastSSE('kill_switch', { active: true, reason, ...result });
+
+    // Audit log
+    await logAudit(supabase, {
+      userId: req.userId, action: 'kill_switch',
+      resource: 'risk', details: { active: true, reason, ...result },
+      ...auditContext(req)
+    });
 
     res.json({ success: true, ...result });
   } catch (err) {
@@ -2656,6 +2678,332 @@ async function removeTelegramSubscriber(chatId) {
     logger.debug('Could not remove Telegram subscriber', { error: error.message });
   }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// AUTH & ADMIN ROUTES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── Get current user profile ─────────────────────────────────────────────────
+app.get('/api/auth/me', requireAuth, async (req, res) => {
+  try {
+    const profile = await getProfile(req.userId);
+    if (!profile) {
+      // Auto-admin: first user
+      const { count } = await supabase
+        .from('user_profiles')
+        .select('id', { count: 'exact', head: true });
+
+      if (count === 0) {
+        const email = req.user?.email || 'admin@sentixpro.com';
+        const { data: newProfile, error: insertErr } = await supabase
+          .from('user_profiles')
+          .insert({
+            id: req.userId,
+            email,
+            role: 'admin',
+            display_name: 'Admin',
+            is_active: true
+          })
+          .select()
+          .single();
+
+        if (!insertErr && newProfile) {
+          await logAudit(supabase, {
+            userId: req.userId, email, action: 'auto_admin',
+            resource: 'user_profiles', details: { reason: 'first_user' },
+            ...auditContext(req)
+          });
+          return res.json({ profile: newProfile });
+        }
+      }
+
+      return res.status(404).json({ error: 'Profile not found' });
+    }
+
+    // Update last_login_at
+    await supabase.from('user_profiles')
+      .update({ last_login_at: new Date().toISOString() })
+      .eq('id', req.userId);
+
+    res.json({ profile });
+  } catch (err) {
+    logger.error('GET /api/auth/me error', { error: err.message });
+    res.status(500).json({ error: 'Failed to get profile' });
+  }
+});
+
+// ─── Validate invitation token (public) ───────────────────────────────────────
+app.post('/api/auth/accept-invite', async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ error: 'Token required' });
+
+    const { data: profile, error } = await supabase
+      .from('user_profiles')
+      .select('email, role, invitation_expires_at, is_active')
+      .eq('invitation_token', token)
+      .single();
+
+    if (error || !profile) {
+      return res.status(404).json({ error: 'Invalid invitation token' });
+    }
+
+    if (profile.is_active) {
+      return res.status(400).json({ error: 'Invitation already claimed' });
+    }
+
+    if (new Date(profile.invitation_expires_at) < new Date()) {
+      return res.status(400).json({ error: 'Invitation expired' });
+    }
+
+    res.json({ email: profile.email, role: profile.role });
+  } catch (err) {
+    logger.error('POST /api/auth/accept-invite error', { error: err.message });
+    res.status(500).json({ error: 'Failed to validate invitation' });
+  }
+});
+
+// ─── Claim invitation after signup ────────────────────────────────────────────
+app.post('/api/auth/claim-invite', requireAuth, async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token) return res.status(400).json({ error: 'Token required' });
+
+    const { data: profile, error } = await supabase
+      .from('user_profiles')
+      .select('*')
+      .eq('invitation_token', token)
+      .single();
+
+    if (error || !profile) {
+      return res.status(404).json({ error: 'Invalid invitation token' });
+    }
+
+    if (profile.is_active) {
+      return res.status(400).json({ error: 'Invitation already claimed' });
+    }
+
+    if (new Date(profile.invitation_expires_at) < new Date()) {
+      return res.status(400).json({ error: 'Invitation expired' });
+    }
+
+    // Link Supabase auth user to the profile
+    const { data: updated, error: updateErr } = await supabase
+      .from('user_profiles')
+      .update({
+        id: req.userId,
+        is_active: true,
+        invitation_token: null,
+        invitation_expires_at: null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('invitation_token', token)
+      .select()
+      .single();
+
+    if (updateErr) {
+      return res.status(500).json({ error: 'Failed to claim invitation' });
+    }
+
+    await logAudit(supabase, {
+      userId: req.userId, email: updated.email, action: 'invite_claimed',
+      resource: 'user_profiles', details: { role: updated.role },
+      ...auditContext(req)
+    });
+
+    invalidateProfileCache(req.userId);
+    res.json({ profile: updated });
+  } catch (err) {
+    logger.error('POST /api/auth/claim-invite error', { error: err.message });
+    res.status(500).json({ error: 'Failed to claim invitation' });
+  }
+});
+
+// ─── Admin: List all users ────────────────────────────────────────────────────
+app.get('/api/admin/users', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('user_profiles')
+      .select('*')
+      .order('created_at', { ascending: true });
+
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ users: data });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to list users' });
+  }
+});
+
+// ─── Admin: Update user (role, active status) ────────────────────────────────
+app.patch('/api/admin/users/:targetUserId', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { targetUserId } = req.params;
+    const { role, is_active, display_name } = req.body;
+
+    // Prevent admin from demoting themselves
+    if (targetUserId === req.userId && role && role !== 'admin') {
+      return res.status(400).json({ error: 'Cannot change your own admin role' });
+    }
+
+    const updates = { updated_at: new Date().toISOString() };
+    if (role && ['admin', 'trader', 'viewer'].includes(role)) updates.role = role;
+    if (typeof is_active === 'boolean') updates.is_active = is_active;
+    if (display_name) updates.display_name = display_name;
+
+    const { data, error } = await supabase
+      .from('user_profiles')
+      .update(updates)
+      .eq('id', targetUserId)
+      .select()
+      .single();
+
+    if (error) return res.status(500).json({ error: error.message });
+
+    await logAudit(supabase, {
+      userId: req.userId, email: req.userProfile?.email, action: 'role_change',
+      resource: 'user_profiles',
+      details: { targetUserId, changes: updates },
+      ...auditContext(req)
+    });
+
+    invalidateProfileCache(targetUserId);
+    res.json({ user: data });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update user' });
+  }
+});
+
+// ─── Admin: Send invitation ──────────────────────────────────────────────────
+app.post('/api/admin/invite', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { email, role = 'trader', display_name } = req.body;
+
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ error: 'Valid email required' });
+    }
+
+    if (!['trader', 'viewer'].includes(role)) {
+      return res.status(400).json({ error: 'Role must be trader or viewer' });
+    }
+
+    // Check if email already exists
+    const { data: existing } = await supabase
+      .from('user_profiles')
+      .select('id, is_active')
+      .eq('email', email)
+      .single();
+
+    if (existing?.is_active) {
+      return res.status(400).json({ error: 'User with this email already exists' });
+    }
+
+    // Generate invitation token
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 72 * 60 * 60 * 1000).toISOString(); // 72 hours
+
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    const inviteLink = `${frontendUrl}/auth?invite=${token}`;
+
+    if (existing && !existing.is_active) {
+      // Re-invite existing inactive user
+      await supabase.from('user_profiles')
+        .update({
+          role,
+          invitation_token: token,
+          invitation_expires_at: expiresAt,
+          invited_by: req.userId,
+          display_name: display_name || null,
+          updated_at: new Date().toISOString()
+        })
+        .eq('email', email);
+    } else {
+      // Create new profile placeholder
+      const { error: insertErr } = await supabase
+        .from('user_profiles')
+        .insert({
+          id: crypto.randomUUID(), // placeholder UUID, will be replaced on claim
+          email,
+          role,
+          display_name: display_name || null,
+          invited_by: req.userId,
+          invitation_token: token,
+          invitation_expires_at: expiresAt,
+          is_active: false
+        });
+
+      if (insertErr) {
+        return res.status(500).json({ error: 'Failed to create invitation: ' + insertErr.message });
+      }
+    }
+
+    // Send invitation email via Resend
+    let emailSent = false;
+    if (RESEND_API_KEY && RESEND_API_KEY !== 're_123456789') {
+      try {
+        const resend = new Resend(RESEND_API_KEY);
+        await resend.emails.send({
+          from: 'Sentix Pro <noreply@sentixpro.com>',
+          to: email,
+          subject: 'Invitación a Sentix Pro',
+          html: `
+            <div style="font-family: system-ui; max-width: 500px; margin: 0 auto; background: #0a0a0a; color: #fff; padding: 32px; border-radius: 12px;">
+              <h2 style="color: #6366f1;">Sentix Pro</h2>
+              <p>Has sido invitado a unirte a Sentix Pro como <strong>${role}</strong>.</p>
+              <a href="${inviteLink}" style="display: inline-block; background: #6366f1; color: #fff; padding: 12px 24px; border-radius: 8px; text-decoration: none; margin: 16px 0;">
+                Aceptar Invitación
+              </a>
+              <p style="color: #888; font-size: 12px;">Este enlace expira en 72 horas.</p>
+            </div>
+          `
+        });
+        emailSent = true;
+      } catch (emailErr) {
+        logger.warn('Failed to send invitation email', { error: emailErr.message });
+      }
+    }
+
+    await logAudit(supabase, {
+      userId: req.userId, email: req.userProfile?.email, action: 'invite_sent',
+      resource: 'user_profiles',
+      details: { invitedEmail: email, role, emailSent },
+      ...auditContext(req)
+    });
+
+    res.json({ success: true, inviteLink, emailSent });
+  } catch (err) {
+    logger.error('POST /api/admin/invite error', { error: err.message });
+    res.status(500).json({ error: 'Failed to send invitation' });
+  }
+});
+
+// ─── Admin: Query audit log ──────────────────────────────────────────────────
+app.get('/api/admin/audit', requireAuth, requireRole('admin'), async (req, res) => {
+  try {
+    const { action, user_id, days = 7, limit = 100, offset = 0 } = req.query;
+
+    let query = supabase
+      .from('audit_log')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .range(Number(offset), Number(offset) + Number(limit) - 1);
+
+    if (action) query = query.eq('action', action);
+    if (user_id) query = query.eq('user_id', user_id);
+
+    const sinceDate = new Date(Date.now() - Number(days) * 24 * 60 * 60 * 1000).toISOString();
+    query = query.gte('created_at', sinceDate);
+
+    const { data, error } = await query;
+    if (error) return res.status(500).json({ error: error.message });
+
+    res.json({ logs: data, total: data.length });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to query audit log' });
+  }
+});
+
+// ─── Admin middleware for admin routes ─────────────────────────────────────────
+app.use('/api/admin', requireAuth, requireRole('admin'));
 
 module.exports = app;
 
