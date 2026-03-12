@@ -2363,6 +2363,57 @@ async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volu
     confluenceReasons.push('Weak confluence - no clear direction');
   }
 
+  // ─── DIVERGENCE / CONVERGENCE / MOMENTUM ACCELERATION ──────────────────
+
+  // Divergence: 4h disagrees with BOTH lower TFs → structural divergence
+  const lowerTFsAgree = trends['1h'] === trends['15m'] && trends['1h'] !== 'neutral';
+  const structuralDivergence = lowerTFsAgree && trends['4h'] !== 'neutral' && trends['4h'] !== trends['1h'];
+
+  if (structuralDivergence) {
+    // 4h is structural → reduce score but flag as potential breakout setup
+    mergedRawScore *= 0.75; // Reduce conviction
+    confidenceBonus -= 8;
+    confluenceReasons.push(`⚠️ Structural divergence: 4H ${trends['4h']} vs 1H+15M ${trends['1h']} — potential breakout`);
+  }
+
+  // Convergence: previously disagreeing TFs now converging (check momentum direction)
+  const allSameDirection = trends['4h'] === trends['1h'] && trends['1h'] === trends['15m'] && trends['4h'] !== 'neutral';
+  const scores = [signal4h.rawScore, signal1h.rawScore, signal15m.rawScore];
+  const allPositive = scores.every(s => s > 0);
+  const allNegative = scores.every(s => s < 0);
+
+  if (allSameDirection) {
+    // Momentum acceleration: 15m > 1h > 4h in same direction = accelerating
+    const absScores = scores.map(Math.abs);
+    const accelerating = absScores[2] >= absScores[1] && absScores[1] >= absScores[0]; // 15m >= 1h >= 4h
+
+    if (accelerating) {
+      const accelBonus = 1.08; // 8% boost for accelerating momentum
+      mergedRawScore *= accelBonus;
+      confidenceBonus += 6;
+      confluenceReasons.push(`🚀 Momentum acceleration: all TFs aligned and strengthening (${trends['4h']})`);
+    } else {
+      // Converged but decelerating (4h strongest) → mature trend, be cautious
+      const decelPenalty = absScores[0] > absScores[2] * 1.5 ? -3 : 0;
+      confidenceBonus += decelPenalty;
+      if (decelPenalty < 0) {
+        confluenceReasons.push(`📉 Decelerating momentum: 4H strongest, lower TFs weakening — mature trend`);
+      }
+    }
+  }
+
+  // Anti-convergence: TFs that were split are now aligning (higher probability setup)
+  // Detected when 2 TFs agree and the 3rd is neutral (moving toward agreement)
+  const twoAgreeOneNeutral = (
+    (trends['4h'] === trends['1h'] && trends['4h'] !== 'neutral' && trends['15m'] === 'neutral') ||
+    (trends['4h'] === trends['15m'] && trends['4h'] !== 'neutral' && trends['1h'] === 'neutral') ||
+    (trends['1h'] === trends['15m'] && trends['1h'] !== 'neutral' && trends['4h'] === 'neutral')
+  );
+  if (twoAgreeOneNeutral && !structuralDivergence) {
+    confidenceBonus += 4;
+    confluenceReasons.push('Emerging convergence: 2 TFs agree, 3rd approaching');
+  }
+
   // 4h governor — graduated, regime-aware
   const governorResult = applyGovernor(mergedRawScore, signal4h.rawScore, trends['4h'], dynamicWeights, cfg);
   mergedRawScore = governorResult.adjustedScore;
@@ -2472,7 +2523,13 @@ async function generateMultiTimeframeSignal(asset, currentPrice, change24h, volu
       },
       confluence,
       dynamicWeights,
-      governorInfo: governorResult.governorInfo
+      governorInfo: governorResult.governorInfo,
+      // Advanced multi-TF analysis
+      structuralDivergence,
+      momentumAccelerating: allSameDirection && scores.map(Math.abs).every((v, i, a) => i === 0 || v >= a[i - 1] * 0.95),
+      emergingConvergence: twoAgreeOneNeutral && !structuralDivergence,
+      allAligned: allSameDirection,
+      dominantDirection: allPositive ? 'bullish' : allNegative ? 'bearish' : (bullishCount > bearishCount ? 'leaning_bullish' : bearishCount > bullishCount ? 'leaning_bearish' : 'mixed')
     }
   };
 }
