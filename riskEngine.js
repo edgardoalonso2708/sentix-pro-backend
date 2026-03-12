@@ -223,8 +223,15 @@ async function activateKillSwitch(supabase, userId, reason, options = {}) {
 
       for (const trade of (openTrades || [])) {
         try {
-          // Use last known price (not perfect but safe)
-          const closePrice = parseFloat(trade.entry_price); // Fallback
+          // Resolve current market price; fall back to entry_price only if unavailable
+          let closePrice;
+          try {
+            closePrice = resolveCurrentPrice(trade.asset);
+          } catch (_) { /* ignore */ }
+          if (!closePrice || closePrice <= 0) {
+            closePrice = parseFloat(trade.entry_price);
+            logger.warn('Kill switch: using entry_price as fallback', { tradeId: trade.id, asset: trade.asset });
+          }
           await executeFullClose(supabase, trade, closePrice, 'kill_switch');
           closedPositions++;
         } catch (closeErr) {

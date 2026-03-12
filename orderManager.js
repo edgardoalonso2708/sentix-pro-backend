@@ -375,7 +375,17 @@ async function submitOrder(supabase, userId, order, executionAdapter, marketData
     await logExecution(supabase, order.id, EVENT_TYPE.ORDER_SUBMITTED, {});
 
     // Execute via adapter
-    const fillResult = await executionAdapter.placeOrder(order, marketData, config);
+    let fillResult;
+    try {
+      fillResult = await executionAdapter.placeOrder(order, marketData, config);
+    } catch (adapterErr) {
+      // Rollback: SUBMITTED → VALIDATED so order can be retried
+      logger.error('Adapter execution failed, rolling back to VALIDATED', { orderId: order.id, error: adapterErr.message });
+      await supabase.from('orders')
+        .update({ status: ORDER_STATUS.VALIDATED, submitted_at: null })
+        .eq('id', order.id);
+      return { filledOrder: null, trade: null, error: { message: `Execution failed: ${adapterErr.message}` } };
+    }
 
     if (!fillResult.filled) {
       // Order not immediately filled (e.g., LIMIT order not at price)
@@ -614,13 +624,18 @@ async function expireOrders(supabase) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 async function rejectOrder(supabase, orderId, reason) {
-  await supabase
+  const { error } = await supabase
     .from('orders')
     .update({
       status: ORDER_STATUS.REJECTED,
       reject_reason: reason
     })
     .eq('id', orderId);
+
+  if (error) {
+    logger.error('rejectOrder DB error', { orderId, reason, error: error.message });
+    throw new Error(`Failed to reject order ${orderId}: ${error.message}`);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
