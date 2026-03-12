@@ -79,6 +79,7 @@ const {
   activateKillSwitch, deactivateKillSwitch, getKillSwitchStatus,
   getRiskDashboard
 } = require('./riskEngine');
+const { requireAuth, optionalAuth } = require('./authMiddleware');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -139,6 +140,23 @@ app.use((req, res, next) => {
   });
   next();
 });
+
+// ─── AUTHENTICATION ───────────────────────────────────────────────────────
+// Apply auth to protected route groups (user-specific data)
+// Public routes: /api/health, /api/market, /api/signals, /api/stream, /api/config
+app.use('/api/paper', requireAuth);
+app.use('/api/wallets', requireAuth);
+app.use('/api/portfolio', requireAuth);
+app.use('/api/orders', requireAuth);
+app.use('/api/risk', requireAuth);
+app.use('/api/execution-log', requireAuth);
+app.use('/api/alert-filters', requireAuth);
+app.use('/api/backtest', requireAuth);
+app.use('/api/optimize', requireAuth);
+app.use('/api/autotune', requireAuth);
+
+// SSE stream uses optional auth (token via query param)
+app.use('/api/stream', optionalAuth);
 
 // ─── CONFIGURATION ─────────────────────────────────────────────────────────
 const SUPABASE_URL = process.env.SUPABASE_URL;
