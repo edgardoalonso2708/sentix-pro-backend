@@ -49,6 +49,25 @@ let cachedMarketData = null;   // Received via IPC from market worker
 let cachedSignals = [];
 let isProcessingAlerts = false;
 
+// ─── PRICE FRESHNESS TRACKING ────────────────────────────────────────────
+let lastMarketDataReceived = 0;  // timestamp (ms)
+let stalePriceAlertSent = false;
+const STALE_WARN_MS   = 5 * 60 * 1000;   // 5 min → warn
+const STALE_PAUSE_MS  = 30 * 60 * 1000;  // 30 min → pause signals
+
+function checkPriceFreshness() {
+  if (!lastMarketDataReceived) return { fresh: false, staleMs: Infinity, level: 'no_data' };
+  const staleMs = Date.now() - lastMarketDataReceived;
+
+  if (staleMs > STALE_PAUSE_MS) {
+    return { fresh: false, staleMs, level: 'critical' };
+  }
+  if (staleMs > STALE_WARN_MS) {
+    return { fresh: true, staleMs, level: 'warning' };
+  }
+  return { fresh: true, staleMs, level: 'ok' };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // SIGNAL GENERATION
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -450,6 +469,24 @@ function markAlertSent(key) {
 async function processAlerts() {
   const _cycleStart = Date.now();
   try {
+    // ─── PRICE FRESHNESS CHECK ─────────────────────────────────────────
+    const freshness = checkPriceFreshness();
+    if (freshness.level === 'critical') {
+      const staleMin = Math.round(freshness.staleMs / 60000);
+      logger.error(`⚠️ STALE DATA: No market update for ${staleMin}min — PAUSING signal generation`);
+      metrics.counter('alerts.stale_data_paused');
+      if (!stalePriceAlertSent && bot.isActive()) {
+        bot.broadcastMessage(`⚠️ *STALE DATA ALERT*\nNo market data received for *${staleMin} minutes*.\nSignal generation is *PAUSED* until fresh data arrives.`).catch(() => {});
+        stalePriceAlertSent = true;
+      }
+      return; // Skip entire cycle — trading on stale data is dangerous
+    }
+    if (freshness.level === 'warning') {
+      const staleMin = Math.round(freshness.staleMs / 60000);
+      logger.warn(`Price data is ${staleMin}min old — signals may be unreliable`);
+      metrics.counter('alerts.stale_data_warning');
+    }
+
     logger.info('Processing alerts');
     metrics.counter('alerts.cycles');
 
@@ -564,6 +601,18 @@ async function processAlerts() {
     });
 
     // ─── PAPER TRADING EVALUATION ─────────────────────────────────────────
+    // Attach market regime for Kelly sizing adjustment
+    try {
+      const btcData = cachedMarketData?.crypto?.bitcoin;
+      if (btcData?.change24h !== undefined) {
+        const absChange = Math.abs(btcData.change24h);
+        if (absChange > 8) cachedMarketData._regime = 'volatile';
+        else if (btcData.change24h > 2) cachedMarketData._regime = 'trending_up';
+        else if (btcData.change24h < -2) cachedMarketData._regime = 'trending_down';
+        else cachedMarketData._regime = 'ranging';
+      }
+    } catch (_) {}
+
     try {
       const ptResult = await evaluateAndExecute(supabase, 'default-user', signals, cachedMarketData);
       if (ptResult.newTrades.length > 0) {
@@ -643,6 +692,8 @@ function gracefulShutdown() {
 installWorkerIPC(gracefulShutdown, (msg) => {
   if (msg.type === MSG.MARKET_UPDATE) {
     cachedMarketData = msg.data;
+    lastMarketDataReceived = Date.now();
+    stalePriceAlertSent = false; // reset on fresh data
   }
 });
 

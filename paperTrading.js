@@ -5,6 +5,7 @@
 
 const { logger } = require('./logger');
 const { SLIPPAGE, COMMISSION } = require('./constants');
+const { buildSizingOptions } = require('./kellySizing');
 
 // ─── EXECUTION SIMULATION ───────────────────────────────────────────────────
 
@@ -1616,8 +1617,60 @@ async function evaluateAndExecute(supabase, userId, signals, marketData) {
         logger.debug('Correlation check failed, proceeding', { error: corrErr.message });
       }
 
-      // Calculate position size
-      const positionSize = calculatePositionSize(config, signal);
+      // Calculate position size with Kelly Criterion + Volatility Targeting
+      let sizingOptions = null;
+      try {
+        // Fetch completed trades for Kelly stats (cached per evaluation cycle)
+        if (!result._completedTrades) {
+          const { data: closedTrades } = await supabase.from('paper_trades')
+            .select('pnl_usd').eq('user_id', userId).eq('status', 'closed')
+            .order('exit_at', { ascending: false }).limit(100);
+          result._completedTrades = (closedTrades || []).map(t => ({ pnl: parseFloat(t.pnl_usd) || 0 }));
+        }
+
+        // Extract ATR% from signal indicators (if available)
+        const atrPercent = signal.indicators?.atrPercent
+          || signal.tradeLevels?.atrPercent
+          || (signal.tradeLevels?.atrValue && signal.tradeLevels.entry
+            ? (signal.tradeLevels.atrValue / signal.tradeLevels.entry) * 100
+            : null);
+
+        // Determine market regime for dynamic Kelly adjustment
+        const regime = marketData?._regime || 'normal';
+        const regimeKellyFraction = { volatile: 0.25, trending_up: 0.5, trending_down: 0.35, ranging: 0.4, normal: 0.5 };
+
+        const kellyConfig = {
+          kelly: {
+            enabled: true,
+            fraction: regimeKellyFraction[regime] || 0.5,  // Half-Kelly default, conservative in volatile
+            minTrades: 15,
+            lookbackTrades: 100,
+            minRiskPerTrade: 0.005,
+            maxRiskPerTrade: 0.04   // 4% cap (conservative for crypto)
+          },
+          volatilityTargeting: {
+            enabled: !!atrPercent,
+            targetATRPercent: 2.0,
+            minScale: 0.3,
+            maxScale: 1.5
+          }
+        };
+
+        sizingOptions = buildSizingOptions(result._completedTrades, atrPercent, kellyConfig);
+
+        if (sizingOptions.kellyResult?.applied) {
+          logger.debug('Kelly sizing applied', {
+            asset: signal.asset,
+            kelly: sizingOptions.kellyResult.kellyFraction,
+            regime,
+            volScale: sizingOptions.volResult?.volScale || 1.0
+          });
+        }
+      } catch (sizingErr) {
+        logger.debug('Kelly sizing failed, using fixed risk', { error: sizingErr.message });
+      }
+
+      const positionSize = calculatePositionSize(config, signal, sizingOptions);
       if (positionSize.positionSizeUsd <= 0) {
         result.skipped.push({ asset: signal.asset, reason: 'Position size too small' });
         continue;
