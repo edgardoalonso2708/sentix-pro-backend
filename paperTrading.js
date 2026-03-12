@@ -34,7 +34,11 @@ const DEFAULT_CONFIG = {
   max_position_percent: 0.30,       // Max 30% of capital per position
   partial_close_ratio: 0.5,         // Close 50% at TP1
   max_holding_hours: 168,           // 7 days max holding period (0 = disabled)
-  move_sl_to_breakeven_after_tp1: true  // Move SL to entry after TP1 hit
+  move_sl_to_breakeven_after_tp1: true,  // Move SL to entry after TP1 hit
+  // Portfolio correlation limits
+  max_portfolio_correlation: 0.70,  // Block new trade if avg correlation with open positions > 70%
+  max_sector_exposure_pct: 0.80,    // Max 80% of capital in same sector (crypto/metals)
+  max_same_direction_crypto: 3,     // Max same-direction crypto positions
 };
 
 // ─── CONFIG VALIDATION RANGES ────────────────────────────────────────────────
@@ -49,6 +53,9 @@ const CONFIG_VALIDATION = {
   max_position_percent:  { min: 0.05,  max: 0.50, type: 'number' },
   partial_close_ratio:   { min: 0.25,  max: 0.75, type: 'number' },
   max_holding_hours:     { min: 0,     max: 720,  type: 'integer' },  // 0 = disabled, max 30 days
+  max_portfolio_correlation: { min: 0.3, max: 1.0, type: 'number' },
+  max_sector_exposure_pct:   { min: 0.3, max: 1.0, type: 'number' },
+  max_same_direction_crypto: { min: 1,   max: 10,  type: 'integer' },
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1586,35 +1593,109 @@ async function evaluateAndExecute(supabase, userId, signals, marketData) {
         break; // No point checking more signals
       }
 
-      // Check position correlation before opening (avoid concentrated risk)
+      // ─── PORTFOLIO CORRELATION & EXPOSURE LIMITS ─────────────────────────
       try {
         const { data: openPositions } = await supabase.from('paper_trades')
-          .select('asset, direction').eq('user_id', userId).in('status', ['open', 'partial']);
-        if (openPositions && openPositions.length >= 2) {
+          .select('asset, direction, position_size_usd, entry_price')
+          .eq('user_id', userId).in('status', ['open', 'partial']);
+
+        if (openPositions && openPositions.length >= 1) {
           const newAsset = signal.asset.toLowerCase();
-          const existingAssets = openPositions.map(p => p.asset.toLowerCase());
-          const sameDirection = openPositions.filter(p => {
-            const sigDir = signal.action === 'BUY' ? 'long' : 'short';
-            return p.direction === sigDir;
-          });
-          // Block if 2+ same-direction positions exist in correlated crypto assets
-          // (crypto pairs have ~0.85+ correlation)
-          const cryptoAssets = ['bitcoin', 'ethereum', 'solana', 'cardano', 'ripple', 'polkadot',
-            'avalanche-2', 'dogecoin', 'binancecoin', 'chainlink'];
-          const isCrypto = cryptoAssets.some(c => newAsset.includes(c));
-          const existingCryptoSameDir = sameDirection.filter(p =>
-            cryptoAssets.some(c => p.asset.toLowerCase().includes(c))
+          const sigDir = signal.action === 'BUY' ? 'long' : 'short';
+          const maxCorr = config.max_portfolio_correlation || DEFAULT_CONFIG.max_portfolio_correlation;
+          const maxSectorPct = config.max_sector_exposure_pct || DEFAULT_CONFIG.max_sector_exposure_pct;
+          const maxSameDirCrypto = config.max_same_direction_crypto || DEFAULT_CONFIG.max_same_direction_crypto;
+
+          const CRYPTO_ASSETS = ['bitcoin', 'ethereum', 'solana', 'cardano', 'ripple', 'polkadot',
+            'avalanche-2', 'dogecoin', 'binancecoin', 'chainlink', 'matic-network', 'tron',
+            'shiba-inu', 'litecoin', 'uniswap', 'near', 'aptos', 'arbitrum', 'optimism', 'sui'];
+          const METAL_ASSETS = ['gold', 'silver', 'xau', 'xag', 'pax-gold', 'platinum'];
+
+          const classifyAsset = (a) => {
+            const lower = a.toLowerCase();
+            if (METAL_ASSETS.some(m => lower.includes(m))) return 'metal';
+            if (CRYPTO_ASSETS.some(c => lower.includes(c))) return 'crypto';
+            return 'other';
+          };
+
+          const newAssetClass = classifyAsset(newAsset);
+
+          // ── CHECK 1: Same-direction crypto limit ──
+          const sameDirCrypto = openPositions.filter(p =>
+            p.direction === sigDir && classifyAsset(p.asset) === 'crypto'
           );
-          if (isCrypto && existingCryptoSameDir.length >= 2) {
+          if (newAssetClass === 'crypto' && sameDirCrypto.length >= maxSameDirCrypto) {
             result.skipped.push({
               asset: signal.asset,
-              reason: `Correlation risk: ${existingCryptoSameDir.length} same-direction crypto positions open (high correlation)`
+              reason: `Same-direction limit: ${sameDirCrypto.length}/${maxSameDirCrypto} ${sigDir.toUpperCase()} crypto positions open`
             });
             continue;
           }
+
+          // ── CHECK 2: Sector exposure % ──
+          const totalExposure = openPositions.reduce((s, p) => s + parseFloat(p.position_size_usd || 0), 0);
+          const sectorExposure = openPositions
+            .filter(p => classifyAsset(p.asset) === newAssetClass)
+            .reduce((s, p) => s + parseFloat(p.position_size_usd || 0), 0);
+          const capital = config.current_capital || DEFAULT_CONFIG.current_capital;
+          const sectorPct = (sectorExposure + (capital * (config.risk_per_trade || 0.01) * 10)) / capital;
+
+          if (sectorPct > maxSectorPct) {
+            result.skipped.push({
+              asset: signal.asset,
+              reason: `Sector exposure: ${newAssetClass} at ${(sectorExposure / capital * 100).toFixed(0)}% of capital (limit ${(maxSectorPct * 100).toFixed(0)}%)`
+            });
+            continue;
+          }
+
+          // ── CHECK 3: Portfolio correlation (use precomputed or known correlations) ──
+          // Use empirical crypto correlation matrix (faster than live calculation)
+          const KNOWN_CORRELATIONS = {
+            'bitcoin-ethereum': 0.87, 'bitcoin-solana': 0.82, 'bitcoin-cardano': 0.78,
+            'bitcoin-ripple': 0.72, 'bitcoin-polkadot': 0.80, 'bitcoin-avalanche-2': 0.83,
+            'bitcoin-dogecoin': 0.68, 'bitcoin-binancecoin': 0.85, 'bitcoin-chainlink': 0.79,
+            'ethereum-solana': 0.84, 'ethereum-cardano': 0.80, 'ethereum-ripple': 0.70,
+            'ethereum-avalanche-2': 0.86, 'ethereum-binancecoin': 0.82, 'ethereum-chainlink': 0.83,
+            'solana-avalanche-2': 0.80, 'solana-cardano': 0.76, 'cardano-ripple': 0.74,
+          };
+
+          const getCorrelation = (a, b) => {
+            const key1 = `${a}-${b}`;
+            const key2 = `${b}-${a}`;
+            if (KNOWN_CORRELATIONS[key1] !== undefined) return KNOWN_CORRELATIONS[key1];
+            if (KNOWN_CORRELATIONS[key2] !== undefined) return KNOWN_CORRELATIONS[key2];
+            // Same sector default: crypto-crypto 0.65, metal-metal 0.70, cross-sector 0.15
+            const classA = classifyAsset(a);
+            const classB = classifyAsset(b);
+            if (classA === classB && classA === 'crypto') return 0.65;
+            if (classA === classB && classA === 'metal') return 0.70;
+            return 0.15; // cross-sector = low correlation
+          };
+
+          // Weighted average correlation of new asset vs all open same-direction positions
+          const sameDirPositions = openPositions.filter(p => p.direction === sigDir);
+          if (sameDirPositions.length >= 2) {
+            let corrWeightSum = 0;
+            let weightSum = 0;
+            for (const pos of sameDirPositions) {
+              const posSize = parseFloat(pos.position_size_usd || 0);
+              const corr = getCorrelation(newAsset, pos.asset.toLowerCase());
+              corrWeightSum += corr * posSize;
+              weightSum += posSize;
+            }
+            const weightedCorr = weightSum > 0 ? corrWeightSum / weightSum : 0;
+
+            if (weightedCorr > maxCorr) {
+              result.skipped.push({
+                asset: signal.asset,
+                reason: `Portfolio correlation ${(weightedCorr * 100).toFixed(0)}% exceeds limit ${(maxCorr * 100).toFixed(0)}% (${sameDirPositions.length} same-dir positions)`
+              });
+              continue;
+            }
+          }
         }
       } catch (corrErr) {
-        logger.debug('Correlation check failed, proceeding', { error: corrErr.message });
+        logger.debug('Portfolio correlation check failed, proceeding', { error: corrErr.message });
       }
 
       // Calculate position size with Kelly Criterion + Volatility Targeting
