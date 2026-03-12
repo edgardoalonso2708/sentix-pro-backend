@@ -35,7 +35,7 @@ const DEFAULT_CONFIG = {
   cooldown_minutes: 30,
   min_confluence: 3,             // require 3+ aligned factors (was 2)
   min_rr_ratio: 1.5,
-  allowed_strength: ['STRONG BUY', 'STRONG SELL'],
+  allowed_strength: ['BUY', 'STRONG BUY', 'SELL', 'STRONG SELL'],
   is_enabled: true,
   daily_pnl: 0,
   daily_pnl_reset_at: new Date().toISOString(),
@@ -44,9 +44,14 @@ const DEFAULT_CONFIG = {
   partial_close_ratio: 0.5,         // Close 50% at TP1
   max_holding_hours: 168,           // 7 days max holding period (0 = disabled)
   move_sl_to_breakeven_after_tp1: true,  // Move SL to entry after TP1 hit
+  // Trade level ATR multipliers
+  atr_stop_mult: 2.5,              // SL = support - (ATR × mult). 2.5 gives room for crypto wicks
+  atr_tp2_mult: 2.0,               // TP2 = resistance + (ATR × mult)
+  atr_trailing_mult: 2.5,          // Trailing stop distance in ATR
+  atr_trailing_activation: 2.0,    // Trailing activates at 2× ATR profit (avoids noise)
   // Portfolio correlation limits
   max_portfolio_correlation: 0.70,  // Block new trade if avg correlation with open positions > 70%
-  max_sector_exposure_pct: 0.80,    // Max 80% of capital in same sector (crypto/metals)
+  max_sector_exposure_pct: 0.60,    // Max 60% of capital in same sector (crypto/metals)
   max_same_direction_crypto: 3,     // Max same-direction crypto positions
 };
 
@@ -65,6 +70,11 @@ const CONFIG_VALIDATION = {
   max_portfolio_correlation: { min: 0.3, max: 1.0, type: 'number' },
   max_sector_exposure_pct:   { min: 0.3, max: 1.0, type: 'number' },
   max_same_direction_crypto: { min: 1,   max: 10,  type: 'integer' },
+  // ATR multipliers for trade levels
+  atr_stop_mult:            { min: 0.5, max: 5.0, type: 'number' },
+  atr_tp2_mult:             { min: 0.5, max: 5.0, type: 'number' },
+  atr_trailing_mult:        { min: 0.5, max: 5.0, type: 'number' },
+  atr_trailing_activation:  { min: 0.5, max: 5.0, type: 'number' },
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -188,7 +198,11 @@ async function updateConfig(supabase, userId, updates) {
       'min_rr_ratio', 'allowed_strength', 'is_enabled',
       'max_position_percent', 'partial_close_ratio', 'max_holding_hours',
       'move_sl_to_breakeven_after_tp1',
-      'daily_pnl', 'daily_pnl_reset_at'
+      'daily_pnl', 'daily_pnl_reset_at',
+      // ATR multipliers
+      'atr_stop_mult', 'atr_tp2_mult', 'atr_trailing_mult', 'atr_trailing_activation',
+      // Portfolio limits
+      'max_portfolio_correlation', 'max_sector_exposure_pct', 'max_same_direction_crypto'
     ];
 
     const filtered = {};
@@ -588,7 +602,70 @@ async function checkDuplicateTrade(supabase, userId, asset) {
 // TRADE EXECUTION
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function openTrade(supabase, userId, signal, positionSize, marketData = null, orderId = null) {
+/**
+ * Recalculate trade levels using user's ATR multipliers instead of strategy defaults.
+ * Preserves support/resistance anchoring but adjusts ATR-based distances.
+ */
+function adjustTradeLevels(tradeLevels, config, isLong) {
+  if (!tradeLevels || !tradeLevels.atrValue || tradeLevels.atrValue <= 0) return tradeLevels;
+
+  // Default ATR multipliers from strategyConfig.js
+  const DEFAULTS = { stop: 1.5, tp2: 2.0, trailing: 2.5, activation: 1.0 };
+
+  const userStop = config.atr_stop_mult || DEFAULTS.stop;
+  const userTp2 = config.atr_tp2_mult || DEFAULTS.tp2;
+  const userTrailing = config.atr_trailing_mult || DEFAULTS.trailing;
+  const userActivation = config.atr_trailing_activation || DEFAULTS.activation;
+
+  // If all match defaults, no adjustment needed
+  if (userStop === DEFAULTS.stop && userTp2 === DEFAULTS.tp2 &&
+      userTrailing === DEFAULTS.trailing && userActivation === DEFAULTS.activation) {
+    return tradeLevels;
+  }
+
+  const atr = tradeLevels.atrValue;
+  const entry = tradeLevels.entry;
+  const adjusted = { ...tradeLevels };
+
+  if (isLong) {
+    // LONG: SL below entry, TP above entry
+    adjusted.stopLoss = Math.max(0.01, entry - (atr * userStop));
+    adjusted.takeProfit2 = entry + (atr * userTp2);
+    adjusted.trailingStop = entry - (atr * userTrailing);
+    adjusted.trailingActivation = entry + (atr * userActivation);
+  } else {
+    // SHORT: SL above entry, TP below entry
+    adjusted.stopLoss = entry + (atr * userStop);
+    adjusted.takeProfit2 = Math.max(0.01, entry - (atr * userTp2));
+    adjusted.trailingStop = entry + (atr * userTrailing);
+    adjusted.trailingActivation = Math.max(0.01, entry - (atr * userActivation));
+  }
+
+  // Recalculate TP1 as midpoint between entry and TP2 (standard approach)
+  adjusted.takeProfit1 = isLong
+    ? entry + (adjusted.takeProfit2 - entry) * 0.5
+    : entry - (entry - adjusted.takeProfit2) * 0.5;
+
+  // Round based on price magnitude
+  const decimals = entry > 100 ? 2 : entry > 1 ? 4 : 6;
+  const round = (v) => parseFloat(v.toFixed(decimals));
+  adjusted.stopLoss = round(adjusted.stopLoss);
+  adjusted.takeProfit1 = round(adjusted.takeProfit1);
+  adjusted.takeProfit2 = round(adjusted.takeProfit2);
+  adjusted.trailingStop = round(adjusted.trailingStop);
+  adjusted.trailingActivation = round(adjusted.trailingActivation);
+
+  logger.debug('Trade levels adjusted with user ATR config', {
+    entry, atr,
+    userMults: { stop: userStop, tp2: userTp2, trailing: userTrailing, activation: userActivation },
+    original: { sl: tradeLevels.stopLoss, tp1: tradeLevels.takeProfit1, tp2: tradeLevels.takeProfit2 },
+    adjusted: { sl: adjusted.stopLoss, tp1: adjusted.takeProfit1, tp2: adjusted.takeProfit2 }
+  });
+
+  return adjusted;
+}
+
+async function openTrade(supabase, userId, signal, positionSize, marketData = null, orderId = null, config = null) {
   try {
     const direction = signal.action === 'BUY' ? 'LONG' : 'SHORT';
 
@@ -605,6 +682,11 @@ async function openTrade(supabase, userId, signal, positionSize, marketData = nu
     // Apply slippage + commission to entry (simulates real execution)
     const isBuy = direction === 'LONG';
     const slippedEntry = applySlippage(signal.tradeLevels.entry, isBuy, signal.asset);
+
+    // Adjust trade levels based on user's ATR multipliers (if custom config provided)
+    const levels = config
+      ? adjustTradeLevels(signal.tradeLevels, config, isBuy)
+      : signal.tradeLevels;
 
     const tradeData = {
       user_id: userId,
@@ -624,12 +706,12 @@ async function openTrade(supabase, userId, signal, positionSize, marketData = nu
       position_size_usd: positionSize.positionSizeUsd,
       quantity: positionSize.quantity,
       risk_amount: positionSize.riskAmount,
-      stop_loss: signal.tradeLevels.stopLoss,
-      take_profit_1: signal.tradeLevels.takeProfit1,
-      take_profit_2: signal.tradeLevels.takeProfit2 || null,
-      trailing_stop_initial: signal.tradeLevels.trailingStop || null,
-      trailing_stop_current: signal.tradeLevels.trailingStop || null,
-      trailing_activation: signal.tradeLevels.trailingActivation || null,
+      stop_loss: levels.stopLoss,
+      take_profit_1: levels.takeProfit1,
+      take_profit_2: levels.takeProfit2 || null,
+      trailing_stop_initial: levels.trailingStop || null,
+      trailing_stop_current: levels.trailingStop || null,
+      trailing_activation: levels.trailingActivation || null,
       trailing_active: false,
       remaining_quantity: positionSize.quantity,
       peak_price: signal.tradeLevels.entry,
@@ -2088,8 +2170,8 @@ async function evaluateAndExecute(supabase, userId, signals, marketData) {
         continue;
       }
 
-      // Open the trade (pass marketData for regime/confluence tracking)
-      const { trade, error: tradeError } = await openTrade(supabase, userId, signal, positionSize, marketData);
+      // Open the trade (pass marketData for regime/confluence tracking + user config for ATR levels)
+      const { trade, error: tradeError } = await openTrade(supabase, userId, signal, positionSize, marketData, null, config);
       if (trade) {
         result.newTrades.push(trade);
         // Refresh config for next iteration (capital changed)
@@ -2199,6 +2281,7 @@ module.exports = {
 
   // Execution
   applySlippage,
+  adjustTradeLevels,
   openTrade,
   executePartialClose,
   executeFullClose,

@@ -359,7 +359,7 @@ async function validateOrder(supabase, userId, order, config = null) {
  * @param {object} [marketData] - Current market data
  * @returns {Promise<{filledOrder: object|null, trade: object|null, error: object|null}>}
  */
-async function submitOrder(supabase, userId, order, executionAdapter, marketData = null) {
+async function submitOrder(supabase, userId, order, executionAdapter, marketData = null, config = null) {
   try {
     if (order.status !== ORDER_STATUS.VALIDATED) {
       return { filledOrder: null, trade: null, error: { message: `Order not VALIDATED (current: ${order.status})` } };
@@ -375,7 +375,7 @@ async function submitOrder(supabase, userId, order, executionAdapter, marketData
     await logExecution(supabase, order.id, EVENT_TYPE.ORDER_SUBMITTED, {});
 
     // Execute via adapter
-    const fillResult = await executionAdapter.placeOrder(order, marketData);
+    const fillResult = await executionAdapter.placeOrder(order, marketData, config);
 
     if (!fillResult.filled) {
       // Order not immediately filled (e.g., LIMIT order not at price)
@@ -765,7 +765,7 @@ async function processSignals(supabase, userId, signals, marketData, executionAd
       // Submit if auto-execute enabled
       if (autoExecute) {
         const { filledOrder, trade, error: submitError } = await submitOrder(
-          supabase, userId, order, executionAdapter, marketData
+          supabase, userId, order, executionAdapter, marketData, config
         );
 
         if (submitError) {

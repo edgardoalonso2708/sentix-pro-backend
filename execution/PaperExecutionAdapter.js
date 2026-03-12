@@ -28,7 +28,7 @@ class PaperExecutionAdapter extends ExecutionAdapter {
    * Place an order in the paper trading system.
    * Converts the order into a paper trade via openTrade().
    */
-  async placeOrder(order, marketData = null) {
+  async placeOrder(order, marketData = null, config = null) {
     try {
       // Resolve current price for the asset
       const currentPrice = resolveCurrentPrice(order.asset, marketData);
@@ -42,7 +42,7 @@ class PaperExecutionAdapter extends ExecutionAdapter {
 
       // ── MARKET ORDER: fill immediately ──
       if (order.order_type === 'MARKET') {
-        return await this._fillOrder(order, currentPrice, marketData);
+        return await this._fillOrder(order, currentPrice, marketData, config);
       }
 
       // ── LIMIT ORDER: check if price satisfies limit ──
@@ -51,11 +51,11 @@ class PaperExecutionAdapter extends ExecutionAdapter {
 
         if (order.side === 'BUY' && currentPrice <= limitPrice) {
           // Buy at or below limit → fill
-          return await this._fillOrder(order, currentPrice, marketData);
+          return await this._fillOrder(order, currentPrice, marketData, config);
         }
         if (order.side === 'SELL' && currentPrice >= limitPrice) {
           // Sell at or above limit → fill
-          return await this._fillOrder(order, currentPrice, marketData);
+          return await this._fillOrder(order, currentPrice, marketData, config);
         }
 
         return {
@@ -93,7 +93,7 @@ class PaperExecutionAdapter extends ExecutionAdapter {
           };
         }
 
-        return await this._fillOrder(order, currentPrice, marketData);
+        return await this._fillOrder(order, currentPrice, marketData, config);
       }
 
       return { filled: false, reason: `Unknown order type: ${order.order_type}` };
@@ -107,7 +107,7 @@ class PaperExecutionAdapter extends ExecutionAdapter {
    * Fill an order: apply slippage, create trade via openTrade().
    * @private
    */
-  async _fillOrder(order, currentPrice, marketData) {
+  async _fillOrder(order, currentPrice, marketData, config = null) {
     const isBuy = order.side === 'BUY';
     const fillPrice = applySlippage(currentPrice, isBuy, order.asset);
     const slippage = Math.abs(fillPrice - currentPrice) / currentPrice;
@@ -148,7 +148,8 @@ class PaperExecutionAdapter extends ExecutionAdapter {
       signalCompat,
       positionSize,
       marketData,
-      order.id // Pass order_id to link trade → order
+      order.id, // Pass order_id to link trade → order
+      config    // Pass user config for ATR-level adjustments
     );
 
     if (error) {

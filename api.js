@@ -1698,8 +1698,12 @@ app.post('/api/orders/:userId/:orderId/submit', async (req, res) => {
     const { createAdapter } = require('./execution');
     const adapter = createAdapter(order.execution_adapter || 'paper', { supabase });
 
+    // Fetch user config for ATR-level adjustments
+    const { getOrCreateConfig } = require('./paperTrading');
+    const { config: userConfig } = await getOrCreateConfig(supabase, userId);
+
     const { filledOrder, trade, error: submitError } = await submitOrder(
-      supabase, userId, order, adapter, cachedMarketData
+      supabase, userId, order, adapter, cachedMarketData, userConfig
     );
 
     if (submitError) return res.status(400).json({ error: submitError.message || submitError });

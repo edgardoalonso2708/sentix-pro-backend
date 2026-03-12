@@ -126,7 +126,7 @@ describe('evaluateSignalForTrade', () => {
 
   test('rejects BUY (non-STRONG) when only STRONG allowed', () => {
     const signal = makeSignal({ strengthLabel: 'BUY' });
-    const config = makeConfig();
+    const config = makeConfig({ allowed_strength: ['STRONG BUY', 'STRONG SELL'] });
     const result = evaluateSignalForTrade(signal, config);
     expect(result.eligible).toBe(false);
     expect(result.reason).toContain('not in allowed list');
@@ -414,7 +414,7 @@ describe('DEFAULT_CONFIG', () => {
     expect(DEFAULT_CONFIG.cooldown_minutes).toBe(30);
     expect(DEFAULT_CONFIG.min_confluence).toBe(3);
     expect(DEFAULT_CONFIG.min_rr_ratio).toBe(1.5);
-    expect(DEFAULT_CONFIG.allowed_strength).toEqual(['STRONG BUY', 'STRONG SELL']);
+    expect(DEFAULT_CONFIG.allowed_strength).toEqual(['BUY', 'STRONG BUY', 'SELL', 'STRONG SELL']);
     expect(DEFAULT_CONFIG.is_enabled).toBe(true);
   });
 });
