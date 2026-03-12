@@ -7,6 +7,7 @@
 const { logger } = require('./logger');
 const { fetchOHLCVCandles } = require('./technicalAnalysis');
 const { LRUCache } = require('./shared/lruCache');
+const { updateRegime } = require('./marketRegime');
 
 /**
  * Feature store cache — LRU with TTL
@@ -220,8 +221,11 @@ async function computeFeatures(assetId, interval = '1h', limit = 200) {
       vwap24h: calculateVWAP(candles, 24),
       momentum14: calculateMomentum(candles, 14),
 
-      // Market regime
+      // Market regime (legacy simple)
       marketRegime: determineMarketRegime(candles),
+
+      // Advanced regime (state machine with smooth transitions)
+      advancedRegime: updateRegime(assetId, candles),
 
       // Metadata
       interval,

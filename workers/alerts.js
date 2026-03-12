@@ -27,6 +27,7 @@ const {
   cleanupExpiredProposals, checkPostApplyPerformance,
 } = require('../autoTuner');
 const { computeFeatures } = require('../featureStore');
+const { getAllRegimes, getRegime } = require('../marketRegime');
 
 // ─── SUPABASE CLIENT ──────────────────────────────────────────────────────
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY);
@@ -601,15 +602,23 @@ async function processAlerts() {
     });
 
     // ─── PAPER TRADING EVALUATION ─────────────────────────────────────────
-    // Attach market regime for Kelly sizing adjustment
+    // Attach advanced market regime for Kelly sizing + signal quality
     try {
-      const btcData = cachedMarketData?.crypto?.bitcoin;
-      if (btcData?.change24h !== undefined) {
-        const absChange = Math.abs(btcData.change24h);
-        if (absChange > 8) cachedMarketData._regime = 'volatile';
-        else if (btcData.change24h > 2) cachedMarketData._regime = 'trending_up';
-        else if (btcData.change24h < -2) cachedMarketData._regime = 'trending_down';
-        else cachedMarketData._regime = 'ranging';
+      const btcRegime = getRegime('bitcoin');
+      if (btcRegime) {
+        cachedMarketData._regime = btcRegime.regime;
+        cachedMarketData._regimeData = btcRegime;
+        cachedMarketData._allRegimes = getAllRegimes();
+      } else {
+        // Fallback to simple regime from BTC 24h change
+        const btcData = cachedMarketData?.crypto?.bitcoin;
+        if (btcData?.change24h !== undefined) {
+          const absChange = Math.abs(btcData.change24h);
+          if (absChange > 8) cachedMarketData._regime = 'volatile';
+          else if (btcData.change24h > 2) cachedMarketData._regime = 'trending_up';
+          else if (btcData.change24h < -2) cachedMarketData._regime = 'trending_down';
+          else cachedMarketData._regime = 'ranging';
+        }
       }
     } catch (_) {}
 

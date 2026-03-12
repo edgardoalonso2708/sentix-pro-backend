@@ -43,6 +43,7 @@ const { Resend } = require('resend');
 const { logger } = require('./logger');
 const { classifyAxiosError, Provider } = require('./errors');
 const { getFeatures, getFeaturesForAssets, getCacheStats } = require('./featureStore');
+const { getAllRegimes, getRegime } = require('./marketRegime');
 const {
   getOrCreateConfig,
   updateConfig,
@@ -354,6 +355,27 @@ app.get('/api/market', (req, res) => {
     return res.status(503).json({ error: 'Market data not yet available' });
   }
   res.json(cachedMarketData);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MARKET REGIME ROUTES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+app.get('/api/regime', (req, res) => {
+  const all = getAllRegimes();
+  const btc = getRegime('bitcoin');
+  res.json({
+    primary: btc || { regime: cachedMarketData?._regime || 'unknown', confidence: 0 },
+    assets: all,
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get('/api/regime/:asset', (req, res) => {
+  const asset = sanitizeInput(req.params.asset);
+  const regime = getRegime(asset);
+  if (!regime) return res.status(404).json({ error: 'No regime data for asset' });
+  res.json(regime);
 });
 
 app.get('/api/signals', async (req, res) => {
