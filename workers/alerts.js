@@ -12,7 +12,7 @@ const { Resend } = require('resend');
 const { SilentTelegramBot, setupTelegramCommands, setupAutoTuneCommands } = require('../telegramBot');
 const { generateSignalWithRealData, generateMultiTimeframeSignal } = require('../technicalAnalysis');
 const { fetchDerivativesData, fetchOrderBookDepth } = require('../binanceAPI');
-const { evaluateAndExecute } = require('../paperTrading');
+const { evaluateAndExecute, getPositionHeatMap } = require('../paperTrading');
 const { logger } = require('../logger');
 const { classifyAxiosError, Provider } = require('../errors');
 const { isWithinTradingHours } = require('../scheduleUtils');
@@ -635,6 +635,14 @@ async function processAlerts() {
       logger.warn('Paper trading evaluation failed', { error: ptError.message });
     }
 
+    // ─── POSITION ANOMALY DETECTION ──────────────────────────────────────
+    // Check open positions for risk indicators and send Telegram alerts
+    try {
+      await checkPositionAnomalies(supabase, cachedMarketData);
+    } catch (anomalyErr) {
+      logger.debug('Position anomaly check failed', { error: anomalyErr.message });
+    }
+
     // ─── CHECK PENDING SIGNAL OUTCOMES (accuracy tracking) ─────────────
     try {
       await checkPendingOutcomes(supabase, async (asset) => {
@@ -652,6 +660,71 @@ async function processAlerts() {
 
   } catch (error) {
     logger.error('Alert processing failed', { error: error.message });
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// POSITION ANOMALY DETECTION
+// Checks open positions for risk indicators and sends Telegram alerts
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Throttle anomaly alerts: don't spam the same anomaly within 30 minutes
+const anomalyAlertCache = new LRUCache(100);
+const ANOMALY_COOLDOWN_MS = 30 * 60 * 1000;
+
+/**
+ * Check all open positions for anomalies and send Telegram alerts for critical ones.
+ * Runs every alert cycle (~5 min) but throttles per-anomaly to avoid spam.
+ */
+async function checkPositionAnomalies(supabase, marketData) {
+  if (!bot.isActive() || !marketData) return;
+
+  const heatMap = await getPositionHeatMap(supabase, 'default-user', marketData);
+  if (!heatMap.anomalies || heatMap.anomalies.length === 0) return;
+
+  const now = Date.now();
+  const highSeverity = heatMap.anomalies.filter(a => a.severity === 'high');
+
+  if (highSeverity.length === 0) return;
+
+  // Build Telegram message for critical anomalies (deduplicated by cooldown)
+  const newAlerts = [];
+  for (const anomaly of highSeverity) {
+    const cacheKey = `${anomaly.type}:${anomaly.asset}`;
+    const lastSent = anomalyAlertCache.get(cacheKey);
+    if (lastSent && (now - lastSent) < ANOMALY_COOLDOWN_MS) continue;
+
+    newAlerts.push(anomaly);
+    anomalyAlertCache.set(cacheKey, now);
+  }
+
+  if (newAlerts.length === 0) return;
+
+  // Compose message
+  const lines = [
+    '🔥 *POSITION ANOMALY ALERT*',
+    `${newAlerts.length} critical issue${newAlerts.length > 1 ? 's' : ''} detected:`,
+    ''
+  ];
+
+  for (const a of newAlerts) {
+    lines.push(`• ${a.message}`);
+  }
+
+  // Add summary
+  const { summary } = heatMap;
+  lines.push('');
+  lines.push(`📊 Heat map: 🟢${summary.cool} 🟡${summary.warm} 🔴${summary.hot} | Total P&L: $${summary.totalUnrealizedPnl}`);
+
+  try {
+    await bot.broadcastMessage(lines.join('\n'));
+    logger.info('Position anomaly alerts sent', {
+      count: newAlerts.length,
+      types: newAlerts.map(a => a.type)
+    });
+    metrics.counter('alerts.anomalies', newAlerts.length);
+  } catch (err) {
+    logger.warn('Failed to send anomaly alerts', { error: err.message });
   }
 }
 

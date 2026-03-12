@@ -952,6 +952,201 @@ async function monitorOpenPositions(supabase, userId, marketData, config = null)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// POSITION HEAT MAP & ANOMALY DETECTION
+// Identifies positions requiring attention: SL proximity, give-back, time risk
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Anomaly thresholds
+const HEAT_THRESHOLDS = {
+  slProximityPct: 2.0,          // Alert when price is within 2% of SL
+  winnerGiveBackPct: 50,        // Alert when winner has given back 50%+ of peak unrealized
+  holdingTimeWarnPct: 70,       // Alert at 70% of max_holding_hours
+  drawdownFromPeakPct: 30,      // Alert when position drawdown from peak > 30%
+  largeUnrealizedLossPct: -5.0, // Alert when unrealized loss exceeds 5%
+};
+
+/**
+ * Analyze all open positions and produce a heat map with risk indicators.
+ * Each position gets a "heat" level: cool (green), warm (yellow), hot (red).
+ *
+ * @param {Object} supabase - Supabase client
+ * @param {string} userId - User ID
+ * @param {Object} marketData - Current market data
+ * @param {Object} [config] - Paper trading config
+ * @returns {Promise<Object>} { positions: [...], summary: { ... }, anomalies: [...] }
+ */
+async function getPositionHeatMap(supabase, userId, marketData, config = null) {
+  try {
+    if (!config) {
+      const { config: fetchedConfig } = await getOrCreateConfig(supabase, userId);
+      config = fetchedConfig || DEFAULT_CONFIG;
+    }
+
+    const { positions } = await getOpenPositions(supabase, userId, marketData);
+
+    if (!positions || positions.length === 0) {
+      return { positions: [], summary: { total: 0, cool: 0, warm: 0, hot: 0 }, anomalies: [] };
+    }
+
+    const maxHoldingHours = config.max_holding_hours || DEFAULT_CONFIG.max_holding_hours;
+    const heatPositions = [];
+    const anomalies = [];
+
+    for (const pos of positions) {
+      const entryPrice = parseFloat(pos.entry_price);
+      const currentPrice = pos.currentPrice;
+      const stopLoss = pos.stop_loss ? parseFloat(pos.stop_loss) : null;
+      const tp1 = pos.take_profit_1 ? parseFloat(pos.take_profit_1) : null;
+      const tp2 = pos.take_profit_2 ? parseFloat(pos.take_profit_2) : null;
+      const maxFavorable = parseFloat(pos.max_favorable || 0);
+      const unrealizedPnl = pos.unrealizedPnl || 0;
+      const unrealizedPnlPct = pos.unrealizedPnlPercent || 0;
+      const holdingMs = pos.entry_at ? Date.now() - new Date(pos.entry_at).getTime() : 0;
+      const holdingHours = holdingMs / 3600000;
+
+      const alerts = [];
+      let heat = 'cool'; // cool | warm | hot
+
+      if (!currentPrice) {
+        heatPositions.push({
+          ...pos,
+          heat: 'unknown',
+          alerts: ['No current price available'],
+          metrics: {}
+        });
+        continue;
+      }
+
+      // ─── 1. SL Proximity ──────────────────────────────────────────────
+      let slDistancePct = null;
+      if (stopLoss) {
+        if (pos.direction === 'LONG') {
+          slDistancePct = ((currentPrice - stopLoss) / currentPrice) * 100;
+        } else {
+          slDistancePct = ((stopLoss - currentPrice) / currentPrice) * 100;
+        }
+
+        if (slDistancePct <= HEAT_THRESHOLDS.slProximityPct && slDistancePct > 0) {
+          heat = 'hot';
+          const msg = `⚠️ SL proximity: ${pos.asset} is ${slDistancePct.toFixed(1)}% from stop-loss`;
+          alerts.push(msg);
+          anomalies.push({ type: 'sl_proximity', asset: pos.asset, severity: 'high', message: msg, value: slDistancePct });
+        }
+      }
+
+      // ─── 2. Winner give-back (was winning, now losing or gave back >50%) ──
+      if (maxFavorable > 0) {
+        const currentGain = Math.max(0, unrealizedPnl);
+        const giveBackPct = ((maxFavorable - currentGain) / maxFavorable) * 100;
+
+        if (unrealizedPnl < 0 && maxFavorable > 0) {
+          // Winner turned into a loser
+          heat = 'hot';
+          const msg = `🔄 Winner → Loser: ${pos.asset} was +$${maxFavorable.toFixed(2)}, now ${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(2)}`;
+          alerts.push(msg);
+          anomalies.push({ type: 'winner_turned_loser', asset: pos.asset, severity: 'high', message: msg, peakPnl: maxFavorable, currentPnl: unrealizedPnl });
+        } else if (giveBackPct >= HEAT_THRESHOLDS.winnerGiveBackPct) {
+          // Major give-back
+          if (heat !== 'hot') heat = 'warm';
+          const msg = `📉 Give-back: ${pos.asset} gave back ${giveBackPct.toFixed(0)}% of peak gain`;
+          alerts.push(msg);
+          anomalies.push({ type: 'give_back', asset: pos.asset, severity: 'medium', message: msg, giveBackPct });
+        }
+      }
+
+      // ─── 3. Holding time warning ──────────────────────────────────────
+      if (maxHoldingHours > 0) {
+        const holdingPct = (holdingHours / maxHoldingHours) * 100;
+        if (holdingPct >= HEAT_THRESHOLDS.holdingTimeWarnPct) {
+          if (heat !== 'hot') heat = 'warm';
+          const remainingHours = Math.max(0, maxHoldingHours - holdingHours);
+          const msg = `⏰ Holding time: ${pos.asset} at ${holdingPct.toFixed(0)}% of max (${remainingHours.toFixed(1)}h remaining)`;
+          alerts.push(msg);
+          anomalies.push({ type: 'holding_time', asset: pos.asset, severity: holdingPct >= 90 ? 'high' : 'medium', message: msg, holdingPct, remainingHours });
+        }
+      }
+
+      // ─── 4. Large unrealized loss ─────────────────────────────────────
+      if (unrealizedPnlPct <= HEAT_THRESHOLDS.largeUnrealizedLossPct) {
+        heat = 'hot';
+        const msg = `💔 Large loss: ${pos.asset} at ${unrealizedPnlPct.toFixed(1)}% unrealized`;
+        alerts.push(msg);
+        anomalies.push({ type: 'large_loss', asset: pos.asset, severity: 'high', message: msg, unrealizedPnlPct });
+      }
+
+      // ─── 5. Drawdown from peak (position-level) ──────────────────────
+      if (maxFavorable > 0 && unrealizedPnl >= 0) {
+        const drawdownFromPeak = ((maxFavorable - unrealizedPnl) / maxFavorable) * 100;
+        if (drawdownFromPeak >= HEAT_THRESHOLDS.drawdownFromPeakPct) {
+          if (heat !== 'hot') heat = 'warm';
+          const msg = `📊 Peak drawdown: ${pos.asset} down ${drawdownFromPeak.toFixed(0)}% from peak gain`;
+          alerts.push(msg);
+          anomalies.push({ type: 'peak_drawdown', asset: pos.asset, severity: 'medium', message: msg, drawdownPct: drawdownFromPeak });
+        }
+      }
+
+      // ─── Progress toward targets ──────────────────────────────────────
+      let progressToTP1 = null, progressToTP2 = null;
+      if (tp1) {
+        if (pos.direction === 'LONG') {
+          progressToTP1 = ((currentPrice - entryPrice) / (tp1 - entryPrice)) * 100;
+        } else {
+          progressToTP1 = ((entryPrice - currentPrice) / (entryPrice - tp1)) * 100;
+        }
+      }
+      if (tp2) {
+        if (pos.direction === 'LONG') {
+          progressToTP2 = ((currentPrice - entryPrice) / (tp2 - entryPrice)) * 100;
+        } else {
+          progressToTP2 = ((entryPrice - currentPrice) / (entryPrice - tp2)) * 100;
+        }
+      }
+
+      heatPositions.push({
+        id: pos.id,
+        asset: pos.asset,
+        direction: pos.direction,
+        entryPrice,
+        currentPrice,
+        stopLoss,
+        takeProfit1: tp1,
+        takeProfit2: tp2,
+        unrealizedPnl,
+        unrealizedPnlPct,
+        heat,
+        alerts,
+        metrics: {
+          slDistancePct: slDistancePct !== null ? Math.round(slDistancePct * 100) / 100 : null,
+          holdingHours: Math.round(holdingHours * 10) / 10,
+          holdingPct: maxHoldingHours > 0 ? Math.round((holdingHours / maxHoldingHours) * 1000) / 10 : null,
+          maxFavorable: Math.round(maxFavorable * 100) / 100,
+          giveBackPct: maxFavorable > 0 ? Math.round(((maxFavorable - Math.max(0, unrealizedPnl)) / maxFavorable) * 1000) / 10 : 0,
+          progressToTP1: progressToTP1 !== null ? Math.round(progressToTP1 * 10) / 10 : null,
+          progressToTP2: progressToTP2 !== null ? Math.round(progressToTP2 * 10) / 10 : null,
+          positionSizeUsd: parseFloat(pos.position_size_usd || 0),
+          entryAt: pos.entry_at
+        }
+      });
+    }
+
+    // Summary
+    const summary = {
+      total: heatPositions.length,
+      cool: heatPositions.filter(p => p.heat === 'cool').length,
+      warm: heatPositions.filter(p => p.heat === 'warm').length,
+      hot: heatPositions.filter(p => p.heat === 'hot').length,
+      totalUnrealizedPnl: Math.round(heatPositions.reduce((s, p) => s + (p.unrealizedPnl || 0), 0) * 100) / 100,
+      anomalyCount: anomalies.length
+    };
+
+    return { positions: heatPositions, summary, anomalies };
+  } catch (err) {
+    logger.error('getPositionHeatMap exception', { error: err.message });
+    return { positions: [], summary: { total: 0, cool: 0, warm: 0, hot: 0 }, anomalies: [], error: err.message };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // ANALYTICS
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1888,6 +2083,7 @@ module.exports = {
   getAdvancedPerformance,
   getTradeHistory,
   getOpenPositions,
+  getPositionHeatMap,
 
   // Equity Curve
   recordEquitySnapshot,

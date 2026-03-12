@@ -52,6 +52,7 @@ const {
   getAdvancedPerformance,
   getTradeHistory,
   getOpenPositions,
+  getPositionHeatMap,
   executeFullClose,
   resolveCurrentPrice,
   getPositionCorrelations,
@@ -1388,6 +1389,21 @@ app.get('/api/paper/correlation/:userId', async (req, res) => {
     res.json({ correlation });
   } catch (error) {
     logger.error('Paper correlation fetch failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Position heat map + anomaly detection
+app.get('/api/paper/heatmap/:userId', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) {
+      return res.status(400).json({ error: 'Invalid user ID' });
+    }
+    const heatMap = await getPositionHeatMap(supabase, userId, cachedMarketData);
+    res.json(heatMap);
+  } catch (error) {
+    logger.error('Position heat map fetch failed', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
