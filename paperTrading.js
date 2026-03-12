@@ -29,26 +29,26 @@ function applySlippage(price, isBuy, asset = null, orderBook = null, tradeSizeUs
 const DEFAULT_CONFIG = {
   initial_capital: 10000,
   current_capital: 10000,
-  risk_per_trade: 0.01,          // 1% — conservative for crypto volatility
-  max_open_positions: 3,
+  risk_per_trade: 0.02,          // 2% — balanced risk per trade
+  max_open_positions: 5,
   max_daily_loss_percent: 0.05,  // 5%
   cooldown_minutes: 30,
-  min_confluence: 3,             // require 3+ aligned factors (was 2)
+  min_confluence: 3,             // require 3+ aligned factors
   min_rr_ratio: 1.5,
-  allowed_strength: ['BUY', 'STRONG BUY', 'SELL', 'STRONG SELL'],
+  allowed_strength: ['BUY', 'STRONG BUY', 'SELL', 'STRONG SELL'],  // NO weak signals
   is_enabled: true,
   daily_pnl: 0,
   daily_pnl_reset_at: new Date().toISOString(),
   last_trade_at: null,
-  max_position_percent: 0.30,       // Max 30% of capital per position
+  max_position_percent: 0.25,       // Max 25% of capital per position
   partial_close_ratio: 0.5,         // Close 50% at TP1
   max_holding_hours: 168,           // 7 days max holding period (0 = disabled)
   move_sl_to_breakeven_after_tp1: true,  // Move SL to entry after TP1 hit
   // Trade level ATR multipliers
   atr_stop_mult: 2.5,              // SL = support - (ATR × mult). 2.5 gives room for crypto wicks
   atr_tp2_mult: 2.0,               // TP2 = resistance + (ATR × mult)
-  atr_trailing_mult: 2.5,          // Trailing stop distance in ATR
-  atr_trailing_activation: 2.0,    // Trailing activates at 2× ATR profit (avoids noise)
+  atr_trailing_mult: 3.5,          // Trailing stop distance — wider to let winners run
+  atr_trailing_activation: 2.5,    // Trailing activates at 2.5× ATR profit (avoids noise activation)
   // Portfolio correlation limits
   max_portfolio_correlation: 0.70,  // Block new trade if avg correlation with open positions > 70%
   max_sector_exposure_pct: 0.60,    // Max 60% of capital in same sector (crypto/metals)
