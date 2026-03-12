@@ -392,12 +392,18 @@ function calculatePositionSize(config, signal, sizingOptions = null) {
     volApplied = true;
   }
 
-  // Cap at configurable % of capital (default 30%)
+  // Cap at configurable % of capital (default 25%)
   const maxPositionPct = config.max_position_percent || DEFAULT_CONFIG.max_position_percent;
   const maxPosition = config.current_capital * maxPositionPct;
   if (positionSizeUsd > maxPosition) {
     positionSizeUsd = maxPosition;
     quantity = positionSizeUsd / entryPrice;
+  }
+
+  // Minimum position size — below this, fees eat the trade
+  const MIN_POSITION_USD = 50;
+  if (positionSizeUsd < MIN_POSITION_USD) {
+    return { positionSizeUsd: 0, quantity: 0, riskAmount: 0, skipped: true, reason: `Position size $${positionSizeUsd.toFixed(2)} below minimum $${MIN_POSITION_USD}` };
   }
 
   return {

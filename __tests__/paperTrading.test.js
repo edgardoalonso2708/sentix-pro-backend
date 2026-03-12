@@ -233,20 +233,29 @@ describe('calculatePositionSize', () => {
     expect(result.quantity).toBe(0);
   });
 
-  test('handles small capital correctly', () => {
+  test('handles small capital correctly (below $50 minimum)', () => {
     const config = makeConfig({ current_capital: 100, risk_per_trade: 0.01 });
     const signal = makeSignal({
       tradeLevels: { ...makeSignal().tradeLevels, entry: 50, stopLoss: 48 }
     });
     const result = calculatePositionSize(config, signal);
 
-    // riskAmount = 100 * 0.01 = 1
-    // distance = 2
-    // quantity = 0.5
-    // positionSize = 0.5 * 50 = 25 (under 30 cap)
-    expect(result.riskAmount).toBe(1);
-    expect(result.positionSizeUsd).toBe(25);
-    expect(result.quantity).toBe(0.5);
+    // riskAmount = 100 * 0.01 = 1, positionSize = $25 → below $50 minimum → skipped
+    expect(result.positionSizeUsd).toBe(0);
+    expect(result.skipped).toBe(true);
+    expect(result.reason).toMatch(/below minimum/);
+  });
+
+  test('allows position size above $50 minimum', () => {
+    const config = makeConfig({ current_capital: 5000, risk_per_trade: 0.02 });
+    const signal = makeSignal({
+      tradeLevels: { ...makeSignal().tradeLevels, entry: 50, stopLoss: 48 }
+    });
+    const result = calculatePositionSize(config, signal);
+
+    // riskAmount = 5000 * 0.02 = 100, distance = 2, qty = 50, size = $2500
+    expect(result.positionSizeUsd).toBeGreaterThanOrEqual(50);
+    expect(result.skipped).toBeUndefined();
   });
 });
 
@@ -408,8 +417,8 @@ describe('resolveCurrentPrice', () => {
 describe('DEFAULT_CONFIG', () => {
   test('has correct default values', () => {
     expect(DEFAULT_CONFIG.initial_capital).toBe(10000);
-    expect(DEFAULT_CONFIG.risk_per_trade).toBe(0.01);
-    expect(DEFAULT_CONFIG.max_open_positions).toBe(3);
+    expect(DEFAULT_CONFIG.risk_per_trade).toBe(0.02);
+    expect(DEFAULT_CONFIG.max_open_positions).toBe(5);
     expect(DEFAULT_CONFIG.max_daily_loss_percent).toBe(0.05);
     expect(DEFAULT_CONFIG.cooldown_minutes).toBe(30);
     expect(DEFAULT_CONFIG.min_confluence).toBe(3);

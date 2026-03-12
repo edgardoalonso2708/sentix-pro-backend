@@ -13,7 +13,7 @@ const { SilentTelegramBot, setupTelegramCommands, setupAutoTuneCommands } = requ
 const { generateSignalWithRealData, generateMultiTimeframeSignal } = require('../technicalAnalysis');
 const { fetchDerivativesData, fetchOrderBookDepth } = require('../binanceAPI');
 const { evaluateAndExecute, getPositionHeatMap } = require('../paperTrading');
-const { processSignals } = require('../orderManager');
+const { processSignals, expireOrders } = require('../orderManager');
 const { createAdapter } = require('../execution');
 const { logger } = require('../logger');
 const { classifyAxiosError, Provider } = require('../errors');
@@ -887,6 +887,18 @@ cron.schedule('0 */6 * * *', async () => {
     await checkPostApplyPerformance(supabase, bot);
   } catch (err) {
     logger.debug('Post-apply/cleanup check error', { error: err.message });
+  }
+});
+
+// Cron: expire GTD orders every minute
+cron.schedule('* * * * *', async () => {
+  try {
+    const { expired } = await expireOrders(supabase);
+    if (expired > 0) {
+      logger.info('Expired GTD orders', { count: expired });
+    }
+  } catch (err) {
+    logger.error('expireOrders cron error', { error: err.message });
   }
 });
 

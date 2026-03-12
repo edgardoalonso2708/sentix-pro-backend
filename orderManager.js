@@ -299,8 +299,19 @@ async function validateOrder(supabase, userId, order, config = null) {
       return { valid: false, reason: portfolioCheck.reason, order, checks };
     }
 
-    // ── CHECK 4: Position size vs capital ──
+    // ── CHECK 4: Position size limits (min $50, max % of capital) ──
+    const MIN_POSITION_USD = 50;
     if (order.position_size_usd) {
+      // Minimum check
+      if (order.position_size_usd < MIN_POSITION_USD) {
+        const reason = `Position size $${order.position_size_usd} below minimum $${MIN_POSITION_USD}`;
+        checks.push({ name: 'position_size_min', passed: false, detail: reason });
+        await rejectOrder(supabase, order.id, reason);
+        await logExecution(supabase, order.id, EVENT_TYPE.RISK_CHECK_FAIL, { checks });
+        return { valid: false, reason, order, checks };
+      }
+
+      // Maximum check
       const maxPct = config.max_position_percent || DEFAULT_CONFIG.max_position_percent;
       const maxPosition = config.current_capital * maxPct;
       const sizeOk = order.position_size_usd <= maxPosition;
@@ -731,8 +742,8 @@ async function processSignals(supabase, userId, signals, marketData, executionAd
       }
 
       const positionSize = calculatePositionSize(config, signal, sizingOptions);
-      if (positionSize.positionSizeUsd <= 0) {
-        result.skipped.push({ asset: signal.asset, reason: 'Position size too small' });
+      if (positionSize.positionSizeUsd <= 0 || positionSize.skipped) {
+        result.skipped.push({ asset: signal.asset, reason: positionSize.reason || 'Position size too small' });
         continue;
       }
 
