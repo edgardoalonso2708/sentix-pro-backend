@@ -20,6 +20,8 @@ const { SCHEDULE_CONFIG } = require('../strategyConfig');
 const { MSG, sendToParent, installWorkerIPC } = require('../shared/ipc');
 const { LRUCache } = require('../shared/lruCache');
 const { metrics } = require('../shared/metrics');
+const { wrapWithCircuitBreaker, setAlertCallback, getAllBreakerStatus } = require('../circuitBreaker');
+const { initConfigManager } = require('../configManager');
 const { recordSignalOutcome, checkPendingOutcomes } = require('../signalAccuracy');
 const {
   runAutoTune, getActiveConfig, isAutoTuneRunning, getApprovalMode,
@@ -51,19 +53,30 @@ let cachedSignals = [];
 let isProcessingAlerts = false;
 
 // ─── PRICE FRESHNESS TRACKING ────────────────────────────────────────────
+const { getConfigSync } = require('../configManager');
 let lastMarketDataReceived = 0;  // timestamp (ms)
 let stalePriceAlertSent = false;
-const STALE_WARN_MS   = 5 * 60 * 1000;   // 5 min → warn
-const STALE_PAUSE_MS  = 30 * 60 * 1000;  // 30 min → pause signals
+
+// Defaults (overridable via system_config 'alert_thresholds')
+const ALERT_DEFAULTS = {
+  staleWarnMs: 5 * 60 * 1000,       // 5 min → warn
+  stalePauseMs: 30 * 60 * 1000,     // 30 min → pause signals
+  anomalyCooldownMs: 30 * 60 * 1000 // 30 min cooldown per anomaly
+};
+
+function getAlertThresholds() {
+  return getConfigSync('alert_thresholds', ALERT_DEFAULTS);
+}
 
 function checkPriceFreshness() {
   if (!lastMarketDataReceived) return { fresh: false, staleMs: Infinity, level: 'no_data' };
   const staleMs = Date.now() - lastMarketDataReceived;
+  const thresholds = getAlertThresholds();
 
-  if (staleMs > STALE_PAUSE_MS) {
+  if (staleMs > thresholds.stalePauseMs) {
     return { fresh: false, staleMs, level: 'critical' };
   }
-  if (staleMs > STALE_WARN_MS) {
+  if (staleMs > thresholds.staleWarnMs) {
     return { fresh: true, staleMs, level: 'warning' };
   }
   return { fresh: true, staleMs, level: 'ok' };
@@ -118,8 +131,8 @@ async function generateSignals() {
       let orderBookData = null;
       try {
         [derivativesData, orderBookData] = await Promise.all([
-          fetchDerivativesData(assetId).catch(() => null),
-          fetchOrderBookDepth(assetId).catch(() => null)
+          wrapWithCircuitBreaker(Provider.BINANCE, () => fetchDerivativesData(assetId), null),
+          wrapWithCircuitBreaker(Provider.BINANCE, () => fetchOrderBookDepth(assetId), null)
         ]);
       } catch (e) {
         logger.debug('Derivatives/OrderBook unavailable', { asset: assetId });
@@ -263,9 +276,11 @@ async function generateSignals() {
   await persistSignals(cachedSignals);
 
   // Record signal outcomes for accuracy tracking (non-blocking)
+  // Include current market regime for regime × confluence analysis (#10)
+  const currentRegime = getRegime('bitcoin')?.regime || cachedMarketData?._regime || 'unknown';
   for (const s of cachedSignals) {
     if (s.action === 'HOLD') continue;
-    recordSignalOutcome(supabase, s).catch(() => {});
+    recordSignalOutcome(supabase, s, currentRegime).catch(() => {});
   }
 
   // Send signals to orchestrator → api.js (for SSE broadcast)
@@ -668,9 +683,8 @@ async function processAlerts() {
 // Checks open positions for risk indicators and sends Telegram alerts
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Throttle anomaly alerts: don't spam the same anomaly within 30 minutes
+// Throttle anomaly alerts: cooldown per anomaly type (configurable)
 const anomalyAlertCache = new LRUCache(100);
-const ANOMALY_COOLDOWN_MS = 30 * 60 * 1000;
 
 /**
  * Check all open positions for anomalies and send Telegram alerts for critical ones.
@@ -692,7 +706,7 @@ async function checkPositionAnomalies(supabase, marketData) {
   for (const anomaly of highSeverity) {
     const cacheKey = `${anomaly.type}:${anomaly.asset}`;
     const lastSent = anomalyAlertCache.get(cacheKey);
-    if (lastSent && (now - lastSent) < ANOMALY_COOLDOWN_MS) continue;
+    if (lastSent && (now - lastSent) < getAlertThresholds().anomalyCooldownMs) continue;
 
     newAlerts.push(anomaly);
     anomalyAlertCache.set(cacheKey, now);
@@ -854,6 +868,19 @@ _metricsTimer.unref();
 // Initial startup
 (async () => {
   logger.info('Alerts worker started', { pid: process.pid });
+
+  // Initialize config manager (loads system_config from Supabase)
+  await initConfigManager(supabase).catch(() => {});
+
+  // Register circuit breaker alert callback → Telegram notifications
+  setAlertCallback(async (provider, info) => {
+    if (!bot.isActive()) return;
+    const msg = `⚡ *CIRCUIT BREAKER* — ${provider}\n` +
+      `State: ${info.state} (${info.failureCount} failures)\n` +
+      `Calls paused for ${Math.round(info.resetTimeoutMs / 1000)}s.\n` +
+      `Total trips: ${info.totalTrips}`;
+    await bot.broadcastMessage(msg).catch(() => {});
+  });
 
   // Load persisted signals so we have data immediately
   const persisted = await loadPersistedSignals();

@@ -67,7 +67,9 @@ const {
 } = require('./autoTuner');
 const { DEFAULT_STRATEGY_CONFIG, SCHEDULE_CONFIG } = require('./strategyConfig');
 const { enrichSignalWithTTL } = require('./scheduleUtils');
-const { getAccuracyMetrics } = require('./signalAccuracy');
+const { getAccuracyMetrics, getOutcomesByRegimeConfluence } = require('./signalAccuracy');
+const { initConfigManager, getConfig, setConfig, getAllConfigs } = require('./configManager');
+const { getAllBreakerStatus, getBreaker } = require('./circuitBreaker');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -137,6 +139,11 @@ const RESEND_API_KEY = process.env.RESEND_API_KEY;
 const ALERT_EMAIL = process.env.ALERT_EMAIL || 'edgardoalonso2708@gmail.com';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// Initialize config manager (preloads system_config table into memory)
+initConfigManager(supabase).catch(err =>
+  logger.warn('Config manager preload failed, using defaults', { error: err.message })
+);
 
 // ─── DATABASE INITIALIZATION ──────────────────────────────────────────────
 // Ensure wallets and portfolios tables exist with correct schema
@@ -359,6 +366,69 @@ app.get('/api/market', (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// SYSTEM CONFIGURATION ROUTES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// List all config keys
+app.get('/api/config', async (req, res) => {
+  try {
+    const { configs, error } = await getAllConfigs();
+    if (error) return res.status(500).json({ error: error.message || 'Failed to list configs' });
+    res.json({ configs });
+  } catch (error) {
+    logger.error('Config list failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get single config value
+app.get('/api/config/:key', async (req, res) => {
+  try {
+    const key = sanitizeInput(req.params.key);
+    const value = await getConfig(key);
+    if (value === null) return res.status(404).json({ error: 'Config key not found' });
+    res.json({ key, value });
+  } catch (error) {
+    logger.error('Config get failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Update config value
+app.put('/api/config/:key', async (req, res) => {
+  try {
+    const key = sanitizeInput(req.params.key);
+    const { value, description } = req.body;
+    if (value === undefined) return res.status(400).json({ error: 'Missing value in body' });
+    const { error } = await setConfig(key, value, description || null);
+    if (error) return res.status(500).json({ error: error.message || 'Failed to set config' });
+    res.json({ key, value, updated: true });
+  } catch (error) {
+    logger.error('Config set failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CIRCUIT BREAKER HEALTH ROUTES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+app.get('/api/health/circuit-breakers', (req, res) => {
+  res.json({ breakers: getAllBreakerStatus() });
+});
+
+app.post('/api/health/circuit-breakers/:provider/reset', (req, res) => {
+  try {
+    const provider = sanitizeInput(req.params.provider);
+    const breaker = getBreaker(provider);
+    breaker.reset();
+    res.json({ provider, state: breaker.getStatus().state, reset: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // MARKET REGIME ROUTES
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -425,6 +495,22 @@ app.get('/api/signals/accuracy', async (req, res) => {
   } catch (err) {
     logger.warn('Signal accuracy endpoint failed', { error: err.message });
     res.status(500).json({ error: 'Failed to fetch accuracy metrics' });
+  }
+});
+
+// Regime × Confluence outcome matrix
+app.get('/api/signals/accuracy/regime-confluence', async (req, res) => {
+  try {
+    const days = Math.min(Math.max(parseInt(req.query.days) || 60, 1), 365);
+    const asset = req.query.asset ? sanitizeInput(req.query.asset) : null;
+    const result = await getOutcomesByRegimeConfluence(supabase, { days, asset });
+    if (result.error) {
+      return res.status(500).json({ error: result.error });
+    }
+    res.json(result);
+  } catch (err) {
+    logger.warn('Regime-confluence accuracy endpoint failed', { error: err.message });
+    res.status(500).json({ error: 'Failed to fetch regime-confluence data' });
   }
 });
 

@@ -588,7 +588,7 @@ async function checkDuplicateTrade(supabase, userId, asset) {
 // TRADE EXECUTION
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function openTrade(supabase, userId, signal, positionSize) {
+async function openTrade(supabase, userId, signal, positionSize, marketData = null) {
   try {
     const direction = signal.action === 'BUY' ? 'LONG' : 'SHORT';
 
@@ -616,6 +616,8 @@ async function openTrade(supabase, userId, signal, positionSize) {
       entry_confidence: signal.confidence,
       entry_raw_score: signal.rawScore,
       entry_confluence: confluenceCount,
+      entry_regime: marketData?._regime || null,
+      entry_confluence_level: signal.timeframes?.confluence || null,
       entry_reasons: signal.reasons,
       entry_at: new Date().toISOString(),
       position_size_usd: positionSize.positionSizeUsd,
@@ -956,14 +958,20 @@ async function monitorOpenPositions(supabase, userId, marketData, config = null)
 // Identifies positions requiring attention: SL proximity, give-back, time risk
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// Anomaly thresholds
-const HEAT_THRESHOLDS = {
+// Anomaly thresholds (defaults — overridable via system_config 'heat_thresholds')
+const { getConfigSync } = require('./configManager');
+const HEAT_THRESHOLDS_DEFAULTS = {
   slProximityPct: 2.0,          // Alert when price is within 2% of SL
   winnerGiveBackPct: 50,        // Alert when winner has given back 50%+ of peak unrealized
   holdingTimeWarnPct: 70,       // Alert at 70% of max_holding_hours
   drawdownFromPeakPct: 30,      // Alert when position drawdown from peak > 30%
   largeUnrealizedLossPct: -5.0, // Alert when unrealized loss exceeds 5%
 };
+
+/** @returns {typeof HEAT_THRESHOLDS_DEFAULTS} */
+function getHeatThresholds() {
+  return getConfigSync('heat_thresholds', HEAT_THRESHOLDS_DEFAULTS);
+}
 
 /**
  * Analyze all open positions and produce a heat map with risk indicators.
@@ -1026,7 +1034,7 @@ async function getPositionHeatMap(supabase, userId, marketData, config = null) {
           slDistancePct = ((stopLoss - currentPrice) / currentPrice) * 100;
         }
 
-        if (slDistancePct <= HEAT_THRESHOLDS.slProximityPct && slDistancePct > 0) {
+        if (slDistancePct <= getHeatThresholds().slProximityPct && slDistancePct > 0) {
           heat = 'hot';
           const msg = `⚠️ SL proximity: ${pos.asset} is ${slDistancePct.toFixed(1)}% from stop-loss`;
           alerts.push(msg);
@@ -1045,7 +1053,7 @@ async function getPositionHeatMap(supabase, userId, marketData, config = null) {
           const msg = `🔄 Winner → Loser: ${pos.asset} was +$${maxFavorable.toFixed(2)}, now ${unrealizedPnl >= 0 ? '+' : ''}$${unrealizedPnl.toFixed(2)}`;
           alerts.push(msg);
           anomalies.push({ type: 'winner_turned_loser', asset: pos.asset, severity: 'high', message: msg, peakPnl: maxFavorable, currentPnl: unrealizedPnl });
-        } else if (giveBackPct >= HEAT_THRESHOLDS.winnerGiveBackPct) {
+        } else if (giveBackPct >= getHeatThresholds().winnerGiveBackPct) {
           // Major give-back
           if (heat !== 'hot') heat = 'warm';
           const msg = `📉 Give-back: ${pos.asset} gave back ${giveBackPct.toFixed(0)}% of peak gain`;
@@ -1057,7 +1065,7 @@ async function getPositionHeatMap(supabase, userId, marketData, config = null) {
       // ─── 3. Holding time warning ──────────────────────────────────────
       if (maxHoldingHours > 0) {
         const holdingPct = (holdingHours / maxHoldingHours) * 100;
-        if (holdingPct >= HEAT_THRESHOLDS.holdingTimeWarnPct) {
+        if (holdingPct >= getHeatThresholds().holdingTimeWarnPct) {
           if (heat !== 'hot') heat = 'warm';
           const remainingHours = Math.max(0, maxHoldingHours - holdingHours);
           const msg = `⏰ Holding time: ${pos.asset} at ${holdingPct.toFixed(0)}% of max (${remainingHours.toFixed(1)}h remaining)`;
@@ -1067,7 +1075,7 @@ async function getPositionHeatMap(supabase, userId, marketData, config = null) {
       }
 
       // ─── 4. Large unrealized loss ─────────────────────────────────────
-      if (unrealizedPnlPct <= HEAT_THRESHOLDS.largeUnrealizedLossPct) {
+      if (unrealizedPnlPct <= getHeatThresholds().largeUnrealizedLossPct) {
         heat = 'hot';
         const msg = `💔 Large loss: ${pos.asset} at ${unrealizedPnlPct.toFixed(1)}% unrealized`;
         alerts.push(msg);
@@ -1077,7 +1085,7 @@ async function getPositionHeatMap(supabase, userId, marketData, config = null) {
       // ─── 5. Drawdown from peak (position-level) ──────────────────────
       if (maxFavorable > 0 && unrealizedPnl >= 0) {
         const drawdownFromPeak = ((maxFavorable - unrealizedPnl) / maxFavorable) * 100;
-        if (drawdownFromPeak >= HEAT_THRESHOLDS.drawdownFromPeakPct) {
+        if (drawdownFromPeak >= getHeatThresholds().drawdownFromPeakPct) {
           if (heat !== 'hot') heat = 'warm';
           const msg = `📊 Peak drawdown: ${pos.asset} down ${drawdownFromPeak.toFixed(0)}% from peak gain`;
           alerts.push(msg);
@@ -1961,8 +1969,8 @@ async function evaluateAndExecute(supabase, userId, signals, marketData) {
         continue;
       }
 
-      // Open the trade
-      const { trade, error: tradeError } = await openTrade(supabase, userId, signal, positionSize);
+      // Open the trade (pass marketData for regime/confluence tracking)
+      const { trade, error: tradeError } = await openTrade(supabase, userId, signal, positionSize, marketData);
       if (trade) {
         result.newTrades.push(trade);
         // Refresh config for next iteration (capital changed)

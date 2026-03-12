@@ -281,7 +281,90 @@ async function getEnhancedContext(supabase, asset) {
     }
   } catch (_) { /* non-critical */ }
 
+  // Last 5 closed trades (with regime/confluence for pattern analysis)
+  try {
+    const { data: recentTrades } = await supabase
+      .from('paper_trades')
+      .select('asset, direction, realized_pnl, realized_pnl_percent, entry_regime, entry_confluence_level, entry_reasons, exit_reason, entry_at, exit_at, entry_confidence')
+      .eq('status', 'closed')
+      .order('exit_at', { ascending: false })
+      .limit(5);
+
+    if (recentTrades && recentTrades.length > 0) {
+      context.recentClosedTrades = recentTrades.map(t => ({
+        asset: t.asset,
+        direction: t.direction,
+        pnl: parseFloat(t.realized_pnl) || 0,
+        pnlPct: parseFloat(t.realized_pnl_percent) || 0,
+        regime: t.entry_regime || 'unknown',
+        confluence: t.entry_confluence_level || 'unknown',
+        exitReason: t.exit_reason || 'unknown',
+        confidence: t.entry_confidence || 0,
+        holdingHours: (t.entry_at && t.exit_at)
+          ? Math.round((new Date(t.exit_at) - new Date(t.entry_at)) / 3600000)
+          : null,
+      }));
+    }
+  } catch (_) { /* non-critical */ }
+
+  // Parameter conflict detection
+  try {
+    const { config } = await getActiveConfig(supabase);
+    if (config) {
+      context.parameterConflicts = detectParameterConflicts(config);
+    }
+  } catch (_) { /* non-critical */ }
+
   return context;
+}
+
+/**
+ * Detect contradictions or suboptimal combinations in strategy parameters.
+ * Returns an array of human-readable conflict descriptions.
+ * @param {Object} config - Strategy configuration object
+ * @returns {string[]}
+ */
+function detectParameterConflicts(config) {
+  const conflicts = [];
+  if (!config) return conflicts;
+
+  // 1. Aggressive RSI oversold + very conservative position sizing
+  if ((config.rsiOversold >= 35 || config.rsiOversoldThreshold >= 35) &&
+      config.risk_per_trade !== undefined && config.risk_per_trade <= 0.005) {
+    conflicts.push('Aggressive RSI oversold threshold (≥35) with very conservative position sizing (≤0.5%). Signals fire often but positions are tiny.');
+  }
+
+  // 2. Very tight stops + long holding period
+  if (config.atrStopMult !== undefined && config.atrStopMult <= 1.0 &&
+      config.max_holding_hours !== undefined && config.max_holding_hours >= 168) {
+    conflicts.push('Tight stop-loss (ATR ×≤1.0) with long max holding period (7+ days). Most trades will stop out before reaching potential.');
+  }
+
+  // 3. High confluence requirement + low buy threshold
+  if (config.min_confluence !== undefined && config.min_confluence >= 4 &&
+      config.buyThreshold !== undefined && config.buyThreshold <= 15) {
+    conflicts.push('High confluence requirement (≥4) with low buy threshold (≤15). Very few signals pass both filters.');
+  }
+
+  // 4. Lenient conflicting multiplier + aggressive strong confluence boost
+  if (config.conflictingMult !== undefined && config.conflictingMult > 0.85 &&
+      config.strongConfluenceMult !== undefined && config.strongConfluenceMult > 1.3) {
+    conflicts.push('Conflicting signal multiplier is lenient (>0.85) but strong confluence mult is aggressive (>1.3). Mixed signals get through too easily.');
+  }
+
+  // 5. Wide stop-loss + small position = wasted capital
+  if (config.atrStopMult !== undefined && config.atrStopMult >= 3.0 &&
+      config.max_position_percent !== undefined && config.max_position_percent <= 10) {
+    conflicts.push('Wide stop-loss (ATR ×≥3.0) with small max position (≤10%). Capital risk per trade is extremely low, limiting potential returns.');
+  }
+
+  // 6. Very short max holding + trend-following weights dominate
+  if (config.max_holding_hours !== undefined && config.max_holding_hours <= 12 &&
+      config.trendWeight !== undefined && config.trendWeight >= 25) {
+    conflicts.push('Short max holding (≤12h) with heavy trend weight (≥25). Trend signals need time to develop; tight holding limits gains.');
+  }
+
+  return conflicts;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -363,6 +446,21 @@ function buildAIPrompt(proposals, context) {
     historySection = `\nRECENT AUTO-TUNE HISTORY:\n${lines}`;
   }
 
+  // Last 5 closed trades with regime/confluence context
+  let tradesSection = '';
+  if (context.recentClosedTrades && context.recentClosedTrades.length > 0) {
+    const lines = context.recentClosedTrades.map(t =>
+      `  ${t.asset} ${t.direction}: ${t.pnl >= 0 ? '+' : ''}$${t.pnl.toFixed(2)} (${t.pnlPct.toFixed(2)}%) | regime: ${t.regime} | confluence: ${t.confluence} | exit: ${t.exitReason} | ${t.holdingHours !== null ? t.holdingHours + 'h' : 'N/A'}`
+    ).join('\n');
+    tradesSection = `\nLAST 5 CLOSED TRADES:\n${lines}`;
+  }
+
+  // Parameter conflict warnings
+  let conflictsSection = '';
+  if (context.parameterConflicts && context.parameterConflicts.length > 0) {
+    conflictsSection = `\nPARAMETER CONFLICTS DETECTED:\n${context.parameterConflicts.map(c => `- ${c}`).join('\n')}`;
+  }
+
   return `You are a quantitative trading strategy advisor for Sentix Pro, a crypto/metals automated trading system.
 
 CURRENT CONTEXT:
@@ -371,7 +469,7 @@ CURRENT CONTEXT:
 - Asset optimized: ${context.asset}
 - Current active config source: ${context.configSource}
 - Recent trade count: ${context.recentTradeCount || 'N/A'}
-- Approval mode: ${APPROVAL_MODE}${paperSection}${signalSection}${historySection}
+- Approval mode: ${APPROVAL_MODE}${paperSection}${signalSection}${historySection}${tradesSection}${conflictsSection}
 
 PROPOSED PARAMETER CHANGES (all passed statistical safety checks):
 ${paramLines}
@@ -384,6 +482,8 @@ Evaluate whether these changes should be applied to a live (paper) trading syste
 4. Could applying all changes at once create unexpected interactions?
 5. Does the signal accuracy data suggest the current strategy needs adjustment?
 6. Looking at recent tune history, is there a pattern of oscillating params?
+7. Review the last 5 trades — are losses concentrated in specific regimes or confluence levels?
+8. Are there parameter conflicts that should be resolved before applying new changes?
 
 Respond with EXACTLY this format:
 DECISION: APPLY | BLEND | REJECT
@@ -1090,4 +1190,5 @@ module.exports = {
   aiReviewProposals,
   parseAIDecision,
   buildAIPrompt,
+  detectParameterConflicts,
 };

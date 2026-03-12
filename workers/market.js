@@ -16,9 +16,14 @@ const { logger } = require('../logger');
 const { classifyAxiosError, Provider } = require('../errors');
 const { MSG, sendToParent, installWorkerIPC } = require('../shared/ipc');
 const { metrics } = require('../shared/metrics');
+const { wrapWithCircuitBreaker } = require('../circuitBreaker');
+const { initConfigManager } = require('../configManager');
 
 // ─── SUPABASE CLIENT ──────────────────────────────────────────────────────
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY);
+
+// Initialize config manager (non-blocking)
+initConfigManager(supabase).catch(() => {});
 
 // ─── CACHED STATE (local to this worker) ──────────────────────────────────
 let cachedMarketData = null;
@@ -96,38 +101,40 @@ async function fetchWithRetry(fn, retries = 3, baseDelay = 2000) {
 async function fetchCryptoPrices() {
   const _t0 = Date.now();
   try {
-    const cryptoData = await fetchWithRetry(async () => {
-      const ids = Object.keys(CRYPTO_ASSETS).join(',');
-      const response = await apiClient.get(
-        'https://api.coingecko.com/api/v3/simple/price',
-        {
-          params: {
-            ids,
-            vs_currencies: 'usd',
-            include_24hr_change: true,
-            include_24hr_vol: true,
-            include_market_cap: true
-          },
-          timeout: 15000
-        }
-      );
-      const result = {};
-      Object.entries(response.data).forEach(([id, data]) => {
-        const symbol = CRYPTO_ASSETS[id];
-        if (symbol) {
-          result[id] = {
-            symbol: symbol.toUpperCase(),
-            price: data.usd,
-            change24h: data.usd_24h_change || 0,
-            volume24h: data.usd_24h_vol || 0,
-            marketCap: data.usd_market_cap || 0
-          };
-        }
-      });
-      return result;
-    }, 2, 3000);
+    const cryptoData = await wrapWithCircuitBreaker(Provider.COINGECKO, () =>
+      fetchWithRetry(async () => {
+        const ids = Object.keys(CRYPTO_ASSETS).join(',');
+        const response = await apiClient.get(
+          'https://api.coingecko.com/api/v3/simple/price',
+          {
+            params: {
+              ids,
+              vs_currencies: 'usd',
+              include_24hr_change: true,
+              include_24hr_vol: true,
+              include_market_cap: true
+            },
+            timeout: 15000
+          }
+        );
+        const result = {};
+        Object.entries(response.data).forEach(([id, data]) => {
+          const symbol = CRYPTO_ASSETS[id];
+          if (symbol) {
+            result[id] = {
+              symbol: symbol.toUpperCase(),
+              price: data.usd,
+              change24h: data.usd_24h_change || 0,
+              volume24h: data.usd_24h_vol || 0,
+              marketCap: data.usd_market_cap || 0
+            };
+          }
+        });
+        return result;
+      }, 2, 3000)
+    , null);
 
-    if (Object.keys(cryptoData).length > 0) {
+    if (cryptoData && Object.keys(cryptoData).length > 0) {
       lastSuccessfulCrypto = cryptoData;
       metrics.counter('provider.coingecko.success');
       metrics.histogram('provider.coingecko.latency', Date.now() - _t0);

@@ -27,7 +27,7 @@ const BATCH_LIMIT = 50;
 // RECORD — insert a new signal outcome row (BUY/SELL only)
 // =============================================================================
 
-async function recordSignalOutcome(supabase, signal) {
+async function recordSignalOutcome(supabase, signal, regime = null) {
   try {
     if (!signal || signal.action === 'HOLD') return;
     if (!signal.asset || !signal.price) return;
@@ -44,6 +44,7 @@ async function recordSignalOutcome(supabase, signal) {
       raw_score: signal.rawScore || 0,
       confidence: signal.confidence || 0,
       confluence,
+      regime,
       price_at_signal: signal.price,
       signal_generated_at: signal.timestamp || new Date().toISOString()
     });
@@ -288,8 +289,87 @@ function computeHitRates(rows) {
   };
 }
 
+// =============================================================================
+// REGIME × CONFLUENCE OUTCOME MATRIX
+// Groups signal hit rates by market regime and confluence level
+// =============================================================================
+
+async function getOutcomesByRegimeConfluence(supabase, { days = 60, asset = null } = {}) {
+  try {
+    const since = new Date(Date.now() - days * 86400000).toISOString();
+    let query = supabase
+      .from('signal_outcomes')
+      .select('regime, confluence, direction_correct_1h, direction_correct_4h, direction_correct_24h, change_pct_1h, change_pct_4h, change_pct_24h')
+      .gte('signal_generated_at', since)
+      .not('price_1h', 'is', null)
+      .not('regime', 'is', null);
+
+    if (asset) query = query.eq('asset', asset);
+    const { data, error } = await query;
+
+    if (error) {
+      if (error.code === '42P01') return { matrix: {}, totalRows: 0 };
+      return { matrix: {}, totalRows: 0, error: error.message };
+    }
+    if (!data || data.length === 0) return { matrix: {}, totalRows: 0 };
+
+    // Group by regime × confluence
+    const groups = {};
+    for (const row of data) {
+      const regime = row.regime || 'unknown';
+      const confl = row.confluence || 'unknown';
+      const key = `${regime}|${confl}`;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(row);
+    }
+
+    // Compute hit rates for each cell
+    const matrix = {};
+    for (const [key, rows] of Object.entries(groups)) {
+      const [regime, confl] = key.split('|');
+      if (!matrix[regime]) matrix[regime] = {};
+
+      const total = rows.length;
+      let hits1h = 0, hits4h = 0, hits24h = 0, count4h = 0, count24h = 0;
+      let sumChange1h = 0, sumChange4h = 0, sumChange24h = 0;
+
+      for (const r of rows) {
+        if (r.direction_correct_1h) hits1h++;
+        sumChange1h += Math.abs(parseFloat(r.change_pct_1h) || 0);
+
+        if (r.direction_correct_4h !== null && r.direction_correct_4h !== undefined) {
+          count4h++;
+          if (r.direction_correct_4h) hits4h++;
+          sumChange4h += Math.abs(parseFloat(r.change_pct_4h) || 0);
+        }
+        if (r.direction_correct_24h !== null && r.direction_correct_24h !== undefined) {
+          count24h++;
+          if (r.direction_correct_24h) hits24h++;
+          sumChange24h += Math.abs(parseFloat(r.change_pct_24h) || 0);
+        }
+      }
+
+      matrix[regime][confl] = {
+        total,
+        hitRate1h: total > 0 ? Math.round((hits1h / total) * 10000) / 100 : null,
+        hitRate4h: count4h > 0 ? Math.round((hits4h / count4h) * 10000) / 100 : null,
+        hitRate24h: count24h > 0 ? Math.round((hits24h / count24h) * 10000) / 100 : null,
+        avgChange1h: total > 0 ? Math.round((sumChange1h / total) * 100) / 100 : null,
+        avgChange4h: count4h > 0 ? Math.round((sumChange4h / count4h) * 100) / 100 : null,
+        avgChange24h: count24h > 0 ? Math.round((sumChange24h / count24h) * 100) / 100 : null,
+      };
+    }
+
+    return { matrix, totalRows: data.length };
+  } catch (err) {
+    logger.warn('getOutcomesByRegimeConfluence failed', { error: err.message });
+    return { matrix: {}, totalRows: 0, error: err.message };
+  }
+}
+
 module.exports = {
   recordSignalOutcome,
   checkPendingOutcomes,
-  getAccuracyMetrics
+  getAccuracyMetrics,
+  getOutcomesByRegimeConfluence
 };
