@@ -162,11 +162,29 @@ async function fetchCryptoPrices() {
     logger.warn('Binance ticker fallback failed', { error: error.message });
   }
 
+  // Third fallback: CryptoCompare (free, reliable, different infrastructure)
+  try {
+    logger.info('Falling back to CryptoCompare API');
+    const _t2 = Date.now();
+    const cryptoData = await fetchFromCryptoCompare();
+    if (Object.keys(cryptoData).length > 0) {
+      lastSuccessfulCrypto = cryptoData;
+      metrics.counter('provider.cryptocompare.success');
+      metrics.histogram('provider.cryptocompare.latency', Date.now() - _t2);
+      logger.info('CryptoCompare fallback OK', { assets: Object.keys(cryptoData).length });
+      return cryptoData;
+    }
+  } catch (error) {
+    metrics.counter('provider.cryptocompare.error');
+    logger.warn('CryptoCompare fallback failed', { error: error.message });
+  }
+
   if (Object.keys(lastSuccessfulCrypto).length > 0) {
     logger.warn('Using cached crypto data', { assets: Object.keys(lastSuccessfulCrypto).length });
     return lastSuccessfulCrypto;
   }
 
+  logger.error('ALL crypto price providers failed — no data available');
   return {};
 }
 
@@ -197,6 +215,37 @@ async function fetchFromBinanceTickers() {
         change24h: Math.round(change24h * 100) / 100,
         volume24h: parseFloat(ticker.quoteVolume) || 0,
         marketCap: 0 // Binance doesn't provide market cap
+      };
+    }
+  }
+  return result;
+}
+
+// CryptoCompare fallback — free tier, no API key required, very reliable
+const CRYPTOCOMPARE_SYMBOL_MAP = {
+  bitcoin: 'BTC', ethereum: 'ETH', binancecoin: 'BNB',
+  solana: 'SOL', cardano: 'ADA', ripple: 'XRP',
+  polkadot: 'DOT', dogecoin: 'DOGE', 'avalanche-2': 'AVAX',
+  chainlink: 'LINK'
+};
+
+async function fetchFromCryptoCompare() {
+  const symbols = Object.values(CRYPTOCOMPARE_SYMBOL_MAP).join(',');
+  const response = await apiClient.get(
+    'https://min-api.cryptocompare.com/data/pricemultifull',
+    { params: { fsyms: symbols, tsyms: 'USD' }, timeout: 10000 }
+  );
+  const raw = response.data?.RAW || {};
+  const result = {};
+  for (const [cgKey, ccSymbol] of Object.entries(CRYPTOCOMPARE_SYMBOL_MAP)) {
+    const usd = raw[ccSymbol]?.USD;
+    if (usd && CRYPTO_ASSETS[cgKey]) {
+      result[cgKey] = {
+        symbol: CRYPTO_ASSETS[cgKey].toUpperCase(),
+        price: Math.round((usd.PRICE || 0) * 100) / 100,
+        change24h: Math.round((usd.CHANGEPCT24HOUR || 0) * 100) / 100,
+        volume24h: usd.TOTALVOLUME24HTO || 0,
+        marketCap: usd.MKTCAP || 0
       };
     }
   }
