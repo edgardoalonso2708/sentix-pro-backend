@@ -86,7 +86,8 @@ describe('Adapter Registry', () => {
   test('getAvailableAdapters returns list', () => {
     const adapters = getAvailableAdapters();
     expect(adapters).toContain('paper');
-    expect(adapters.length).toBe(1);
+    expect(adapters).toContain('bybit');
+    expect(adapters.length).toBe(2);
   });
 });
 

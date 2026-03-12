@@ -917,10 +917,34 @@ _metricsTimer.unref();
 
   // Initialize execution adapter for order-based trading
   try {
-    _executionAdapter = createAdapter('paper', { supabase });
-    logger.info('Paper execution adapter initialized');
+    const adapterType = process.env.EXECUTION_ADAPTER || 'paper';
+    if (adapterType === 'bybit') {
+      _executionAdapter = createAdapter('bybit', {
+        apiKey: process.env.BYBIT_API_KEY,
+        apiSecret: process.env.BYBIT_API_SECRET,
+        testnet: process.env.BYBIT_TESTNET !== 'false',
+        supabase
+      });
+      const health = await _executionAdapter.healthCheck();
+      logger.info('Bybit execution adapter initialized', { healthy: health.healthy, testnet: health.details?.testnet });
+    } else {
+      _executionAdapter = createAdapter('paper', { supabase });
+      logger.info('Paper execution adapter initialized');
+    }
   } catch (adapterErr) {
-    logger.warn('Failed to init execution adapter, falling back to legacy', { error: adapterErr.message });
+    logger.warn('Failed to init execution adapter, falling back to paper', { error: adapterErr.message });
+    _executionAdapter = createAdapter('paper', { supabase });
+  }
+
+  // Recover orders stuck in SUBMITTED status from previous crash
+  try {
+    const { recoverStuckOrders } = require('../orderManager');
+    const recovery = await recoverStuckOrders(supabase, _executionAdapter, cachedMarketData);
+    if (recovery.retried > 0 || recovery.rolledBack > 0 || recovery.synced > 0) {
+      logger.info('Order recovery on startup', recovery);
+    }
+  } catch (recErr) {
+    logger.warn('Order recovery failed on startup', { error: recErr.message });
   }
 
   // Register circuit breaker alert callback → Telegram notifications

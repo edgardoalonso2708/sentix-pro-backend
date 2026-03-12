@@ -151,7 +151,10 @@ function createMockSupabase(opts = {}) {
       return makeChain(opts.defaultData || null, opts.defaultError);
     }),
     _insertedData: insertedData,
-    _updatedData: updatedData
+    _updatedData: updatedData,
+    rpc: jest.fn().mockImplementation(() => {
+      return Promise.resolve({ data: { success: true }, error: null });
+    })
   };
 
   return sb;

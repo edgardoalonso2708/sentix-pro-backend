@@ -29,7 +29,8 @@ const Provider = Object.freeze({
   METALS: 'Metals',
   SUPABASE: 'Supabase',
   RESEND: 'Resend',
-  TELEGRAM: 'Telegram'
+  TELEGRAM: 'Telegram',
+  BYBIT: 'Bybit'
 });
 
 class ProviderError extends Error {

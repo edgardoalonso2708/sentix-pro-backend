@@ -17,6 +17,7 @@ const {
   DEFAULT_CONFIG
 } = require('./paperTrading');
 const { buildSizingOptions } = require('./kellySizing');
+const { transitionOrderStatus } = require('./lib/pgLock');
 
 // ─── ORDER STATUS CONSTANTS ─────────────────────────────────────────────────
 
@@ -58,7 +59,9 @@ const EVENT_TYPE = Object.freeze({
   TRADE_CLOSED:       'TRADE_CLOSED',
   RISK_CHECK_PASS:    'RISK_CHECK_PASS',
   RISK_CHECK_FAIL:    'RISK_CHECK_FAIL',
-  KILL_SWITCH:        'KILL_SWITCH'
+  KILL_SWITCH:        'KILL_SWITCH',
+  ORDER_RECOVERY_RETRY:    'ORDER_RECOVERY_RETRY',
+  ORDER_RECOVERY_ROLLBACK: 'ORDER_RECOVERY_ROLLBACK'
 });
 
 // ─── HELPERS ────────────────────────────────────────────────────────────────
@@ -330,14 +333,11 @@ async function validateOrder(supabase, userId, order, config = null) {
       }
     }
 
-    // ── All checks passed → VALIDATED ──
-    const { error: updateError } = await supabase
-      .from('orders')
-      .update({ status: ORDER_STATUS.VALIDATED, validated_at: new Date().toISOString() })
-      .eq('id', order.id);
+    // ── All checks passed → VALIDATED (atomic transition with advisory lock) ──
+    const txResult = await transitionOrderStatus(supabase, order.id, ORDER_STATUS.PENDING, ORDER_STATUS.VALIDATED);
 
-    if (updateError) {
-      return { valid: false, reason: `Failed to update order: ${updateError.message}`, order, checks };
+    if (!txResult.success) {
+      return { valid: false, reason: txResult.reason || 'State transition failed', order, checks };
     }
 
     order.status = ORDER_STATUS.VALIDATED;
@@ -376,11 +376,11 @@ async function submitOrder(supabase, userId, order, executionAdapter, marketData
       return { filledOrder: null, trade: null, error: { message: `Order not VALIDATED (current: ${order.status})` } };
     }
 
-    // Mark as SUBMITTED
-    await supabase
-      .from('orders')
-      .update({ status: ORDER_STATUS.SUBMITTED, submitted_at: new Date().toISOString() })
-      .eq('id', order.id);
+    // Mark as SUBMITTED (atomic transition with advisory lock)
+    const txSubmit = await transitionOrderStatus(supabase, order.id, ORDER_STATUS.VALIDATED, ORDER_STATUS.SUBMITTED);
+    if (!txSubmit.success) {
+      return { filledOrder: null, trade: null, error: { message: txSubmit.reason || 'Cannot transition to SUBMITTED' } };
+    }
 
     order.status = ORDER_STATUS.SUBMITTED;
     await logExecution(supabase, order.id, EVENT_TYPE.ORDER_SUBMITTED, {});
@@ -392,9 +392,7 @@ async function submitOrder(supabase, userId, order, executionAdapter, marketData
     } catch (adapterErr) {
       // Rollback: SUBMITTED → VALIDATED so order can be retried
       logger.error('Adapter execution failed, rolling back to VALIDATED', { orderId: order.id, error: adapterErr.message });
-      await supabase.from('orders')
-        .update({ status: ORDER_STATUS.VALIDATED, submitted_at: null })
-        .eq('id', order.id);
+      await transitionOrderStatus(supabase, order.id, ORDER_STATUS.SUBMITTED, ORDER_STATUS.VALIDATED);
       return { filledOrder: null, trade: null, error: { message: `Execution failed: ${adapterErr.message}` } };
     }
 
@@ -405,26 +403,23 @@ async function submitOrder(supabase, userId, order, executionAdapter, marketData
       return { filledOrder: order, trade: null, error: null };
     }
 
-    // ── Order filled ──
+    // ── Order filled (atomic transition with advisory lock) ──
     const now = new Date().toISOString();
-    const { error: fillError } = await supabase
-      .from('orders')
-      .update({
-        status: ORDER_STATUS.FILLED,
-        filled_quantity: fillResult.fillQuantity || order.quantity,
-        avg_fill_price: fillResult.fillPrice,
-        filled_at: now
-      })
-      .eq('id', order.id);
+    const txFill = await transitionOrderStatus(supabase, order.id, ORDER_STATUS.SUBMITTED, ORDER_STATUS.FILLED, {
+      filled_quantity: String(fillResult.fillQuantity || order.quantity),
+      avg_fill_price: String(fillResult.fillPrice),
+      exchange_order_id: fillResult.exchange_order_id || null,
+    });
 
-    if (fillError) {
-      logger.error('Failed to update filled order', { orderId: order.id, error: fillError.message });
+    if (!txFill.success) {
+      logger.error('Failed to transition order to FILLED', { orderId: order.id, reason: txFill.reason });
     }
 
     order.status = ORDER_STATUS.FILLED;
     order.avg_fill_price = fillResult.fillPrice;
     order.filled_quantity = fillResult.fillQuantity || order.quantity;
     order.filled_at = now;
+    order.exchange_order_id = fillResult.exchange_order_id || null;
 
     await logExecution(supabase, order.id, EVENT_TYPE.ORDER_FILLED, {
       fillPrice: fillResult.fillPrice,
@@ -486,17 +481,15 @@ async function cancelOrder(supabase, userId, orderId) {
       return { order: null, error: { message: `Cannot cancel order in ${order.status} status` } };
     }
 
-    const { error: updateError } = await supabase
-      .from('orders')
-      .update({ status: ORDER_STATUS.CANCELLED, cancelled_at: new Date().toISOString() })
-      .eq('id', orderId);
+    const previousStatus = order.status;
+    const txCancel = await transitionOrderStatus(supabase, orderId, order.status, ORDER_STATUS.CANCELLED);
 
-    if (updateError) {
-      return { order: null, error: updateError };
+    if (!txCancel.success) {
+      return { order: null, error: { message: txCancel.reason || 'Cancel transition failed' } };
     }
 
     order.status = ORDER_STATUS.CANCELLED;
-    await logExecution(supabase, orderId, EVENT_TYPE.ORDER_CANCELLED, { previousStatus: order.status });
+    await logExecution(supabase, orderId, EVENT_TYPE.ORDER_CANCELLED, { previousStatus });
 
     logger.info('Order cancelled', { orderId, asset: order.asset });
     return { order, error: null };
@@ -856,6 +849,119 @@ async function getExecutionLog(supabase, userId, filters = {}) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// ORDER RECOVERY ON RESTART
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Recover orders stuck in SUBMITTED status after a server restart.
+ * - For Bybit adapter: queries exchange for actual status first
+ * - Retries if age < 15min and retry_count < 3
+ * - Rolls back to CANCELLED if stale or max retries reached
+ *
+ * @param {object} supabase
+ * @param {object} executionAdapter - Current execution adapter
+ * @param {object} [marketData] - Current market data for retry fills
+ * @returns {Promise<{retried: number, rolledBack: number, synced: number}>}
+ */
+async function recoverStuckOrders(supabase, executionAdapter, marketData = null) {
+  const stats = { retried: 0, rolledBack: 0, synced: 0 };
+
+  try {
+    const { data: stuckOrders, error } = await supabase
+      .from('orders')
+      .select('*')
+      .eq('status', ORDER_STATUS.SUBMITTED)
+      .order('submitted_at', { ascending: true });
+
+    if (error || !stuckOrders || stuckOrders.length === 0) {
+      return stats;
+    }
+
+    logger.info('Order recovery: found stuck orders', { count: stuckOrders.length });
+
+    const MAX_RETRIES = 3;
+    const MAX_AGE_MS = 15 * 60 * 1000; // 15 minutes
+
+    for (const order of stuckOrders) {
+      const age = Date.now() - new Date(order.submitted_at).getTime();
+      const retryCount = order.retry_count || 0;
+
+      // ── For Bybit: check actual exchange status first ──
+      if (executionAdapter.name === 'bybit' && order.exchange_order_id) {
+        try {
+          const exchangeStatus = await executionAdapter.queryOrderStatus(order.exchange_order_id, order.asset);
+
+          if (exchangeStatus?.orderStatus === 'Filled') {
+            // Order was actually filled on exchange — sync our DB
+            await transitionOrderStatus(supabase, order.id, ORDER_STATUS.SUBMITTED, ORDER_STATUS.FILLED, {
+              avg_fill_price: exchangeStatus.avgPrice,
+              filled_quantity: exchangeStatus.cumExecQty,
+              exchange_order_id: order.exchange_order_id,
+            });
+            await logExecution(supabase, order.id, EVENT_TYPE.ORDER_FILLED, { source: 'recovery_sync' });
+            stats.synced++;
+            continue;
+          }
+
+          if (exchangeStatus?.orderStatus === 'Cancelled') {
+            await transitionOrderStatus(supabase, order.id, ORDER_STATUS.SUBMITTED, ORDER_STATUS.CANCELLED, {
+              reject_reason: 'Cancelled on exchange (detected during recovery)',
+            });
+            await logExecution(supabase, order.id, EVENT_TYPE.ORDER_RECOVERY_ROLLBACK, { exchangeStatus: 'Cancelled' });
+            stats.rolledBack++;
+            continue;
+          }
+        } catch (queryErr) {
+          logger.warn('Recovery: could not query exchange status', { orderId: order.id, error: queryErr.message });
+        }
+      }
+
+      // ── Retry or rollback ──
+      if (age < MAX_AGE_MS && retryCount < MAX_RETRIES) {
+        // Retry: rollback to VALIDATED then re-submit
+        const rollback = await transitionOrderStatus(supabase, order.id, ORDER_STATUS.SUBMITTED, ORDER_STATUS.VALIDATED, {
+          retry_count: String(retryCount + 1),
+          last_retry_at: new Date().toISOString(),
+        });
+
+        if (rollback.success) {
+          order.status = ORDER_STATUS.VALIDATED;
+          await logExecution(supabase, order.id, EVENT_TYPE.ORDER_RECOVERY_RETRY, {
+            retryCount: retryCount + 1,
+            ageMs: age,
+          });
+
+          // Re-submit
+          try {
+            await submitOrder(supabase, order.user_id, order, executionAdapter, marketData);
+          } catch (submitErr) {
+            logger.warn('Recovery retry failed', { orderId: order.id, error: submitErr.message });
+          }
+          stats.retried++;
+        }
+      } else {
+        // Stale or max retries — cancel
+        await transitionOrderStatus(supabase, order.id, ORDER_STATUS.SUBMITTED, ORDER_STATUS.CANCELLED, {
+          reject_reason: `Recovery: ${age >= MAX_AGE_MS ? 'stale order' : 'max retries reached'} (age: ${Math.round(age / 1000)}s, retries: ${retryCount})`,
+        });
+        await logExecution(supabase, order.id, EVENT_TYPE.ORDER_RECOVERY_ROLLBACK, {
+          ageMs: age,
+          retryCount,
+          reason: age >= MAX_AGE_MS ? 'stale' : 'max_retries',
+        });
+        stats.rolledBack++;
+      }
+    }
+
+    logger.info('Order recovery complete', stats);
+    return stats;
+  } catch (err) {
+    logger.error('recoverStuckOrders exception', { error: err.message });
+    return stats;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // EXPORTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -877,6 +983,9 @@ module.exports = {
 
   // Signal → Order pipeline
   processSignals,
+
+  // Recovery
+  recoverStuckOrders,
 
   // Audit
   getExecutionLog,
