@@ -4,14 +4,24 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 
 const { logger } = require('./logger');
-const { SLIPPAGE, COMMISSION, getAssetCost } = require('./constants');
+const { SLIPPAGE, COMMISSION, getAssetCost, estimateFillFromOrderBook, getTimeOfDayMultiplier } = require('./constants');
 const { buildSizingOptions } = require('./kellySizing');
 
 // ─── EXECUTION SIMULATION ───────────────────────────────────────────────────
 
-function applySlippage(price, isBuy, asset = null) {
-  // Per-asset slippage when asset is provided, else legacy flat rate
-  const cost = asset ? getAssetCost(asset) : (SLIPPAGE + COMMISSION);
+function applySlippage(price, isBuy, asset = null, orderBook = null, tradeSizeUsd = 0) {
+  // Order book execution: use real depth when available
+  if (orderBook && orderBook.bestBid && tradeSizeUsd > 0) {
+    const side = isBuy ? 'BUY' : 'SELL';
+    const estimate = estimateFillFromOrderBook(orderBook, side, tradeSizeUsd, price);
+    // Add commission on top of order-book fill
+    return isBuy ? estimate.fillPrice * (1 + COMMISSION) : estimate.fillPrice * (1 - COMMISSION);
+  }
+
+  // Fallback: per-asset slippage × time-of-day liquidity multiplier
+  const baseCost = asset ? getAssetCost(asset) : (SLIPPAGE + COMMISSION);
+  const todMult = getTimeOfDayMultiplier();
+  const cost = baseCost * todMult;
   return isBuy ? price * (1 + cost) : price * (1 - cost);
 }
 

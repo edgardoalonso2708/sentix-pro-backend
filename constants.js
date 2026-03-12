@@ -97,6 +97,78 @@ const SL_OVERSHOOT = {
   volatilityMultiplier: 0.15, // Scale overshoot by 15% of recent candle range
 };
 
+// ─── Order Book Execution Model ──────────────────────────────────────────────
+// Estimate realistic fill price based on order book depth
+
+/**
+ * Estimate fill price from order book for a given trade size
+ * @param {Object} orderBook - From fetchOrderBookDepth() (needs bestBid, bestAsk, spreadPercent)
+ * @param {string} side - 'BUY' or 'SELL'
+ * @param {number} tradeSizeUsd - Trade size in USD
+ * @param {number} currentPrice - Current mid price
+ * @returns {{ fillPrice: number, slippageEstimate: number, source: string }}
+ */
+function estimateFillFromOrderBook(orderBook, side, tradeSizeUsd, currentPrice) {
+  if (!orderBook || !orderBook.bestBid || !orderBook.bestAsk) {
+    return { fillPrice: currentPrice, slippageEstimate: 0, source: 'no_book' };
+  }
+
+  const midPrice = (orderBook.bestBid + orderBook.bestAsk) / 2;
+  const spreadPct = orderBook.spreadPercent / 100; // Convert to decimal
+
+  // Base fill: cross the spread (BUY at ask, SELL at bid)
+  let baseFill = side === 'BUY' ? orderBook.bestAsk : orderBook.bestBid;
+
+  // Depth impact: larger trades move price further
+  // Estimate using imbalance as proxy for depth (full L2 book not available)
+  const depthFactor = side === 'BUY'
+    ? (orderBook.askTotal > 0 ? tradeSizeUsd / (orderBook.askTotal * midPrice) : 0.01)
+    : (orderBook.bidTotal > 0 ? tradeSizeUsd / (orderBook.bidTotal * midPrice) : 0.01);
+
+  // Market impact: sqrt model (empirical) — impact grows with sqrt of order size relative to depth
+  const impactPct = Math.min(0.005, Math.sqrt(Math.max(0, depthFactor)) * 0.01); // Cap at 0.5%
+
+  // Apply impact
+  const fillPrice = side === 'BUY'
+    ? baseFill * (1 + impactPct)
+    : baseFill * (1 - impactPct);
+
+  const slippageEstimate = Math.abs(fillPrice - midPrice) / midPrice;
+
+  return {
+    fillPrice: Math.round(fillPrice * 100) / 100,
+    slippageEstimate: Math.round(slippageEstimate * 10000) / 10000,
+    source: 'order_book',
+    spreadPct: Math.round(spreadPct * 10000) / 10000,
+    depthFactor: Math.round(depthFactor * 10000) / 10000,
+    impactPct: Math.round(impactPct * 10000) / 10000
+  };
+}
+
+// ─── Time-of-Day Slippage Multiplier ─────────────────────────────────────────
+// Crypto is 24/7 but liquidity varies by hour (UTC)
+const HOUR_LIQUIDITY_MULT = {
+  // Asia session (low liquidity for Western pairs)
+  0: 1.3, 1: 1.4, 2: 1.5, 3: 1.5, 4: 1.4, 5: 1.3,
+  // Europe open → peak liquidity
+  6: 1.1, 7: 1.0, 8: 0.9, 9: 0.85, 10: 0.85, 11: 0.9,
+  // US overlap → best liquidity
+  12: 0.8, 13: 0.75, 14: 0.75, 15: 0.8, 16: 0.85,
+  // US afternoon
+  17: 0.9, 18: 0.95, 19: 1.0, 20: 1.05,
+  // Evening wind-down
+  21: 1.1, 22: 1.2, 23: 1.25
+};
+
+/**
+ * Get time-of-day slippage multiplier
+ * @returns {number} Multiplier (< 1.0 = good liquidity, > 1.0 = thin)
+ */
+function getTimeOfDayMultiplier() {
+  const hourUTC = new Date().getUTCHours();
+  return HOUR_LIQUIDITY_MULT[hourUTC] || 1.0;
+}
+
 module.exports = Object.freeze({
   SLIPPAGE,
   COMMISSION,
@@ -107,4 +179,7 @@ module.exports = Object.freeze({
   GAP_RISK,
   simulateGapRisk,
   SL_OVERSHOOT,
+  estimateFillFromOrderBook,
+  HOUR_LIQUIDITY_MULT,
+  getTimeOfDayMultiplier,
 });
