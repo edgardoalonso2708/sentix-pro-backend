@@ -13,6 +13,8 @@ const { SilentTelegramBot, setupTelegramCommands, setupAutoTuneCommands } = requ
 const { generateSignalWithRealData, generateMultiTimeframeSignal } = require('../technicalAnalysis');
 const { fetchDerivativesData, fetchOrderBookDepth } = require('../binanceAPI');
 const { evaluateAndExecute, getPositionHeatMap } = require('../paperTrading');
+const { processSignals } = require('../orderManager');
+const { createAdapter } = require('../execution');
 const { logger } = require('../logger');
 const { classifyAxiosError, Provider } = require('../errors');
 const { isWithinTradingHours } = require('../scheduleUtils');
@@ -33,6 +35,9 @@ const { getAllRegimes, getRegime } = require('../marketRegime');
 
 // ─── SUPABASE CLIENT ──────────────────────────────────────────────────────
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY);
+
+// ─── EXECUTION ADAPTER ──────────────────────────────────────────────────
+let _executionAdapter = null; // Initialized in startup block
 
 // ─── RESEND EMAIL CLIENT ──────────────────────────────────────────────────
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
@@ -638,13 +643,39 @@ async function processAlerts() {
     } catch (_) {}
 
     try {
-      const ptResult = await evaluateAndExecute(supabase, 'default-user', signals, cachedMarketData);
-      if (ptResult.newTrades.length > 0) {
-        logger.info('Paper trades opened', {
-          count: ptResult.newTrades.length,
-          assets: ptResult.newTrades.map(t => t.asset)
-        });
-        sendToParent(MSG.PAPER_TRADE, { action: 'opened', trades: ptResult.newTrades });
+      if (_executionAdapter) {
+        // New order-based flow: Signal → Order → Validate → Execute
+        const orderResult = await processSignals(supabase, 'default-user', signals, cachedMarketData, _executionAdapter, { autoExecute: true });
+        if (orderResult.executed && orderResult.executed.length > 0) {
+          const trades = orderResult.executed.map(e => e.trade).filter(Boolean);
+          logger.info('Orders executed', {
+            count: orderResult.executed.length,
+            assets: trades.map(t => t.asset)
+          });
+          if (trades.length > 0) {
+            sendToParent(MSG.PAPER_TRADE, { action: 'opened', trades });
+          }
+          // Broadcast order updates
+          orderResult.executed.forEach(e => {
+            if (e.order) sendToParent(MSG.ORDER_UPDATE, { order: e.order });
+          });
+        }
+        if (orderResult.rejected && orderResult.rejected.length > 0) {
+          logger.debug('Orders rejected by risk checks', {
+            count: orderResult.rejected.length,
+            reasons: orderResult.rejected.map(r => r.reason).slice(0, 3)
+          });
+        }
+      } else {
+        // Legacy fallback: direct paper trading
+        const ptResult = await evaluateAndExecute(supabase, 'default-user', signals, cachedMarketData);
+        if (ptResult.newTrades.length > 0) {
+          logger.info('Paper trades opened (legacy)', {
+            count: ptResult.newTrades.length,
+            assets: ptResult.newTrades.map(t => t.asset)
+          });
+          sendToParent(MSG.PAPER_TRADE, { action: 'opened', trades: ptResult.newTrades });
+        }
       }
     } catch (ptError) {
       logger.warn('Paper trading evaluation failed', { error: ptError.message });
@@ -871,6 +902,14 @@ _metricsTimer.unref();
 
   // Initialize config manager (loads system_config from Supabase)
   await initConfigManager(supabase).catch(() => {});
+
+  // Initialize execution adapter for order-based trading
+  try {
+    _executionAdapter = createAdapter('paper', { supabase });
+    logger.info('Paper execution adapter initialized');
+  } catch (adapterErr) {
+    logger.warn('Failed to init execution adapter, falling back to legacy', { error: adapterErr.message });
+  }
 
   // Register circuit breaker alert callback → Telegram notifications
   setAlertCallback(async (provider, info) => {

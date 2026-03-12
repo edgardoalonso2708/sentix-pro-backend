@@ -70,6 +70,15 @@ const { enrichSignalWithTTL } = require('./scheduleUtils');
 const { getAccuracyMetrics, getOutcomesByRegimeConfluence } = require('./signalAccuracy');
 const { initConfigManager, getConfig, setConfig, getAllConfigs } = require('./configManager');
 const { getAllBreakerStatus, getBreaker } = require('./circuitBreaker');
+const {
+  createOrder, validateOrder, submitOrder, cancelOrder,
+  getOrders, getOrder, getExecutionLog, expireOrders,
+  ORDER_STATUS
+} = require('./orderManager');
+const {
+  activateKillSwitch, deactivateKillSwitch, getKillSwitchStatus,
+  getRiskDashboard
+} = require('./riskEngine');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -1588,6 +1597,214 @@ app.delete('/api/paper/equity/:userId', async (req, res) => {
     res.json({ success: true, message: `Snapshots older than ${keepDays} days cleaned up` });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ORDER MANAGEMENT API ROUTES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── Create a manual order ──────────────────────────────────────────────────
+app.post('/api/orders/:userId', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) return res.status(400).json({ error: 'Invalid user ID' });
+
+    const orderSpec = req.body;
+    if (!orderSpec || !orderSpec.asset || !orderSpec.side || !orderSpec.orderType) {
+      return res.status(400).json({ error: 'Missing required fields: asset, side, orderType' });
+    }
+
+    const { order, error } = await createOrder(supabase, userId, orderSpec);
+    if (error) return res.status(400).json({ error: error.message || error });
+    res.json({ success: true, order });
+  } catch (err) {
+    logger.error('POST /api/orders error', { error: err.message });
+    res.status(500).json({ error: 'Failed to create order' });
+  }
+});
+
+// ─── List orders ────────────────────────────────────────────────────────────
+app.get('/api/orders/:userId', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) return res.status(400).json({ error: 'Invalid user ID' });
+
+    const filters = {
+      status: req.query.status || null,
+      asset: req.query.asset || null,
+      limit: parseInt(req.query.limit) || 50,
+      offset: parseInt(req.query.offset) || 0
+    };
+
+    const { orders, total, error } = await getOrders(supabase, userId, filters);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ orders, total });
+  } catch (err) {
+    logger.error('GET /api/orders error', { error: err.message });
+    res.status(500).json({ error: 'Failed to get orders' });
+  }
+});
+
+// ─── Get single order ───────────────────────────────────────────────────────
+app.get('/api/orders/:userId/:orderId', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    const orderId = req.params.orderId;
+    if (!isValidUserId(userId)) return res.status(400).json({ error: 'Invalid user ID' });
+
+    const { order, error } = await getOrder(supabase, userId, orderId);
+    if (error) return res.status(404).json({ error: 'Order not found' });
+    res.json({ order });
+  } catch (err) {
+    logger.error('GET /api/orders/:id error', { error: err.message });
+    res.status(500).json({ error: 'Failed to get order' });
+  }
+});
+
+// ─── Cancel order ───────────────────────────────────────────────────────────
+app.post('/api/orders/:userId/:orderId/cancel', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    const orderId = req.params.orderId;
+    if (!isValidUserId(userId)) return res.status(400).json({ error: 'Invalid user ID' });
+
+    const { order, error } = await cancelOrder(supabase, userId, orderId);
+    if (error) return res.status(400).json({ error: error.message || error });
+    res.json({ success: true, order });
+  } catch (err) {
+    logger.error('POST /api/orders/cancel error', { error: err.message });
+    res.status(500).json({ error: 'Failed to cancel order' });
+  }
+});
+
+// ─── Submit (approve) validated order ───────────────────────────────────────
+app.post('/api/orders/:userId/:orderId/submit', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    const orderId = req.params.orderId;
+    if (!isValidUserId(userId)) return res.status(400).json({ error: 'Invalid user ID' });
+
+    // Fetch the order
+    const { order, error: fetchError } = await getOrder(supabase, userId, orderId);
+    if (fetchError || !order) return res.status(404).json({ error: 'Order not found' });
+
+    if (order.status !== ORDER_STATUS.VALIDATED) {
+      return res.status(400).json({ error: `Order must be VALIDATED to submit (current: ${order.status})` });
+    }
+
+    // For now, use paper adapter placeholder — will be replaced in Tier 2
+    // The adapter will be resolved from the order's execution_adapter field
+    const { createAdapter } = require('./execution');
+    const adapter = createAdapter(order.execution_adapter || 'paper', { supabase });
+
+    const { filledOrder, trade, error: submitError } = await submitOrder(
+      supabase, userId, order, adapter, cachedMarketData
+    );
+
+    if (submitError) return res.status(400).json({ error: submitError.message || submitError });
+    res.json({ success: true, order: filledOrder, trade });
+  } catch (err) {
+    logger.error('POST /api/orders/submit error', { error: err.message });
+    res.status(500).json({ error: 'Failed to submit order' });
+  }
+});
+
+// ─── Execution audit log ────────────────────────────────────────────────────
+app.get('/api/execution-log/:userId', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) return res.status(400).json({ error: 'Invalid user ID' });
+
+    const filters = {
+      orderId: req.query.orderId || null,
+      eventType: req.query.eventType || null,
+      limit: parseInt(req.query.limit) || 50,
+      offset: parseInt(req.query.offset) || 0
+    };
+
+    const { logs, error } = await getExecutionLog(supabase, userId, filters);
+    if (error) return res.status(500).json({ error: error.message });
+    res.json({ logs });
+  } catch (err) {
+    logger.error('GET /api/execution-log error', { error: err.message });
+    res.status(500).json({ error: 'Failed to get execution log' });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RISK ENGINE API ROUTES
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── Risk dashboard ─────────────────────────────────────────────────────────
+app.get('/api/risk/:userId/dashboard', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) return res.status(400).json({ error: 'Invalid user ID' });
+
+    const dashboard = await getRiskDashboard(supabase, userId, cachedMarketData);
+    if (dashboard.error) return res.status(500).json({ error: dashboard.error });
+    res.json(dashboard);
+  } catch (err) {
+    logger.error('GET /api/risk/dashboard error', { error: err.message });
+    res.status(500).json({ error: 'Failed to get risk dashboard' });
+  }
+});
+
+// ─── Kill switch — activate ─────────────────────────────────────────────────
+app.post('/api/risk/:userId/kill-switch', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) return res.status(400).json({ error: 'Invalid user ID' });
+
+    const reason = req.body?.reason || 'Manual activation';
+    const result = await activateKillSwitch(supabase, userId, reason);
+
+    if (!result.success) {
+      return res.status(500).json({ error: 'Failed to activate kill switch' });
+    }
+
+    // Broadcast via SSE
+    broadcastSSE('kill_switch', { active: true, reason, ...result });
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    logger.error('POST /api/risk/kill-switch error', { error: err.message });
+    res.status(500).json({ error: 'Failed to activate kill switch' });
+  }
+});
+
+// ─── Kill switch — deactivate ───────────────────────────────────────────────
+app.delete('/api/risk/:userId/kill-switch', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) return res.status(400).json({ error: 'Invalid user ID' });
+
+    const result = await deactivateKillSwitch(supabase, userId);
+    if (!result.success) {
+      return res.status(500).json({ error: result.error || 'Failed to deactivate kill switch' });
+    }
+
+    broadcastSSE('kill_switch', { active: false });
+
+    res.json({ success: true });
+  } catch (err) {
+    logger.error('DELETE /api/risk/kill-switch error', { error: err.message });
+    res.status(500).json({ error: 'Failed to deactivate kill switch' });
+  }
+});
+
+// ─── Kill switch — status ───────────────────────────────────────────────────
+app.get('/api/risk/:userId/kill-switch', async (req, res) => {
+  try {
+    const userId = sanitizeInput(req.params.userId);
+    if (!isValidUserId(userId)) return res.status(400).json({ error: 'Invalid user ID' });
+
+    const status = await getKillSwitchStatus(supabase, userId);
+    res.json(status);
+  } catch (err) {
+    logger.error('GET /api/risk/kill-switch error', { error: err.message });
+    res.status(500).json({ error: 'Failed to get kill switch status' });
   }
 });
 

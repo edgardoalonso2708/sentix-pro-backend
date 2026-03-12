@@ -28,6 +28,12 @@ const MSG = {
 
   // Orchestrator → All workers (graceful shutdown)
   SHUTDOWN: 'shutdown',
+
+  // Order manager → Orchestrator → API (SSE broadcast)
+  ORDER_UPDATE: 'order_update',
+
+  // Risk engine → Orchestrator → All workers + API
+  KILL_SWITCH: 'kill_switch',
 };
 
 /**

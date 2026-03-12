@@ -588,7 +588,7 @@ async function checkDuplicateTrade(supabase, userId, asset) {
 // TRADE EXECUTION
 // ═══════════════════════════════════════════════════════════════════════════════
 
-async function openTrade(supabase, userId, signal, positionSize, marketData = null) {
+async function openTrade(supabase, userId, signal, positionSize, marketData = null, orderId = null) {
   try {
     const direction = signal.action === 'BUY' ? 'LONG' : 'SHORT';
 
@@ -608,6 +608,7 @@ async function openTrade(supabase, userId, signal, positionSize, marketData = nu
 
     const tradeData = {
       user_id: userId,
+      order_id: orderId || null,
       asset: signal.asset,
       asset_class: signal.assetClass || 'crypto',
       direction,
@@ -1751,6 +1752,124 @@ async function getPositionCorrelations(fetchCandles, positions) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// PORTFOLIO LIMITS (extracted for reuse by orderManager)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const CRYPTO_ASSETS = ['bitcoin', 'ethereum', 'solana', 'cardano', 'ripple', 'polkadot',
+  'avalanche-2', 'dogecoin', 'binancecoin', 'chainlink', 'matic-network', 'tron',
+  'shiba-inu', 'litecoin', 'uniswap', 'near', 'aptos', 'arbitrum', 'optimism', 'sui'];
+const METAL_ASSETS = ['gold', 'silver', 'xau', 'xag', 'pax-gold', 'platinum'];
+
+const KNOWN_CORRELATIONS = {
+  'bitcoin-ethereum': 0.87, 'bitcoin-solana': 0.82, 'bitcoin-cardano': 0.78,
+  'bitcoin-ripple': 0.72, 'bitcoin-polkadot': 0.80, 'bitcoin-avalanche-2': 0.83,
+  'bitcoin-dogecoin': 0.68, 'bitcoin-binancecoin': 0.85, 'bitcoin-chainlink': 0.79,
+  'ethereum-solana': 0.84, 'ethereum-cardano': 0.80, 'ethereum-ripple': 0.70,
+  'ethereum-avalanche-2': 0.86, 'ethereum-binancecoin': 0.82, 'ethereum-chainlink': 0.83,
+  'solana-avalanche-2': 0.80, 'solana-cardano': 0.76, 'cardano-ripple': 0.74,
+};
+
+function classifyAsset(a) {
+  const lower = a.toLowerCase();
+  if (METAL_ASSETS.some(m => lower.includes(m))) return 'metal';
+  if (CRYPTO_ASSETS.some(c => lower.includes(c))) return 'crypto';
+  return 'other';
+}
+
+function getCorrelation(a, b) {
+  const key1 = `${a}-${b}`;
+  const key2 = `${b}-${a}`;
+  if (KNOWN_CORRELATIONS[key1] !== undefined) return KNOWN_CORRELATIONS[key1];
+  if (KNOWN_CORRELATIONS[key2] !== undefined) return KNOWN_CORRELATIONS[key2];
+  const classA = classifyAsset(a);
+  const classB = classifyAsset(b);
+  if (classA === classB && classA === 'crypto') return 0.65;
+  if (classA === classB && classA === 'metal') return 0.70;
+  return 0.15;
+}
+
+/**
+ * Check portfolio-level limits: same-direction count, sector exposure, correlation.
+ * Extracted from evaluateAndExecute for reuse in orderManager.
+ *
+ * @param {object} supabase
+ * @param {string} userId
+ * @param {object} signal - Must have: asset, action ('BUY'|'SELL'), assetClass (optional)
+ * @param {object} config - Paper trading config
+ * @returns {Promise<{allowed: boolean, reason: string}>}
+ */
+async function checkPortfolioLimits(supabase, userId, signal, config) {
+  try {
+    const { data: openPositions } = await supabase.from('paper_trades')
+      .select('asset, direction, position_size_usd, entry_price')
+      .eq('user_id', userId).in('status', ['open', 'partial']);
+
+    if (!openPositions || openPositions.length < 1) {
+      return { allowed: true, reason: 'No open positions' };
+    }
+
+    const newAsset = signal.asset.toLowerCase();
+    const sigDir = (signal.action === 'BUY') ? 'long' : 'short';
+    const maxCorr = config.max_portfolio_correlation || DEFAULT_CONFIG.max_portfolio_correlation;
+    const maxSectorPct = config.max_sector_exposure_pct || DEFAULT_CONFIG.max_sector_exposure_pct;
+    const maxSameDirCrypto = config.max_same_direction_crypto || DEFAULT_CONFIG.max_same_direction_crypto;
+
+    const newAssetClass = classifyAsset(newAsset);
+
+    // CHECK 1: Same-direction crypto limit
+    const sameDirCrypto = openPositions.filter(p =>
+      p.direction === sigDir && classifyAsset(p.asset) === 'crypto'
+    );
+    if (newAssetClass === 'crypto' && sameDirCrypto.length >= maxSameDirCrypto) {
+      return {
+        allowed: false,
+        reason: `Same-direction limit: ${sameDirCrypto.length}/${maxSameDirCrypto} ${sigDir.toUpperCase()} crypto positions open`
+      };
+    }
+
+    // CHECK 2: Sector exposure %
+    const sectorExposure = openPositions
+      .filter(p => classifyAsset(p.asset) === newAssetClass)
+      .reduce((s, p) => s + parseFloat(p.position_size_usd || 0), 0);
+    const capital = config.current_capital || DEFAULT_CONFIG.current_capital;
+    const sectorPct = (sectorExposure + (capital * (config.risk_per_trade || 0.01) * 10)) / capital;
+
+    if (sectorPct > maxSectorPct) {
+      return {
+        allowed: false,
+        reason: `Sector exposure: ${newAssetClass} at ${(sectorExposure / capital * 100).toFixed(0)}% of capital (limit ${(maxSectorPct * 100).toFixed(0)}%)`
+      };
+    }
+
+    // CHECK 3: Portfolio correlation
+    const sameDirPositions = openPositions.filter(p => p.direction === sigDir);
+    if (sameDirPositions.length >= 2) {
+      let corrWeightSum = 0;
+      let weightSum = 0;
+      for (const pos of sameDirPositions) {
+        const posSize = parseFloat(pos.position_size_usd || 0);
+        const corr = getCorrelation(newAsset, pos.asset.toLowerCase());
+        corrWeightSum += corr * posSize;
+        weightSum += posSize;
+      }
+      const weightedCorr = weightSum > 0 ? corrWeightSum / weightSum : 0;
+
+      if (weightedCorr > maxCorr) {
+        return {
+          allowed: false,
+          reason: `Portfolio correlation ${(weightedCorr * 100).toFixed(0)}% exceeds limit ${(maxCorr * 100).toFixed(0)}% (${sameDirPositions.length} same-dir positions)`
+        };
+      }
+    }
+
+    return { allowed: true, reason: 'Portfolio limits OK' };
+  } catch (err) {
+    logger.debug('Portfolio limits check failed, allowing trade', { error: err.message });
+    return { allowed: true, reason: 'Check failed, allowing (fail-open)' };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // ORCHESTRATION (called from server.js)
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2076,8 +2195,10 @@ module.exports = {
   // Safety
   checkSafetyLimits,
   checkDuplicateTrade,
+  checkPortfolioLimits,
 
   // Execution
+  applySlippage,
   openTrade,
   executePartialClose,
   executeFullClose,
