@@ -62,7 +62,7 @@ const {
 const { runBacktest } = require('./backtester');
 const { startOptimizationJob, getJobStatus, getAllJobs, PARAM_RANGES } = require('./optimizer');
 const {
-  runAutoTune, getAutoTuneHistory, getActiveConfig, isAutoTuneRunning,
+  runAutoTune, getAutoTuneHistory, getActiveConfig, saveActiveConfig, isAutoTuneRunning,
   getApprovalMode, approveProposal, getPendingProposals, PRIORITY_PARAMS,
 } = require('./autoTuner');
 const { DEFAULT_STRATEGY_CONFIG, SCHEDULE_CONFIG } = require('./strategyConfig');
@@ -1885,7 +1885,8 @@ app.post('/api/backtest/run', async (req, res) => {
       allowedStrength = ['STRONG BUY', 'STRONG SELL'],
       cooldownBars = 6,
       userId = 'default-user',
-      kellySizing = null
+      kellySizing = null,
+      strategyConfig = null
     } = req.body;
 
     // Validate inputs
@@ -1963,7 +1964,7 @@ app.post('/api/backtest/run', async (req, res) => {
           asset, days, stepInterval, capital, riskPerTrade,
           maxOpenPositions, minConfluence, minRR, allowedStrength,
           cooldownBars, fearGreed: 50, derivativesData: null, macroData: null,
-          kellySizing
+          kellySizing, strategyConfig
         }, async (progress) => {
           // Update progress in memory
           const entry = backtestStore.get(recordId);
@@ -2325,6 +2326,47 @@ app.post('/api/autotune/approve', async (req, res) => {
     res.json(result);
   } catch (err) {
     logger.error('Approval failed', { error: err.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * POST /api/autotune/apply-param — Apply a single optimized parameter to the active strategy config
+ */
+app.post('/api/autotune/apply-param', async (req, res) => {
+  try {
+    const { paramName, value, source = 'optimizer' } = req.body;
+
+    if (!paramName || value === undefined) {
+      return res.status(400).json({ error: 'paramName and value are required' });
+    }
+
+    const range = PARAM_RANGES[paramName];
+    if (!range) {
+      return res.status(400).json({ error: `Unknown parameter: ${paramName}` });
+    }
+    if (value < range.min || value > range.max) {
+      return res.status(400).json({ error: `Value ${value} out of range [${range.min}, ${range.max}]` });
+    }
+
+    const { config: currentConfig } = await getActiveConfig(supabase);
+    const updatedConfig = { ...currentConfig, [paramName]: value };
+
+    const saved = await saveActiveConfig(
+      supabase, updatedConfig,
+      `${source}-${paramName}-${value}`,
+      `Applied ${range.label} = ${value} from ${source}`,
+      null
+    );
+
+    if (!saved) {
+      return res.status(500).json({ error: 'Failed to save config' });
+    }
+
+    logger.info('Strategy param applied', { paramName, value, source });
+    res.json({ status: 'applied', paramName, value, label: range.label });
+  } catch (err) {
+    logger.error('Apply param failed', { error: err.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
