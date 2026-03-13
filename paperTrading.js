@@ -207,7 +207,9 @@ async function updateConfig(supabase, userId, updates) {
       // Portfolio limits
       'max_portfolio_correlation', 'max_sector_exposure_pct', 'max_same_direction_crypto',
       // Execution settings
-      'auto_execute', 'execution_mode'
+      'auto_execute', 'execution_mode',
+      // Risk / kill switch
+      'max_drawdown_pct', 'kill_switch_close_positions'
     ];
 
     const filtered = {};
