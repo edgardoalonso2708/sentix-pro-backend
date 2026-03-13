@@ -157,104 +157,6 @@ async function generateSignals() {
     }
   }
 
-  // ─── GOLD SIGNAL ─────────────────────────────────────────────────────
-  if (cachedMarketData.metals?.gold) {
-    try {
-      const gold = cachedMarketData.metals.gold;
-      if (gold.price > 0) {
-        const goldSignal = await generateSignalWithRealData(
-          'pax-gold', gold.price, gold.change24h || 0,
-          gold.volume24h || 0, fearGreed, '1h', null
-        );
-        goldSignal.asset = 'GOLD (XAU)';
-        goldSignal.assetClass = 'metal';
-        allSignals.push(goldSignal);
-
-        await new Promise(resolve => setTimeout(resolve, 1500));
-
-        // ─── SILVER SIGNAL (gold-correlated with silver-specific adjustments) ───
-        if (cachedMarketData.metals?.silver) {
-          const silver = cachedMarketData.metals.silver;
-          if (silver.price > 0) {
-            const silverSignal = { ...goldSignal };
-            silverSignal.asset = 'SILVER (XAG)';
-            silverSignal.price = silver.price;
-            silverSignal.assetClass = 'metal';
-            silverSignal.derivatives = null;
-            silverSignal.dataSource = 'Gold-correlated (PAXG OHLCV + silver price)';
-
-            // Use silver's own price movement to weight the signal
-            const silverChange = silver.change24h || 0;
-            const goldChange = gold.change24h || 0;
-            silverSignal.change24h = silverChange;
-
-            // Check if silver and gold are moving in the same direction
-            const sameDirection = (silverChange >= 0 && goldChange >= 0) || (silverChange < 0 && goldChange < 0);
-            const silverMoreVolatile = Math.abs(silverChange) > Math.abs(goldChange);
-
-            // Score: use gold's technical score but adjust based on silver's own momentum
-            let adjustedScore = goldSignal.rawScore;
-            if (sameDirection && silverMoreVolatile) {
-              // Silver confirms gold direction with more strength → modest boost
-              adjustedScore = Math.round(adjustedScore * 1.08);
-            } else if (!sameDirection) {
-              // Silver diverging from gold → reduce confidence significantly
-              adjustedScore = Math.round(adjustedScore * 0.6);
-            }
-            silverSignal.rawScore = Math.max(-100, Math.min(100, adjustedScore));
-            silverSignal.score = Math.round(Math.max(0, Math.min(100, (silverSignal.rawScore + 100) / 2)));
-
-            // Confidence: always lower than gold (derived signal = less certain)
-            const correlationPenalty = sameDirection ? 8 : 20;
-            silverSignal.confidence = Math.max(0, goldSignal.confidence - correlationPenalty);
-
-            // Reasons: be transparent about derivation
-            silverSignal.reasons = goldSignal.reasons +
-              ` \u2022 Silver derived from gold (corr ~0.85)` +
-              (sameDirection ? ' \u2022 Silver confirms gold direction' : ' \u2022 ⚠ Silver diverging from gold') +
-              (silverMoreVolatile ? ' \u2022 Silver showing higher volatility' : '');
-
-            // Trade levels: scale by silver/gold price ratio
-            if (goldSignal.tradeLevels) {
-              const ratio = silver.price / gold.price;
-              silverSignal.tradeLevels = {
-                ...goldSignal.tradeLevels,
-                entry: parseFloat((goldSignal.tradeLevels.entry * ratio).toFixed(4)),
-                stopLoss: parseFloat((goldSignal.tradeLevels.stopLoss * ratio).toFixed(4)),
-                takeProfit1: parseFloat((goldSignal.tradeLevels.takeProfit1 * ratio).toFixed(4)),
-                takeProfit2: parseFloat((goldSignal.tradeLevels.takeProfit2 * ratio).toFixed(4)),
-                support: parseFloat((goldSignal.tradeLevels.support * ratio).toFixed(4)),
-                resistance: parseFloat((goldSignal.tradeLevels.resistance * ratio).toFixed(4)),
-                pivot: parseFloat((goldSignal.tradeLevels.pivot * ratio).toFixed(4)),
-                atrValue: parseFloat((goldSignal.tradeLevels.atrValue * ratio).toFixed(4))
-              };
-            }
-
-            // Action thresholds (same as standard signals)
-            if (silverSignal.rawScore >= 25) silverSignal.action = 'BUY';
-            else if (silverSignal.rawScore >= 15 && silverSignal.confidence >= 35) silverSignal.action = 'BUY';
-            else if (silverSignal.rawScore <= -25) silverSignal.action = 'SELL';
-            else if (silverSignal.rawScore <= -15 && silverSignal.confidence >= 35) silverSignal.action = 'SELL';
-            else silverSignal.action = 'HOLD';
-
-            if (silverSignal.action === 'BUY') {
-              silverSignal.strengthLabel = silverSignal.rawScore >= 50 && silverSignal.confidence >= 55 ? 'STRONG BUY' :
-                silverSignal.rawScore >= 35 ? 'BUY' : 'WEAK BUY';
-            } else if (silverSignal.action === 'SELL') {
-              silverSignal.strengthLabel = silverSignal.rawScore <= -50 && silverSignal.confidence >= 55 ? 'STRONG SELL' :
-                silverSignal.rawScore <= -35 ? 'SELL' : 'WEAK SELL';
-            } else {
-              silverSignal.strengthLabel = 'HOLD';
-            }
-
-            allSignals.push(silverSignal);
-          }
-        }
-      }
-    } catch (error) {
-      logger.error('Gold/Silver signal generation failed', { error: error.message });
-    }
-  }
 
   // Mark off-hours signals
   const tradingHours = isWithinTradingHours(SCHEDULE_CONFIG);
@@ -693,12 +595,8 @@ async function processAlerts() {
     try {
       await checkPendingOutcomes(supabase, async (asset) => {
         if (!cachedMarketData) return null;
-        // Try crypto first, then metals
         const crypto = cachedMarketData.crypto?.[asset.toLowerCase()];
-        if (crypto?.price) return crypto.price;
-        const metal = cachedMarketData.metals?.[asset.toLowerCase()];
-        if (metal?.price) return metal.price;
-        return null;
+        return crypto?.price || null;
       });
     } catch (accErr) {
       logger.debug('Signal accuracy check failed', { error: accErr.message });

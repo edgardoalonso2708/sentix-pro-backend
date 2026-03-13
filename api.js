@@ -2523,7 +2523,7 @@ if (bot.isActive()) {
     }
 
     let message = '🎯 *Señales Activas*\n\n';
-    // Show top 8 signals (including metals)
+    // Show top 8 signals
     signals.slice(0, 8).forEach(s => {
       const emoji = s.action === 'BUY' ? '🟢' : s.action === 'SELL' ? '🔴' : '⚪';
       message += `${emoji} *${s.asset}* - ${s.strengthLabel || s.action}\n`;
@@ -2545,18 +2545,8 @@ if (bot.isActive()) {
         `💎 *${asset.toUpperCase()}*\nPrecio: $${data.price.toLocaleString()}\n24h: ${data.change24h >= 0 ? '+' : ''}${data.change24h.toFixed(2)}%`,
         { parse_mode: 'Markdown' }
       );
-    } else if (asset.includes('gold') || asset.includes('oro')) {
-      const gold = marketData?.metals?.gold;
-      if (gold) {
-        await bot.sendMessage(chatId, `🥇 *ORO (XAU)*\nPrecio: $${gold.price.toLocaleString()}\n24h: ${(gold.change24h || 0).toFixed(2)}%`, { parse_mode: 'Markdown' });
-      }
-    } else if (asset.includes('silver') || asset.includes('plata')) {
-      const silver = marketData?.metals?.silver;
-      if (silver) {
-        await bot.sendMessage(chatId, `🥈 *PLATA (XAG)*\nPrecio: $${silver.price.toLocaleString()}\n24h: ${(silver.change24h || 0).toFixed(2)}%`, { parse_mode: 'Markdown' });
-      }
     } else {
-      await bot.sendMessage(chatId, '❌ Asset no encontrado. Usa: bitcoin, ethereum, solana, oro, plata, etc.');
+      await bot.sendMessage(chatId, '❌ Asset no encontrado. Usa: bitcoin, ethereum, solana, etc.');
     }
   });
 
@@ -2570,11 +2560,6 @@ if (bot.isActive()) {
         `BTC Dom: ${marketData.macro.btcDom}%\n` +
         `DXY: ${marketData.macro.dxy || '—'} (${marketData.macro.dxyTrend || 'N/A'})\n` +
         `Market Cap: $${(marketData.macro.globalMcap / 1e12).toFixed(2)}T\n`;
-
-      if (marketData.metals?.gold) {
-        message += `\n🥇 Oro: $${marketData.metals.gold.price.toLocaleString()}\n`;
-        message += `🥈 Plata: $${marketData.metals.silver?.price?.toLocaleString() || 'N/A'}`;
-      }
 
       await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
     } else {

@@ -51,7 +51,7 @@ const DEFAULT_CONFIG = {
   atr_trailing_activation: 2.5,    // Trailing activates at 2.5× ATR profit (avoids noise activation)
   // Portfolio correlation limits
   max_portfolio_correlation: 0.70,  // Block new trade if avg correlation with open positions > 70%
-  max_sector_exposure_pct: 0.60,    // Max 60% of capital in same sector (crypto/metals)
+  max_sector_exposure_pct: 0.60,    // Max 60% of capital in same sector
   max_same_direction_crypto: 3,     // Max same-direction crypto positions
 };
 
@@ -120,14 +120,6 @@ async function updateCapitalAtomic(supabase, userId, delta) {
 function resolveCurrentPrice(asset, marketData) {
   if (!asset || !marketData) return null;
   const lower = asset.toLowerCase();
-
-  // Metals
-  if (lower.includes('gold') || lower.includes('xau') || lower.includes('paxg')) {
-    return marketData?.metals?.gold?.price || null;
-  }
-  if (lower.includes('silver') || lower.includes('xag')) {
-    return marketData?.metals?.silver?.price || null;
-  }
 
   // Crypto - try direct match then search
   if (marketData?.crypto?.[lower]?.price) {
@@ -1853,8 +1845,6 @@ async function getPositionCorrelations(fetchCandles, positions) {
 const CRYPTO_ASSETS = ['bitcoin', 'ethereum', 'solana', 'cardano', 'ripple', 'polkadot',
   'avalanche-2', 'dogecoin', 'binancecoin', 'chainlink', 'matic-network', 'tron',
   'shiba-inu', 'litecoin', 'uniswap', 'near', 'aptos', 'arbitrum', 'optimism', 'sui'];
-const METAL_ASSETS = ['gold', 'silver', 'xau', 'xag', 'pax-gold', 'platinum'];
-
 const KNOWN_CORRELATIONS = {
   'bitcoin-ethereum': 0.87, 'bitcoin-solana': 0.82, 'bitcoin-cardano': 0.78,
   'bitcoin-ripple': 0.72, 'bitcoin-polkadot': 0.80, 'bitcoin-avalanche-2': 0.83,
@@ -1866,7 +1856,6 @@ const KNOWN_CORRELATIONS = {
 
 function classifyAsset(a) {
   const lower = a.toLowerCase();
-  if (METAL_ASSETS.some(m => lower.includes(m))) return 'metal';
   if (CRYPTO_ASSETS.some(c => lower.includes(c))) return 'crypto';
   return 'other';
 }
@@ -1879,7 +1868,6 @@ function getCorrelation(a, b) {
   const classA = classifyAsset(a);
   const classB = classifyAsset(b);
   if (classA === classB && classA === 'crypto') return 0.65;
-  if (classA === classB && classA === 'metal') return 0.70;
   return 0.15;
 }
 
@@ -1990,14 +1978,6 @@ async function evaluateAndExecute(supabase, userId, signals, marketData) {
     }
 
     for (const signal of signals) {
-      // Skip non-crypto assets (metals are reference-only, not tradeable)
-      if (signal.assetClass === 'metal' ||
-          (signal.asset && (signal.asset.includes('GOLD') || signal.asset.includes('SILVER') ||
-           signal.asset.includes('XAU') || signal.asset.includes('XAG')))) {
-        result.skipped.push({ asset: signal.asset, reason: 'Non-crypto asset (reference only)' });
-        continue;
-      }
-
       // Evaluate signal eligibility
       const { eligible, reason } = evaluateSignalForTrade(signal, config);
       if (!eligible) {

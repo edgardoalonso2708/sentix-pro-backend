@@ -84,8 +84,7 @@ const SYMBOL_MAP = {
   polkadot: 'DOTUSDT',
   dogecoin: 'DOGEUSDT',
   'avalanche-2': 'AVAXUSDT',
-  chainlink: 'LINKUSDT',
-  'pax-gold': 'PAXGUSDT'  // Gold proxy - PAXG = 1 troy oz of gold
+  chainlink: 'LINKUSDT'
 };
 
 // Valid intervals for Binance klines API
@@ -431,9 +430,7 @@ binanceFuturesClient.interceptors.request.use(config => {
   return config;
 });
 
-// Futures symbols (PAXG does NOT have futures on Binance)
 const FUTURES_SYMBOL_MAP = { ...SYMBOL_MAP };
-delete FUTURES_SYMBOL_MAP['pax-gold'];
 
 /**
  * Fetch current funding rate from Binance USDM Futures
@@ -631,7 +628,7 @@ async function fetchHistoricalFundingBybit(symbol, startMs, endMs) {
  */
 async function fetchDerivativesData(coinGeckoId) {
   const symbol = FUTURES_SYMBOL_MAP[coinGeckoId];
-  if (!symbol) return null; // No futures for this asset (e.g. PAXG)
+  if (!symbol) return null;
 
   // Try Binance first (unless already switched to Bybit)
   if (derivativesProvider === 'binance') {

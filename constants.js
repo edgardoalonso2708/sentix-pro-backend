@@ -35,10 +35,6 @@ const ASSET_SLIPPAGE = {
   arbitrum:     0.0025,
   optimism:     0.0025,
   sui:          0.0025,
-  // Metals (OTC — wider spreads)
-  'pax-gold':   0.0020,   // 0.20%
-  gold:         0.0020,
-  silver:       0.0025,
 };
 
 const DEFAULT_SLIPPAGE = 0.0020; // 0.20% for unknown assets

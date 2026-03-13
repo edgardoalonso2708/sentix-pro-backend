@@ -678,14 +678,6 @@ async function processSignals(supabase, userId, signals, marketData, executionAd
     let completedTrades = null;
 
     for (const signal of signals) {
-      // Skip non-crypto assets
-      if (signal.assetClass === 'metal' ||
-          (signal.asset && (signal.asset.includes('GOLD') || signal.asset.includes('SILVER') ||
-           signal.asset.includes('XAU') || signal.asset.includes('XAG')))) {
-        result.skipped.push({ asset: signal.asset, reason: 'Non-crypto asset (reference only)' });
-        continue;
-      }
-
       // Evaluate signal eligibility
       const { eligible, reason } = evaluateSignalForTrade(signal, config);
       if (!eligible) {

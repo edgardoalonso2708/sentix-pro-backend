@@ -1,6 +1,6 @@
 // ═══════════════════════════════════════════════════════════════════════════════
 // SENTIX PRO — MARKET DATA WORKER
-// Fetches crypto prices, macro data, metals, DXY every 1 minute.
+// Fetches crypto prices, macro data, DXY every 1 minute.
 // Monitors paper trading positions on each update.
 // Communicates with orchestrator via IPC.
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -10,7 +10,6 @@ require('dotenv').config();
 const cron = require('node-cron');
 const axios = require('axios');
 const { createClient } = require('@supabase/supabase-js');
-const { fetchMetalsPricesSafe } = require('../metalsAPI');
 const { monitorAndManage } = require('../paperTrading');
 const { logger } = require('../logger');
 const { classifyAxiosError, Provider } = require('../errors');
@@ -298,10 +297,6 @@ async function fetchGlobalData() {
   }
 }
 
-async function fetchMetalsPrices() {
-  return await fetchMetalsPricesSafe();
-}
-
 // DXY proxy via EUR/USD
 let cachedDxy = { dxy: 100, dxyTrend: 'neutral', dxyChange: 0 };
 let lastDxyFetch = 0;
@@ -347,10 +342,9 @@ async function updateMarketData() {
     metrics.counter('market.cycles');
 
     const crypto = await fetchCryptoPrices();
-    const [fearGreedData, globalData, metals, dxyData] = await Promise.all([
+    const [fearGreedData, globalData, dxyData] = await Promise.all([
       fetchFearGreed(),
       fetchGlobalData(),
-      fetchMetalsPrices(),
       fetchDXY()
     ]);
 
@@ -360,7 +354,6 @@ async function updateMarketData() {
       cachedMarketData = {
         crypto: cryptoCount > 0 ? crypto : (cachedMarketData?.crypto || {}),
         macro: { ...fearGreedData, ...globalData, ...dxyData },
-        metals,
         lastUpdate: new Date().toISOString()
       };
       logger.info('Market data updated', { cryptoAssets: cryptoCount });
@@ -368,7 +361,6 @@ async function updateMarketData() {
       cachedMarketData = {
         ...cachedMarketData,
         macro: { ...fearGreedData, ...globalData, ...dxyData },
-        metals,
         lastUpdate: new Date().toISOString()
       };
       logger.warn('Market data partially updated (crypto unchanged, using cache)');
