@@ -189,36 +189,35 @@ async function checkDrawdownCircuitBreaker(supabase, userId, config) {
  */
 async function activateKillSwitch(supabase, userId, reason, options = {}) {
   try {
-    // 1. Disable trading
+    // 1. Disable trading for ALL users (global kill switch)
     const { error: configError } = await supabase.from('paper_config')
       .update({ is_enabled: false })
-      .eq('user_id', userId);
+      .neq('is_enabled', false); // Only update those that are currently enabled
 
     if (configError) {
       logger.error('Kill switch: failed to disable trading', { error: configError.message });
       return { success: false, cancelledOrders: 0, closedPositions: 0 };
     }
 
-    // 2. Cancel all pending/validated orders
+    // 2. Cancel all pending/validated orders for ALL users
     let cancelledOrders = 0;
-    const { orders } = await getOrders(supabase, userId, { limit: 100 });
-    const cancellable = (orders || []).filter(o =>
-      [ORDER_STATUS.PENDING, ORDER_STATUS.VALIDATED, ORDER_STATUS.SUBMITTED].includes(o.status)
-    );
+    const { data: allCancellable } = await supabase.from('orders')
+      .select('id, user_id')
+      .in('status', [ORDER_STATUS.PENDING, ORDER_STATUS.VALIDATED, ORDER_STATUS.SUBMITTED])
+      .limit(500);
 
-    for (const order of cancellable) {
-      const { error } = await cancelOrder(supabase, userId, order.id);
+    for (const order of (allCancellable || [])) {
+      const { error } = await cancelOrder(supabase, order.user_id, order.id);
       if (!error) cancelledOrders++;
     }
 
-    // 3. Optionally close all open positions
+    // 3. Optionally close all open positions for ALL users
     let closedPositions = 0;
     const { config } = await getOrCreateConfig(supabase, userId);
     if (config?.kill_switch_close_positions) {
       const { executeFullClose, resolveCurrentPrice } = require('./paperTrading');
       const { data: openTrades } = await supabase.from('paper_trades')
         .select('*')
-        .eq('user_id', userId)
         .in('status', ['open', 'partial']);
 
       for (const trade of (openTrades || [])) {
@@ -272,7 +271,7 @@ async function activateKillSwitch(supabase, userId, reason, options = {}) {
       }
     }
 
-    logger.warn('Kill switch activated', { userId, reason, cancelledOrders, closedPositions });
+    logger.warn('GLOBAL kill switch activated', { activatedBy: userId, reason, cancelledOrders, closedPositions });
     return { success: true, cancelledOrders, closedPositions };
   } catch (err) {
     logger.error('activateKillSwitch exception', { error: err.message });
@@ -281,19 +280,19 @@ async function activateKillSwitch(supabase, userId, reason, options = {}) {
 }
 
 /**
- * Deactivate kill switch — re-enable trading.
+ * Deactivate kill switch — re-enable trading for ALL users.
  */
 async function deactivateKillSwitch(supabase, userId) {
   try {
     const { error } = await supabase.from('paper_config')
       .update({ is_enabled: true })
-      .eq('user_id', userId);
+      .neq('is_enabled', true); // Only update those currently disabled
 
     if (error) {
       return { success: false, error: error.message };
     }
 
-    logger.info('Kill switch deactivated', { userId });
+    logger.info('GLOBAL kill switch deactivated', { reactivatedBy: userId });
     return { success: true };
   } catch (err) {
     logger.error('deactivateKillSwitch exception', { error: err.message });
