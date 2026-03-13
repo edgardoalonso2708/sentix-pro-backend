@@ -163,10 +163,11 @@ async function getOrCreateConfig(supabase, userId) {
       .single();
 
     if (error && error.code === 'PGRST116') {
-      // Not found - create with defaults
+      // Not found — create with only user_id and let DB defaults handle columns.
+      // Then merge DEFAULT_CONFIG for any fields the DB schema doesn't have yet.
       const { data: newConfig, error: insertError } = await supabase
         .from('paper_config')
-        .insert({ user_id: userId, ...DEFAULT_CONFIG })
+        .insert({ user_id: userId })
         .select()
         .single();
 
@@ -175,7 +176,8 @@ async function getOrCreateConfig(supabase, userId) {
         return { config: null, error: insertError };
       }
       logger.info('Paper config created with defaults', { userId });
-      return { config: newConfig, error: null };
+      // Merge DEFAULT_CONFIG as fallback for any missing fields
+      return { config: { ...DEFAULT_CONFIG, ...newConfig }, error: null };
     }
 
     if (error) {
@@ -183,7 +185,8 @@ async function getOrCreateConfig(supabase, userId) {
       return { config: null, error };
     }
 
-    return { config: data, error: null };
+    // Merge DEFAULT_CONFIG as fallback for fields not yet in DB schema
+    return { config: { ...DEFAULT_CONFIG, ...data }, error: null };
   } catch (err) {
     logger.error('getOrCreateConfig exception', { error: err.message });
     return { config: null, error: err };
@@ -202,7 +205,9 @@ async function updateConfig(supabase, userId, updates) {
       // ATR multipliers
       'atr_stop_mult', 'atr_tp2_mult', 'atr_trailing_mult', 'atr_trailing_activation',
       // Portfolio limits
-      'max_portfolio_correlation', 'max_sector_exposure_pct', 'max_same_direction_crypto'
+      'max_portfolio_correlation', 'max_sector_exposure_pct', 'max_same_direction_crypto',
+      // Execution settings
+      'auto_execute', 'execution_mode'
     ];
 
     const filtered = {};
