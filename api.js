@@ -42,6 +42,7 @@ const {
 } = require('./security');
 const { Resend } = require('resend');
 const { logger } = require('./logger');
+const { fetchOHLCVForAsset, VALID_INTERVALS } = require('./binanceAPI');
 const { classifyAxiosError, Provider } = require('./errors');
 const { getFeatures, getFeaturesForAssets, getCacheStats } = require('./featureStore');
 const { getAllRegimes, getRegime } = require('./marketRegime');
@@ -399,6 +400,37 @@ app.get('/api/market', (req, res) => {
     return res.status(503).json({ error: 'Market data not yet available' });
   }
   res.json(cachedMarketData);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CANDLE DATA (OHLCV) ROUTE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+app.get('/api/candles/:asset', async (req, res) => {
+  try {
+    const { asset } = req.params;
+    const interval = req.query.interval || '1h';
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 200, 1), 1000);
+
+    if (!VALID_INTERVALS[interval]) {
+      return res.status(400).json({ error: `Invalid interval. Valid: ${Object.keys(VALID_INTERVALS).join(', ')}` });
+    }
+
+    const candles = await fetchOHLCVForAsset(asset, interval, limit);
+    const formatted = candles.map(c => ({
+      time: Math.floor(c.timestamp / 1000),
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+      volume: c.volume
+    }));
+
+    res.json(formatted);
+  } catch (e) {
+    logger.error('Candle fetch error', { asset: req.params.asset, error: e.message });
+    res.status(400).json({ error: e.message });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
