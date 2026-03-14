@@ -120,24 +120,29 @@ async function validatePreTrade(supabase, userId, order, config, marketData = nu
  */
 async function checkDrawdownCircuitBreaker(supabase, userId, config) {
   const threshold = config.max_drawdown_pct || 0.15; // Default 15%
+  const ROLLING_WINDOW_DAYS = 90; // Rolling window for peak detection
 
   try {
-    // Find peak equity from snapshots
+    // Find peak equity within rolling window (not all-time)
+    const windowStart = new Date(Date.now() - ROLLING_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
+
     const { data: peakRow } = await supabase.from('paper_equity_snapshots')
       .select('equity')
       .eq('user_id', userId)
+      .gte('created_at', windowStart)
       .order('equity', { ascending: false })
       .limit(1)
       .single();
 
     if (!peakRow) {
-      // No equity history → use initial capital as peak
+      // No equity history in window → use initial capital as peak
       return {
         triggered: false,
         currentDrawdown: 0,
         threshold,
         peakEquity: config.initial_capital || config.current_capital,
-        currentEquity: config.current_capital
+        currentEquity: config.current_capital,
+        windowDays: ROLLING_WINDOW_DAYS
       };
     }
 
@@ -155,7 +160,8 @@ async function checkDrawdownCircuitBreaker(supabase, userId, config) {
       currentDrawdown: Math.max(0, currentDrawdown),
       threshold,
       peakEquity,
-      currentEquity
+      currentEquity,
+      windowDays: ROLLING_WINDOW_DAYS
     };
   } catch (err) {
     logger.debug('Drawdown check failed, not triggering', { error: err.message });
@@ -164,7 +170,8 @@ async function checkDrawdownCircuitBreaker(supabase, userId, config) {
       currentDrawdown: 0,
       threshold,
       peakEquity: config.current_capital,
-      currentEquity: config.current_capital
+      currentEquity: config.current_capital,
+      windowDays: ROLLING_WINDOW_DAYS
     };
   }
 }
@@ -188,41 +195,58 @@ async function checkDrawdownCircuitBreaker(supabase, userId, config) {
  * @returns {Promise<{success: boolean, cancelledOrders: number, closedPositions: number}>}
  */
 async function activateKillSwitch(supabase, userId, reason, options = {}) {
-  try {
-    // 1. Disable trading for ALL users (global kill switch)
-    const { error: configError } = await supabase.from('paper_config')
-      .update({ is_enabled: false })
-      .neq('is_enabled', false); // Only update those that are currently enabled
+  const isGlobal = options.global === true; // Requires admin role at API layer
+  const scope = isGlobal ? 'global' : 'user';
 
-    if (configError) {
-      logger.error('Kill switch: failed to disable trading', { error: configError.message });
-      return { success: false, cancelledOrders: 0, closedPositions: 0 };
+  try {
+    // 1. Disable trading — per-user by default, global only if explicitly requested
+    if (isGlobal) {
+      const { error: configError } = await supabase.from('paper_config')
+        .update({ is_enabled: false })
+        .neq('is_enabled', false);
+      if (configError) {
+        logger.error('Kill switch: failed to disable trading (global)', { error: configError.message });
+        return { success: false, cancelledOrders: 0, closedPositions: 0, scope };
+      }
+    } else {
+      const { error: configError } = await supabase.from('paper_config')
+        .update({ is_enabled: false })
+        .eq('user_id', userId);
+      if (configError) {
+        logger.error('Kill switch: failed to disable trading (user)', { error: configError.message });
+        return { success: false, cancelledOrders: 0, closedPositions: 0, scope };
+      }
     }
 
-    // 2. Cancel all pending/validated orders for ALL users
+    // 2. Cancel pending/validated orders — scoped to user or all
     let cancelledOrders = 0;
-    const { data: allCancellable } = await supabase.from('orders')
+    const orderQuery = supabase.from('orders')
       .select('id, user_id')
       .in('status', [ORDER_STATUS.PENDING, ORDER_STATUS.VALIDATED, ORDER_STATUS.SUBMITTED])
       .limit(500);
+    if (!isGlobal) orderQuery.eq('user_id', userId);
+
+    const { data: allCancellable } = await orderQuery;
 
     for (const order of (allCancellable || [])) {
       const { error } = await cancelOrder(supabase, order.user_id, order.id);
       if (!error) cancelledOrders++;
     }
 
-    // 3. Optionally close all open positions for ALL users
+    // 3. Optionally close open positions — scoped
     let closedPositions = 0;
     const { config } = await getOrCreateConfig(supabase, userId);
     if (config?.kill_switch_close_positions) {
       const { executeFullClose, resolveCurrentPrice } = require('./paperTrading');
-      const { data: openTrades } = await supabase.from('paper_trades')
+      const tradesQuery = supabase.from('paper_trades')
         .select('*')
         .in('status', ['open', 'partial']);
+      if (!isGlobal) tradesQuery.eq('user_id', userId);
+
+      const { data: openTrades } = await tradesQuery;
 
       for (const trade of (openTrades || [])) {
         try {
-          // Resolve current market price; fall back to entry_price only if unavailable
           let closePrice;
           try {
             closePrice = resolveCurrentPrice(trade.asset);
@@ -240,7 +264,6 @@ async function activateKillSwitch(supabase, userId, reason, options = {}) {
     }
 
     // 4. Log kill switch event
-    // Create a system order placeholder for the log entry
     const { data: sysOrder } = await supabase.from('orders').insert({
       user_id: userId,
       asset: 'SYSTEM',
@@ -255,7 +278,7 @@ async function activateKillSwitch(supabase, userId, reason, options = {}) {
 
     if (sysOrder) {
       await logExecution(supabase, sysOrder.id, EVENT_TYPE.KILL_SWITCH, {
-        reason,
+        reason, scope,
         cancelledOrders,
         closedPositions,
         activatedAt: new Date().toISOString()
@@ -265,35 +288,43 @@ async function activateKillSwitch(supabase, userId, reason, options = {}) {
     // 5. Notify
     if (options.notifyFn) {
       try {
-        await options.notifyFn(`🚨 KILL SWITCH ACTIVATED\nReason: ${reason}\nOrders cancelled: ${cancelledOrders}\nPositions closed: ${closedPositions}`);
+        await options.notifyFn(`🚨 KILL SWITCH ACTIVATED (${scope})\nReason: ${reason}\nOrders cancelled: ${cancelledOrders}\nPositions closed: ${closedPositions}`);
       } catch (notifyErr) {
         logger.warn('Kill switch notification failed', { error: notifyErr.message });
       }
     }
 
-    logger.warn('GLOBAL kill switch activated', { activatedBy: userId, reason, cancelledOrders, closedPositions });
-    return { success: true, cancelledOrders, closedPositions };
+    logger.warn(`${scope.toUpperCase()} kill switch activated`, { activatedBy: userId, reason, cancelledOrders, closedPositions });
+    return { success: true, cancelledOrders, closedPositions, scope };
   } catch (err) {
     logger.error('activateKillSwitch exception', { error: err.message });
-    return { success: false, cancelledOrders: 0, closedPositions: 0 };
+    return { success: false, cancelledOrders: 0, closedPositions: 0, scope };
   }
 }
 
 /**
- * Deactivate kill switch — re-enable trading for ALL users.
+ * Deactivate kill switch — re-enable trading.
+ * Per-user by default; pass options.global = true to re-enable ALL users (admin only at API layer).
  */
-async function deactivateKillSwitch(supabase, userId) {
+async function deactivateKillSwitch(supabase, userId, options = {}) {
+  const isGlobal = options.global === true;
+  const scope = isGlobal ? 'global' : 'user';
+
   try {
-    const { error } = await supabase.from('paper_config')
+    const query = supabase.from('paper_config')
       .update({ is_enabled: true })
       .neq('is_enabled', true); // Only update those currently disabled
+
+    if (!isGlobal) query.eq('user_id', userId);
+
+    const { error } = await query;
 
     if (error) {
       return { success: false, error: error.message };
     }
 
-    logger.info('GLOBAL kill switch deactivated', { reactivatedBy: userId });
-    return { success: true };
+    logger.info(`${scope.toUpperCase()} kill switch deactivated`, { reactivatedBy: userId, scope });
+    return { success: true, scope };
   } catch (err) {
     logger.error('deactivateKillSwitch exception', { error: err.message });
     return { success: false, error: err.message };

@@ -51,7 +51,7 @@ const DEFAULT_CONFIG = {
   atr_trailing_activation: 2.5,    // Trailing activates at 2.5× ATR profit (avoids noise activation)
   // Portfolio correlation limits
   max_portfolio_correlation: 0.70,  // Block new trade if avg correlation with open positions > 70%
-  max_sector_exposure_pct: 0.60,    // Max 60% of capital in same sector (crypto/metals)
+  max_sector_exposure_pct: 0.60,    // Max 60% of capital in same sector
   max_same_direction_crypto: 3,     // Max same-direction crypto positions
 };
 
@@ -120,14 +120,6 @@ async function updateCapitalAtomic(supabase, userId, delta) {
 function resolveCurrentPrice(asset, marketData) {
   if (!asset || !marketData) return null;
   const lower = asset.toLowerCase();
-
-  // Metals
-  if (lower.includes('gold') || lower.includes('xau') || lower.includes('paxg')) {
-    return marketData?.metals?.gold?.price || null;
-  }
-  if (lower.includes('silver') || lower.includes('xag')) {
-    return marketData?.metals?.silver?.price || null;
-  }
 
   // Crypto - try direct match then search
   if (marketData?.crypto?.[lower]?.price) {
@@ -1850,12 +1842,15 @@ async function getPositionCorrelations(fetchCandles, positions) {
 // PORTFOLIO LIMITS (extracted for reuse by orderManager)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// Per-user lock for portfolio checks (prevents concurrent approval of conflicting trades)
+const portfolioCheckQueue = new Map();
+
 const CRYPTO_ASSETS = ['bitcoin', 'ethereum', 'solana', 'cardano', 'ripple', 'polkadot',
   'avalanche-2', 'dogecoin', 'binancecoin', 'chainlink', 'matic-network', 'tron',
   'shiba-inu', 'litecoin', 'uniswap', 'near', 'aptos', 'arbitrum', 'optimism', 'sui'];
-const METAL_ASSETS = ['gold', 'silver', 'xau', 'xag', 'pax-gold', 'platinum'];
 
-const KNOWN_CORRELATIONS = {
+// Hardcoded fallback — only used when dynamic fetch fails
+const FALLBACK_CORRELATIONS = {
   'bitcoin-ethereum': 0.87, 'bitcoin-solana': 0.82, 'bitcoin-cardano': 0.78,
   'bitcoin-ripple': 0.72, 'bitcoin-polkadot': 0.80, 'bitcoin-avalanche-2': 0.83,
   'bitcoin-dogecoin': 0.68, 'bitcoin-binancecoin': 0.85, 'bitcoin-chainlink': 0.79,
@@ -1864,22 +1859,133 @@ const KNOWN_CORRELATIONS = {
   'solana-avalanche-2': 0.80, 'solana-cardano': 0.76, 'cardano-ripple': 0.74,
 };
 
+// Dynamic correlation cache: { 'btc-eth': { value: 0.87, fetchedAt: Date.now() } }
+const correlationCache = new Map();
+const CORRELATION_CACHE_TTL = 60 * 60 * 1000; // 1 hour
+const CORRELATION_WINDOW_DAYS = 30; // Rolling 30-day window
+
 function classifyAsset(a) {
   const lower = a.toLowerCase();
-  if (METAL_ASSETS.some(m => lower.includes(m))) return 'metal';
   if (CRYPTO_ASSETS.some(c => lower.includes(c))) return 'crypto';
   return 'other';
 }
 
-function getCorrelation(a, b) {
+/**
+ * Calculate Pearson correlation between two arrays of daily returns.
+ */
+function pearsonCorrelation(xReturns, yReturns) {
+  const n = Math.min(xReturns.length, yReturns.length);
+  if (n < 5) return null; // Not enough data
+
+  let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0, sumY2 = 0;
+  for (let i = 0; i < n; i++) {
+    sumX += xReturns[i];
+    sumY += yReturns[i];
+    sumXY += xReturns[i] * yReturns[i];
+    sumX2 += xReturns[i] * xReturns[i];
+    sumY2 += yReturns[i] * yReturns[i];
+  }
+
+  const denom = Math.sqrt((n * sumX2 - sumX * sumX) * (n * sumY2 - sumY * sumY));
+  if (denom === 0) return 0;
+  return (n * sumXY - sumX * sumY) / denom;
+}
+
+/**
+ * Compute daily log returns from close prices.
+ */
+function dailyReturns(closes) {
+  const returns = [];
+  for (let i = 1; i < closes.length; i++) {
+    if (closes[i - 1] > 0 && closes[i] > 0) {
+      returns.push(Math.log(closes[i] / closes[i - 1]));
+    }
+  }
+  return returns;
+}
+
+/**
+ * Get dynamic correlation between two assets using rolling 30-day daily closes.
+ * Results are cached for 1 hour to avoid excessive API calls.
+ * Falls back to hardcoded values on error.
+ */
+async function getCorrelation(a, b) {
   const key1 = `${a}-${b}`;
   const key2 = `${b}-${a}`;
-  if (KNOWN_CORRELATIONS[key1] !== undefined) return KNOWN_CORRELATIONS[key1];
-  if (KNOWN_CORRELATIONS[key2] !== undefined) return KNOWN_CORRELATIONS[key2];
+
+  // Check cache
+  const cached = correlationCache.get(key1) || correlationCache.get(key2);
+  if (cached && (Date.now() - cached.fetchedAt) < CORRELATION_CACHE_TTL) {
+    return cached.value;
+  }
+
+  // Try dynamic calculation from Binance daily candles
+  try {
+    const { fetchOHLCVForAsset, SYMBOL_MAP } = require('./binanceAPI');
+
+    // Both assets must have Binance mapping
+    if (!SYMBOL_MAP[a] || !SYMBOL_MAP[b]) {
+      return _fallbackCorrelation(a, b);
+    }
+
+    const [candlesA, candlesB] = await Promise.all([
+      fetchOHLCVForAsset(a, '1d', CORRELATION_WINDOW_DAYS + 5),
+      fetchOHLCVForAsset(b, '1d', CORRELATION_WINDOW_DAYS + 5),
+    ]);
+
+    if (!candlesA || candlesA.length < 10 || !candlesB || candlesB.length < 10) {
+      return _fallbackCorrelation(a, b);
+    }
+
+    // Align candles by timestamp (daily close)
+    const closesMapB = new Map(candlesB.map(c => [c.timestamp, c.close]));
+    const alignedA = [];
+    const alignedB = [];
+    for (const candle of candlesA) {
+      const bClose = closesMapB.get(candle.timestamp);
+      if (bClose !== undefined) {
+        alignedA.push(candle.close);
+        alignedB.push(bClose);
+      }
+    }
+
+    if (alignedA.length < 10) {
+      return _fallbackCorrelation(a, b);
+    }
+
+    const returnsA = dailyReturns(alignedA);
+    const returnsB = dailyReturns(alignedB);
+    const corr = pearsonCorrelation(returnsA, returnsB);
+
+    if (corr === null) {
+      return _fallbackCorrelation(a, b);
+    }
+
+    // Clamp to [0, 1] since we use it as a risk weight (negative correlation = low risk)
+    const clampedCorr = Math.max(0, Math.min(1, corr));
+
+    // Cache the result
+    correlationCache.set(key1, { value: clampedCorr, fetchedAt: Date.now() });
+
+    logger.debug('Dynamic correlation calculated', { a, b, correlation: clampedCorr.toFixed(3), dataPoints: returnsA.length });
+    return clampedCorr;
+  } catch (err) {
+    logger.debug('Dynamic correlation fetch failed, using fallback', { a, b, error: err.message });
+    return _fallbackCorrelation(a, b);
+  }
+}
+
+/**
+ * Fallback to hardcoded correlations when dynamic fetch fails.
+ */
+function _fallbackCorrelation(a, b) {
+  const key1 = `${a}-${b}`;
+  const key2 = `${b}-${a}`;
+  if (FALLBACK_CORRELATIONS[key1] !== undefined) return FALLBACK_CORRELATIONS[key1];
+  if (FALLBACK_CORRELATIONS[key2] !== undefined) return FALLBACK_CORRELATIONS[key2];
   const classA = classifyAsset(a);
   const classB = classifyAsset(b);
   if (classA === classB && classA === 'crypto') return 0.65;
-  if (classA === classB && classA === 'metal') return 0.70;
   return 0.15;
 }
 
@@ -1894,6 +2000,17 @@ function getCorrelation(a, b) {
  * @returns {Promise<{allowed: boolean, reason: string}>}
  */
 async function checkPortfolioLimits(supabase, userId, signal, config) {
+  // Serialize per-user to prevent race condition where 2 concurrent checks
+  // both see N positions and both approve, exceeding the limit
+  const prev = portfolioCheckQueue.get(userId) || Promise.resolve();
+  const result = prev.then(() => _checkPortfolioLimitsInner(supabase, userId, signal, config));
+  portfolioCheckQueue.set(userId, result.catch(() => {}).finally(() => {
+    if (portfolioCheckQueue.get(userId) === result) portfolioCheckQueue.delete(userId);
+  }));
+  return result;
+}
+
+async function _checkPortfolioLimitsInner(supabase, userId, signal, config) {
   try {
     const { data: openPositions } = await supabase.from('paper_trades')
       .select('asset, direction, position_size_usd, entry_price')
@@ -1943,7 +2060,7 @@ async function checkPortfolioLimits(supabase, userId, signal, config) {
       let weightSum = 0;
       for (const pos of sameDirPositions) {
         const posSize = parseFloat(pos.position_size_usd || 0);
-        const corr = getCorrelation(newAsset, pos.asset.toLowerCase());
+        const corr = await getCorrelation(newAsset, pos.asset.toLowerCase());
         corrWeightSum += corr * posSize;
         weightSum += posSize;
       }
@@ -1990,14 +2107,6 @@ async function evaluateAndExecute(supabase, userId, signals, marketData) {
     }
 
     for (const signal of signals) {
-      // Skip non-crypto assets (metals are reference-only, not tradeable)
-      if (signal.assetClass === 'metal' ||
-          (signal.asset && (signal.asset.includes('GOLD') || signal.asset.includes('SILVER') ||
-           signal.asset.includes('XAU') || signal.asset.includes('XAG')))) {
-        result.skipped.push({ asset: signal.asset, reason: 'Non-crypto asset (reference only)' });
-        continue;
-      }
-
       // Evaluate signal eligibility
       const { eligible, reason } = evaluateSignalForTrade(signal, config);
       if (!eligible) {

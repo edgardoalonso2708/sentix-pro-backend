@@ -42,6 +42,7 @@ const {
 } = require('./security');
 const { Resend } = require('resend');
 const { logger } = require('./logger');
+const { fetchOHLCVForAsset, VALID_INTERVALS } = require('./binanceAPI');
 const { classifyAxiosError, Provider } = require('./errors');
 const { getFeatures, getFeaturesForAssets, getCacheStats } = require('./featureStore');
 const { getAllRegimes, getRegime } = require('./marketRegime');
@@ -399,6 +400,37 @@ app.get('/api/market', (req, res) => {
     return res.status(503).json({ error: 'Market data not yet available' });
   }
   res.json(cachedMarketData);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CANDLE DATA (OHLCV) ROUTE
+// ═══════════════════════════════════════════════════════════════════════════════
+
+app.get('/api/candles/:asset', async (req, res) => {
+  try {
+    const { asset } = req.params;
+    const interval = req.query.interval || '1h';
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 200, 1), 1000);
+
+    if (!VALID_INTERVALS[interval]) {
+      return res.status(400).json({ error: `Invalid interval. Valid: ${Object.keys(VALID_INTERVALS).join(', ')}` });
+    }
+
+    const candles = await fetchOHLCVForAsset(asset, interval, limit);
+    const formatted = candles.map(c => ({
+      time: Math.floor(c.timestamp / 1000),
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+      volume: c.volume
+    }));
+
+    res.json(formatted);
+  } catch (e) {
+    logger.error('Candle fetch error', { asset: req.params.asset, error: e.message });
+    res.status(400).json({ error: e.message });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1802,7 +1834,14 @@ app.post('/api/risk/:userId/kill-switch', async (req, res) => {
     if (!isValidUserId(userId)) return res.status(400).json({ error: 'Invalid user ID' });
 
     const reason = req.body?.reason || 'Manual activation';
-    const result = await activateKillSwitch(supabase, userId, reason);
+    const isGlobal = req.body?.global === true;
+
+    // Global kill switch requires admin role
+    if (isGlobal && req.userRole !== 'admin') {
+      return res.status(403).json({ error: 'Global kill switch requires admin role' });
+    }
+
+    const result = await activateKillSwitch(supabase, userId, reason, { global: isGlobal });
 
     if (!result.success) {
       return res.status(500).json({ error: 'Failed to activate kill switch' });
@@ -1814,7 +1853,7 @@ app.post('/api/risk/:userId/kill-switch', async (req, res) => {
     // Audit log
     await logAudit(supabase, {
       userId: req.userId, action: 'kill_switch',
-      resource: 'risk', details: { active: true, reason, ...result },
+      resource: 'risk', details: { active: true, reason, scope: result.scope, ...result },
       ...auditContext(req)
     });
 
@@ -1831,14 +1870,21 @@ app.delete('/api/risk/:userId/kill-switch', async (req, res) => {
     const userId = sanitizeInput(req.params.userId);
     if (!isValidUserId(userId)) return res.status(400).json({ error: 'Invalid user ID' });
 
-    const result = await deactivateKillSwitch(supabase, userId);
+    const isGlobal = req.query?.global === 'true' || req.body?.global === true;
+
+    // Global deactivation requires admin role
+    if (isGlobal && req.userRole !== 'admin') {
+      return res.status(403).json({ error: 'Global kill switch deactivation requires admin role' });
+    }
+
+    const result = await deactivateKillSwitch(supabase, userId, { global: isGlobal });
     if (!result.success) {
       return res.status(500).json({ error: result.error || 'Failed to deactivate kill switch' });
     }
 
-    broadcastSSE('kill_switch', { active: false });
+    broadcastSSE('kill_switch', { active: false, scope: result.scope });
 
-    res.json({ success: true });
+    res.json({ success: true, ...result });
   } catch (err) {
     logger.error('DELETE /api/risk/kill-switch error', { error: err.message });
     res.status(500).json({ error: 'Failed to deactivate kill switch' });
@@ -2027,6 +2073,7 @@ app.post('/api/backtest/run', async (req, res) => {
           monte_carlo: mcForClient,
           significance: result.significance || null,
           kelly_sizing: result.kellySizing || null,
+          benchmark: result.benchmark || null,
           completed_at: new Date().toISOString(), created_at: backtestStore.get(recordId)?.created_at
         };
 
@@ -2048,6 +2095,7 @@ app.post('/api/backtest/run', async (req, res) => {
               monte_carlo: mcForClient,
               significance: result.significance || null,
               kelly_sizing: result.kellySizing || null,
+              benchmark: result.benchmark || null,
               completed_at: new Date().toISOString()
             }).eq('id', recordId);
             if (updateErr) logger.error(`Backtest DB update FAILED [${updateErr.code}]: ${updateErr.message} | hint: ${updateErr.hint || 'none'} | details: ${updateErr.details || 'none'}`);
@@ -2530,7 +2578,7 @@ if (bot.isActive()) {
     }
 
     let message = '🎯 *Señales Activas*\n\n';
-    // Show top 8 signals (including metals)
+    // Show top 8 signals
     signals.slice(0, 8).forEach(s => {
       const emoji = s.action === 'BUY' ? '🟢' : s.action === 'SELL' ? '🔴' : '⚪';
       message += `${emoji} *${s.asset}* - ${s.strengthLabel || s.action}\n`;
@@ -2552,18 +2600,8 @@ if (bot.isActive()) {
         `💎 *${asset.toUpperCase()}*\nPrecio: $${data.price.toLocaleString()}\n24h: ${data.change24h >= 0 ? '+' : ''}${data.change24h.toFixed(2)}%`,
         { parse_mode: 'Markdown' }
       );
-    } else if (asset.includes('gold') || asset.includes('oro')) {
-      const gold = marketData?.metals?.gold;
-      if (gold) {
-        await bot.sendMessage(chatId, `🥇 *ORO (XAU)*\nPrecio: $${gold.price.toLocaleString()}\n24h: ${(gold.change24h || 0).toFixed(2)}%`, { parse_mode: 'Markdown' });
-      }
-    } else if (asset.includes('silver') || asset.includes('plata')) {
-      const silver = marketData?.metals?.silver;
-      if (silver) {
-        await bot.sendMessage(chatId, `🥈 *PLATA (XAG)*\nPrecio: $${silver.price.toLocaleString()}\n24h: ${(silver.change24h || 0).toFixed(2)}%`, { parse_mode: 'Markdown' });
-      }
     } else {
-      await bot.sendMessage(chatId, '❌ Asset no encontrado. Usa: bitcoin, ethereum, solana, oro, plata, etc.');
+      await bot.sendMessage(chatId, '❌ Asset no encontrado. Usa: bitcoin, ethereum, solana, etc.');
     }
   });
 
@@ -2577,11 +2615,6 @@ if (bot.isActive()) {
         `BTC Dom: ${marketData.macro.btcDom}%\n` +
         `DXY: ${marketData.macro.dxy || '—'} (${marketData.macro.dxyTrend || 'N/A'})\n` +
         `Market Cap: $${(marketData.macro.globalMcap / 1e12).toFixed(2)}T\n`;
-
-      if (marketData.metals?.gold) {
-        message += `\n🥇 Oro: $${marketData.metals.gold.price.toLocaleString()}\n`;
-        message += `🥈 Plata: $${marketData.metals.silver?.price?.toLocaleString() || 'N/A'}`;
-      }
 
       await bot.sendMessage(chatId, message, { parse_mode: 'Markdown' });
     } else {
