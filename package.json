@@ -7,9 +7,9 @@
     "start": "node orchestrator.js",
     "start:legacy": "node server.js",
     "dev": "nodemon orchestrator.js",
-    "test": "jest --testPathIgnorePatterns='worktrees'",
-    "test:watch": "jest --watch --testPathIgnorePatterns='worktrees'",
-    "test:coverage": "jest --coverage --testPathIgnorePatterns='worktrees'"
+    "test": "jest --testPathIgnorePatterns='agent-'",
+    "test:watch": "jest --watch --testPathIgnorePatterns='agent-'",
+    "test:coverage": "jest --coverage --testPathIgnorePatterns='agent-'"
   },
   "keywords": [
     "trading",
