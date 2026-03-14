@@ -1365,6 +1365,48 @@ async function runBacktest(options, onProgress = null) {
   // ─── 6b. Buy & Hold benchmark ──────────────────────────────────────
   const backtestCandles1h = candles1h.slice(firstStepIndex);
   const buyAndHold = calculateBuyAndHoldMetrics(backtestCandles1h, capital);
+  // Information Ratio: (strategy daily returns - B&H daily returns) / tracking error
+  let informationRatio = 0;
+  if (buyAndHold.equityCurve.length >= 3 && equityCurve.length >= 3) {
+    const dayMs = 24 * 60 * 60 * 1000;
+
+    // Build daily returns for strategy
+    const stratDailyMap = new Map();
+    for (const pt of equityCurve) {
+      const dayNum = Math.floor(pt.timestamp / dayMs);
+      stratDailyMap.set(dayNum, pt.equity);
+    }
+
+    // Build daily returns for B&H
+    const bhDailyMap = new Map();
+    for (const pt of buyAndHold.equityCurve) {
+      const dayNum = Math.floor(pt.timestamp / dayMs);
+      bhDailyMap.set(dayNum, pt.equity);
+    }
+
+    // Align days and compute excess returns
+    const allDays = [...new Set([...stratDailyMap.keys(), ...bhDailyMap.keys()])].sort((a, b) => a - b);
+    const excessReturns = [];
+    for (let i = 1; i < allDays.length; i++) {
+      const sNow = stratDailyMap.get(allDays[i]);
+      const sPrev = stratDailyMap.get(allDays[i - 1]);
+      const bNow = bhDailyMap.get(allDays[i]);
+      const bPrev = bhDailyMap.get(allDays[i - 1]);
+      if (sNow && sPrev && sPrev > 0 && bNow && bPrev && bPrev > 0) {
+        const sReturn = (sNow - sPrev) / sPrev;
+        const bReturn = (bNow - bPrev) / bPrev;
+        excessReturns.push(sReturn - bReturn);
+      }
+    }
+
+    if (excessReturns.length >= 2) {
+      const avgExcess = excessReturns.reduce((s, r) => s + r, 0) / excessReturns.length;
+      const trackingVariance = excessReturns.reduce((s, r) => s + Math.pow(r - avgExcess, 2), 0) / (excessReturns.length - 1);
+      const trackingError = Math.sqrt(trackingVariance);
+      informationRatio = trackingError > 0 ? Math.round((avgExcess / trackingError) * Math.sqrt(365) * 100) / 100 : 0;
+    }
+  }
+
   const benchmark = {
     buyAndHold: {
       totalReturn: buyAndHold.totalReturn,
@@ -1376,7 +1418,8 @@ async function runBacktest(options, onProgress = null) {
     comparison: {
       returnDiff: Math.round((metrics.totalPnlPercent - buyAndHold.totalReturn) * 100) / 100,
       drawdownDiff: Math.round((metrics.maxDrawdownPercent - buyAndHold.maxDrawdown) * 100) / 100,
-      sharpeDiff: Math.round((metrics.sharpeRatio - buyAndHold.sharpeRatio) * 100) / 100
+      sharpeDiff: Math.round((metrics.sharpeRatio - buyAndHold.sharpeRatio) * 100) / 100,
+      informationRatio
     }
   };
 
@@ -1487,6 +1530,182 @@ async function runBacktest(options, onProgress = null) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// MULTI-ASSET PORTFOLIO BACKTEST
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Run backtests across multiple assets simultaneously and compute portfolio-level metrics.
+ * Capital is split equally among assets. Equity curves are merged by timestamp.
+ *
+ * @param {object} options
+ * @param {string[]} options.assets - Array of asset IDs (e.g., ['bitcoin', 'ethereum', 'solana'])
+ * @param {number} [options.days=90]
+ * @param {number} [options.capital=10000] - Total portfolio capital (split equally)
+ * @param {number} [options.riskPerTrade=0.02]
+ * @param {number} [options.maxOpenPositions=3] - Per asset
+ * @param {object} [options.strategyConfig]
+ * @param {object} [options.kellySizing]
+ * @param {Function} [options.onProgress]
+ * @returns {Promise<object>} Portfolio backtest results
+ */
+async function runPortfolioBacktest(options = {}) {
+  const {
+    assets = ['bitcoin', 'ethereum', 'solana'],
+    days = 90,
+    capital = 10000,
+    riskPerTrade = 0.02,
+    maxOpenPositions = 3,
+    stepInterval = '4h',
+    strategyConfig = null,
+    kellySizing = null,
+    onProgress = null
+  } = options;
+
+  if (!assets || assets.length < 2 || assets.length > 5) {
+    throw new Error('Portfolio backtest requires 2-5 assets');
+  }
+
+  const startTime = Date.now();
+  const capitalPerAsset = capital / assets.length;
+
+  // Run individual backtests in parallel
+  if (onProgress) onProgress({ phase: 'running', message: `Ejecutando backtests para ${assets.length} assets...`, current: 0, total: assets.length });
+
+  const assetResults = await Promise.all(
+    assets.map(async (asset, idx) => {
+      try {
+        const result = await runBacktest({
+          asset,
+          days,
+          capital: capitalPerAsset,
+          riskPerTrade,
+          maxOpenPositions,
+          stepInterval,
+          strategyConfig,
+          kellySizing,
+          cooldownBars: 6,
+          fearGreed: 50
+        });
+
+        if (onProgress) onProgress({ phase: 'running', message: `Completado: ${asset}`, current: idx + 1, total: assets.length });
+        return { asset, result, error: null };
+      } catch (err) {
+        logger.warn('Portfolio backtest: asset failed', { asset, error: err.message });
+        if (onProgress) onProgress({ phase: 'running', message: `Error: ${asset} — ${err.message}`, current: idx + 1, total: assets.length });
+        return { asset, result: null, error: err.message };
+      }
+    })
+  );
+
+  const successfulAssets = assetResults.filter(a => a.result !== null);
+  if (successfulAssets.length === 0) {
+    throw new Error('All asset backtests failed');
+  }
+
+  // Merge equity curves by timestamp — sum equity across assets
+  const dayMs = 24 * 60 * 60 * 1000;
+  const equityByDay = new Map();
+
+  for (const { asset, result } of successfulAssets) {
+    for (const pt of result.equityCurve) {
+      const dayKey = Math.floor(pt.timestamp / dayMs);
+      if (!equityByDay.has(dayKey)) {
+        equityByDay.set(dayKey, { timestamp: pt.timestamp, equity: 0 });
+      }
+      equityByDay.get(dayKey).equity += pt.equity;
+    }
+  }
+
+  const portfolioEquityCurve = [...equityByDay.values()].sort((a, b) => a.timestamp - b.timestamp);
+
+  // Merge all trades
+  const allTrades = [];
+  for (const { result } of successfulAssets) {
+    allTrades.push(...result.trades);
+  }
+  allTrades.sort((a, b) => a.entryTimestamp - b.entryTimestamp);
+
+  // Portfolio-level metrics
+  const totalCapitalUsed = successfulAssets.length * capitalPerAsset;
+  const portfolioMetrics = calculateBacktestMetrics(
+    allTrades.map(t => ({ ...t, holdingBars: t.holdingBars || 0 })),
+    portfolioEquityCurve,
+    totalCapitalUsed,
+    days
+  );
+
+  // Portfolio B&H benchmark: equal-weight basket
+  const assetBHReturns = successfulAssets
+    .map(a => a.result.benchmark?.buyAndHold?.totalReturn || 0);
+  const portfolioBHReturn = assetBHReturns.reduce((s, r) => s + r, 0) / assetBHReturns.length;
+  const assetBHSharpes = successfulAssets
+    .map(a => a.result.benchmark?.buyAndHold?.sharpeRatio || 0);
+  const portfolioBHSharpe = assetBHSharpes.reduce((s, r) => s + r, 0) / assetBHSharpes.length;
+
+  // Portfolio Monte Carlo
+  const portfolioMC = runMonteCarloSimulation(allTrades, totalCapitalUsed, {
+    simulations: 1000,
+    seed: 42,
+    blockSize: 10
+  });
+
+  // Per-asset summary
+  const perAssetSummary = assetResults.map(({ asset, result, error }) => {
+    if (error) return { asset, error };
+    return {
+      asset,
+      totalReturn: result.metrics.totalPnlPercent,
+      sharpe: result.metrics.sharpeRatio,
+      winRate: result.metrics.winRate,
+      totalTrades: result.metrics.totalTrades,
+      maxDrawdown: result.metrics.maxDrawdownPercent,
+      profitFactor: result.metrics.profitFactor,
+      informationRatio: result.benchmark?.comparison?.informationRatio || 0
+    };
+  });
+
+  // Diversification ratio: portfolio vol / weighted avg individual vols
+  // Approximate using max drawdowns
+  const avgAssetDD = successfulAssets.reduce((s, a) => s + a.result.metrics.maxDrawdownPercent, 0) / successfulAssets.length;
+  const diversificationRatio = avgAssetDD > 0
+    ? Math.round((portfolioMetrics.maxDrawdownPercent / avgAssetDD) * 100) / 100
+    : 1;
+
+  const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+
+  if (onProgress) onProgress({ phase: 'completed', message: 'Portfolio backtest completado' });
+
+  logger.info('Portfolio backtest completed', {
+    assets: assets.join(', '), days, duration: duration + 's',
+    totalTrades: portfolioMetrics.totalTrades,
+    portfolioReturn: portfolioMetrics.totalPnlPercent + '%',
+    diversificationRatio
+  });
+
+  return {
+    type: 'portfolio',
+    config: { assets, days, stepInterval, capital, capitalPerAsset, riskPerTrade, maxOpenPositions, strategyConfig },
+    metrics: portfolioMetrics,
+    benchmark: {
+      buyAndHold: {
+        totalReturn: Math.round(portfolioBHReturn * 100) / 100,
+        sharpeRatio: Math.round(portfolioBHSharpe * 100) / 100
+      },
+      comparison: {
+        returnDiff: Math.round((portfolioMetrics.totalPnlPercent - portfolioBHReturn) * 100) / 100,
+        sharpeDiff: Math.round((portfolioMetrics.sharpeRatio - portfolioBHSharpe) * 100) / 100
+      }
+    },
+    monteCarlo: portfolioMC,
+    perAsset: perAssetSummary,
+    diversificationRatio,
+    trades: allTrades,
+    equityCurve: portfolioEquityCurve,
+    duration: parseFloat(duration)
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // EXPORTS
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1499,6 +1718,7 @@ module.exports = {
   fetchHistoricalDXY,
   lookupByTimestamp,
   runBacktest,
+  runPortfolioBacktest,
   simulateTradeExecution,
   calculateBacktestMetrics,
   calculateBuyAndHoldMetrics,

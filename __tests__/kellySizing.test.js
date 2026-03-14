@@ -23,12 +23,11 @@ function generateTrades(count, winRate, avgWin = 100, avgLoss = -50) {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe('computeKellyFraction', () => {
-  test('returns applied:false when disabled (default)', () => {
+  test('returns applied:true when using defaults (enabled by default)', () => {
     const trades = generateTrades(50, 0.6);
-    const result = computeKellyFraction(trades); // no config → defaults (disabled)
-    expect(result.applied).toBe(false);
-    expect(result.reason).toBe('kelly_disabled');
-    expect(result.kellyFraction).toBeNull();
+    const result = computeKellyFraction(trades); // no config → defaults (enabled)
+    expect(result.applied).toBe(true);
+    expect(result.reason).toBe('computed');
   });
 
   test('returns applied:false when explicitly disabled', () => {
@@ -59,11 +58,11 @@ describe('computeKellyFraction', () => {
     expect(result.minTrades).toBe(20);
   });
 
-  test('computes correct Kelly for 60% WR, R=2.0 (half-Kelly)', () => {
+  test('computes correct Kelly for 60% WR, R=2.0 (quarter-Kelly)', () => {
     // 60% wins at $100, 40% losses at $50 → R = 100/50 = 2.0
     // rawKelly = 0.6 - 0.4/2.0 = 0.6 - 0.2 = 0.4
-    // halfKelly = 0.4 * 0.5 = 0.20 (20%)
-    // Clamped to maxRiskPerTrade = 0.05 → 5%
+    // quarterKelly = 0.4 * 0.25 = 0.10 (10%)
+    // Clamped to maxRiskPerTrade = 0.02 → 2%
     const trades = generateTrades(100, 0.6, 100, -50);
     const result = computeKellyFraction(trades, { enabled: true });
     expect(result.applied).toBe(true);
@@ -71,30 +70,30 @@ describe('computeKellyFraction', () => {
     expect(result.rawKelly).toBeCloseTo(0.4, 2);
     expect(result.winRate).toBeCloseTo(0.6, 2);
     expect(result.payoffRatio).toBeCloseTo(2.0, 1);
-    // halfKelly = 0.2, but capped at maxRiskPerTrade 0.05
-    expect(result.kellyFraction).toBe(0.05);
+    // quarterKelly = 0.10, but capped at maxRiskPerTrade 0.02
+    expect(result.kellyFraction).toBe(0.02);
   });
 
   test('computes correct Kelly for moderate edge with custom fraction', () => {
     // Use exact counts: 28 wins at $150, 22 losses at -$100 from 50 trades
     // winRate = 28/50 = 0.56, R = 150/100 = 1.5
     // rawKelly = 0.56 - 0.44/1.5 ≈ 0.2667
-    // quarterKelly = 0.2667 * 0.25 ≈ 0.0667 → capped to 0.05
+    // quarterKelly = 0.2667 * 0.25 ≈ 0.0667 → capped to 0.02 (new default max)
     const trades = generateTrades(50, 0.56, 150, -100);
     const result = computeKellyFraction(trades, { enabled: true, fraction: 0.25 });
     expect(result.applied).toBe(true);
     expect(result.rawKelly).toBeGreaterThan(0.2);
-    expect(result.kellyFraction).toBe(0.05); // capped at maxRiskPerTrade
+    expect(result.kellyFraction).toBe(0.02); // capped at maxRiskPerTrade
   });
 
   test('computes Kelly within bounds for small edge', () => {
     // 52% WR, R=1.0 → rawKelly = 0.52 - 0.48/1.0 = 0.04
-    // halfKelly = 0.04 * 0.5 = 0.02
+    // quarterKelly = 0.04 * 0.25 = 0.01
     const trades = generateTrades(50, 0.52, 100, -100);
     const result = computeKellyFraction(trades, { enabled: true });
     expect(result.applied).toBe(true);
     expect(result.rawKelly).toBeCloseTo(0.04, 2);
-    expect(result.kellyFraction).toBeCloseTo(0.02, 3);
+    expect(result.kellyFraction).toBeCloseTo(0.01, 3);
   });
 
   test('negative edge returns minRiskPerTrade', () => {
@@ -284,7 +283,10 @@ describe('buildSizingOptions', () => {
 
   test('both disabled returns both applied:false', () => {
     const trades = generateTrades(50, 0.6, 100, -50);
-    const result = buildSizingOptions(trades, 3.0, {});
+    const result = buildSizingOptions(trades, 3.0, {
+      kelly: { enabled: false },
+      volatilityTargeting: { enabled: false }
+    });
     expect(result.kellyResult.applied).toBe(false);
     expect(result.volResult.applied).toBe(false);
   });
@@ -298,9 +300,10 @@ describe('buildSizingOptions', () => {
     expect(result.volResult.applied).toBe(false);
   });
 
-  test('Vol only (no kelly config)', () => {
+  test('Vol only (kelly explicitly disabled)', () => {
     const trades = generateTrades(50, 0.6, 100, -50);
     const result = buildSizingOptions(trades, 3.0, {
+      kelly: { enabled: false },
       volatilityTargeting: { enabled: true, targetATRPercent: 2.0 }
     });
     expect(result.kellyResult.applied).toBe(false);
