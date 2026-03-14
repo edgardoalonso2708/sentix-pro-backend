@@ -1,18 +1,101 @@
 'use client'
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
+import { createClient } from "@supabase/supabase-js";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SENTIX PRO - FRONTEND COMPLETO
 // Dashboard, Señales, Portfolio, Alertas - Versión Full
 // ═══════════════════════════════════════════════════════════════════════════════
 
+// ─── SUPABASE CLIENT (singleton, outside component) ────────────────────────
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
+const supabase = supabaseUrl && supabaseAnonKey
+  ? createClient(supabaseUrl, supabaseAnonKey)
+  : null;
+
 export default function SentixProFrontend() {
-  
+
   // ─── CONFIGURATION ─────────────────────────────────────────────────────────
   const rawApiUrl = (process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001').replace(/\/+$/, '');
   const API_URL = rawApiUrl.startsWith('http') ? rawApiUrl : `https://${rawApiUrl}`;
-  
+
+  // ─── AUTH STATE ──────────────────────────────────────────────────────────
+  const [session, setSession] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authError, setAuthError] = useState(null);
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authMode, setAuthMode] = useState('login'); // 'login' | 'register'
+
+  // Derive userId from session (fallback for dev without Supabase configured)
+  const USER_ID = session?.user?.id || 'default-user';
+  const accessToken = session?.access_token || null;
+
+  // Auth-aware fetch wrapper — injects Authorization header automatically
+  const authFetch = useCallback((url, options = {}) => {
+    const headers = { ...options.headers };
+    if (accessToken) {
+      headers['Authorization'] = `Bearer ${accessToken}`;
+    }
+    return fetch(url, { ...options, headers });
+  }, [accessToken]);
+
+  // ─── AUTH LIFECYCLE ──────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!supabase) {
+      // Supabase not configured — skip auth (dev mode)
+      setAuthLoading(false);
+      return;
+    }
+
+    // Get initial session
+    supabase.auth.getSession().then(({ data: { session: s } }) => {
+      setSession(s);
+      setAuthLoading(false);
+    });
+
+    // Listen for auth changes (login, logout, token refresh)
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      (_event, s) => setSession(s)
+    );
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  const handleLogin = async (e) => {
+    e.preventDefault();
+    setAuthError(null);
+    const { error } = await supabase.auth.signInWithPassword({
+      email: authEmail,
+      password: authPassword,
+    });
+    if (error) setAuthError(error.message);
+  };
+
+  const handleRegister = async (e) => {
+    e.preventDefault();
+    setAuthError(null);
+    const { error } = await supabase.auth.signUp({
+      email: authEmail,
+      password: authPassword,
+    });
+    if (error) setAuthError(error.message);
+    else setAuthError('Check your email to confirm your account.');
+  };
+
+  const handleOAuthLogin = async (provider) => {
+    setAuthError(null);
+    const { error } = await supabase.auth.signInWithOAuth({ provider });
+    if (error) setAuthError(error.message);
+  };
+
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+    setSession(null);
+  };
+
   // ─── STATE ─────────────────────────────────────────────────────────────────
   const [marketData, setMarketData] = useState(null);
   const [signals, setSignals] = useState([]);
@@ -20,10 +103,10 @@ export default function SentixProFrontend() {
   const [loading, setLoading] = useState(true);
   const [lastUpdate, setLastUpdate] = useState(null);
   const [tab, setTab] = useState("dashboard");
-  
+
   // Alert config
   const [alertConfig, setAlertConfig] = useState({
-    email: "edgardoalonso2708@gmail.com",
+    email: session?.user?.email || '',
     telegramEnabled: false,
     minConfidence: 75,
   });
@@ -33,7 +116,10 @@ export default function SentixProFrontend() {
   const [wallets, setWallets] = useState([]);
   const [portfolioLoading, setPortfolioLoading] = useState(false);
   const [walletsLoading, setWalletsLoading] = useState(false);
-  const USER_ID = 'default-user';
+
+  // SSE connection status
+  const [sseConnected, setSseConnected] = useState(false);
+  const sseRef = useRef(null);
 
   // Paper Trading
   const [paperConfig, setPaperConfig] = useState(null);
@@ -78,7 +164,7 @@ export default function SentixProFrontend() {
   const fetchWallets = useCallback(async () => {
     try {
       setWalletsLoading(true);
-      const response = await fetch(`${API_URL}/api/wallets/${USER_ID}`);
+      const response = await authFetch(`${API_URL}/api/wallets/${USER_ID}`);
       if (response.ok) {
         const data = await response.json();
         setWallets(data.wallets || []);
@@ -88,12 +174,12 @@ export default function SentixProFrontend() {
     } finally {
       setWalletsLoading(false);
     }
-  }, [API_URL]);
+  }, [API_URL, USER_ID, authFetch]);
 
   const fetchPortfolio = useCallback(async () => {
     try {
       setPortfolioLoading(true);
-      const response = await fetch(`${API_URL}/api/portfolio/${USER_ID}`);
+      const response = await authFetch(`${API_URL}/api/portfolio/${USER_ID}`);
       if (response.ok) {
         const data = await response.json();
         // Flatten wallet positions into portfolio array
@@ -123,13 +209,86 @@ export default function SentixProFrontend() {
     } finally {
       setPortfolioLoading(false);
     }
-  }, [API_URL]);
+  }, [API_URL, USER_ID, authFetch]);
 
-  // ─── INITIAL LOAD & AUTO-REFRESH ───────────────────────────────────────────
+  // ─── SSE REAL-TIME CONNECTION ──────────────────────────────────────────────
+  // Replaces 30s polling with instant server-pushed updates.
+  // Falls back to polling if SSE fails or disconnects.
   useEffect(() => {
+    let reconnectTimer = null;
+    let fallbackInterval = null;
+    const RECONNECT_DELAY = 5000;
+
+    const connectSSE = () => {
+      // Close previous connection if any
+      if (sseRef.current) {
+        sseRef.current.close();
+      }
+
+      // Pass auth token via query param (EventSource doesn't support headers)
+      const tokenParam = accessToken ? `?token=${encodeURIComponent(accessToken)}` : '';
+      const streamUrl = `${API_URL}/api/stream${tokenParam}`;
+      const es = new EventSource(streamUrl);
+      sseRef.current = es;
+
+      es.onopen = () => {
+        setSseConnected(true);
+        setLoading(false);
+        // Clear fallback polling when SSE is active
+        if (fallbackInterval) {
+          clearInterval(fallbackInterval);
+          fallbackInterval = null;
+        }
+      };
+
+      es.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          switch (msg.type) {
+            case 'market':
+              setMarketData(msg.data);
+              setLastUpdate(new Date());
+              break;
+            case 'signals':
+              setSignals(Array.isArray(msg.data) ? msg.data : []);
+              break;
+            case 'paper_trade':
+              // Trigger paper data refresh on trade events
+              if (typeof window.__sentixRefreshPaper === 'function') {
+                window.__sentixRefreshPaper();
+              }
+              break;
+            case 'connected':
+              // Initial connection acknowledged
+              break;
+            case 'shutdown':
+              // Server is shutting down — will auto-reconnect via onerror
+              break;
+          }
+        } catch (err) {
+          console.error('SSE parse error:', err);
+        }
+      };
+
+      es.onerror = () => {
+        es.close();
+        sseRef.current = null;
+        setSseConnected(false);
+        // Start fallback polling while disconnected
+        if (!fallbackInterval) {
+          fallbackInterval = setInterval(() => {
+            fetchMarketData();
+            fetchSignals();
+          }, 30000);
+        }
+        // Schedule reconnect attempt
+        reconnectTimer = setTimeout(connectSSE, RECONNECT_DELAY);
+      };
+    };
+
+    // Initial REST load (fast first paint), then upgrade to SSE
     const loadData = async () => {
       setLoading(true);
-      // Use Promise.allSettled so one failure doesn't block everything
       await Promise.allSettled([
         fetchMarketData(),
         fetchSignals(),
@@ -139,15 +298,14 @@ export default function SentixProFrontend() {
     };
 
     loadData();
+    connectSSE();
 
-    // Auto-refresh every 30 seconds
-    const interval = setInterval(() => {
-      fetchMarketData();
-      fetchSignals();
-    }, 30000);
-
-    return () => clearInterval(interval);
-  }, [fetchMarketData, fetchSignals, fetchAlerts]);
+    return () => {
+      if (sseRef.current) sseRef.current.close();
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (fallbackInterval) clearInterval(fallbackInterval);
+    };
+  }, [API_URL, accessToken, fetchMarketData, fetchSignals, fetchAlerts]);
 
   // ─── PORTFOLIO FUNCTIONS ───────────────────────────────────────────────────
   const addToPortfolio = (asset, amount, buyPrice) => {
@@ -280,13 +438,14 @@ export default function SentixProFrontend() {
               boxShadow: `0 0 10px ${green}`,
               animation: "pulse 2s infinite"
             }} />
-            <span style={{ fontSize: 13, fontWeight: 700, color: green }}>
-              🔴 LIVE - Datos actualizándose cada 30 segundos
+            <span style={{ fontSize: 13, fontWeight: 700, color: sseConnected ? green : "#f59e0b" }}>
+              {sseConnected ? "LIVE — Streaming en tiempo real" : "POLLING — Reconectando SSE..."}
             </span>
           </div>
           {lastUpdate && (
             <span style={{ fontSize: 11, color: muted, fontFamily: "monospace" }}>
               Última actualización: {lastUpdate.toLocaleTimeString()}
+              {sseConnected && " • SSE"}
             </span>
           )}
         </div>
@@ -755,7 +914,7 @@ export default function SentixProFrontend() {
     const handleCreateWallet = async () => {
       if (!newWallet.name.trim()) return;
       try {
-        const response = await fetch(`${API_URL}/api/wallets`, {
+        const response = await authFetch(`${API_URL}/api/wallets`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -790,7 +949,7 @@ export default function SentixProFrontend() {
       setSaving(true);
       try {
         // Get current positions for this wallet, then add the new one
-        const res = await fetch(`${API_URL}/api/portfolio/${USER_ID}/wallet/${newPosition.walletId}`);
+        const res = await authFetch(`${API_URL}/api/portfolio/${USER_ID}/wallet/${newPosition.walletId}`);
         const data = res.ok ? await res.json() : { wallet: { positions: [] } };
         const existingPositions = (data.wallet?.positions || []).map(p => ({
           asset: p.asset,
@@ -812,7 +971,7 @@ export default function SentixProFrontend() {
         });
 
         // Save all positions to wallet via JSON endpoint
-        const saveRes = await fetch(`${API_URL}/api/portfolio/save`, {
+        const saveRes = await authFetch(`${API_URL}/api/portfolio/save`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -844,7 +1003,7 @@ export default function SentixProFrontend() {
 
     const handleRemovePosition = async (positionId) => {
       try {
-        const response = await fetch(`${API_URL}/api/portfolio/${USER_ID}/${positionId}`, {
+        const response = await authFetch(`${API_URL}/api/portfolio/${USER_ID}/${positionId}`, {
           method: 'DELETE'
         });
         if (response.ok) {
@@ -875,7 +1034,7 @@ export default function SentixProFrontend() {
         formData.append('userId', USER_ID);
         formData.append('walletId', uploadWalletId);
 
-        const response = await fetch(`${API_URL}/api/portfolio/upload`, {
+        const response = await authFetch(`${API_URL}/api/portfolio/upload`, {
           method: 'POST',
           body: formData,
         });
@@ -1575,10 +1734,10 @@ export default function SentixProFrontend() {
       setPaperLoading(true);
       try {
         const [configRes, posRes, histRes, perfRes] = await Promise.allSettled([
-          fetch(`${API_URL}/api/paper/config/${USER_ID}`),
-          fetch(`${API_URL}/api/paper/positions/${USER_ID}`),
-          fetch(`${API_URL}/api/paper/history/${USER_ID}?status=closed&limit=${HISTORY_PAGE_SIZE}&offset=${historyPage * HISTORY_PAGE_SIZE}`),
-          fetch(`${API_URL}/api/paper/performance/${USER_ID}`)
+          authFetch(`${API_URL}/api/paper/config/${USER_ID}`),
+          authFetch(`${API_URL}/api/paper/positions/${USER_ID}`),
+          authFetch(`${API_URL}/api/paper/history/${USER_ID}?status=closed&limit=${HISTORY_PAGE_SIZE}&offset=${historyPage * HISTORY_PAGE_SIZE}`),
+          authFetch(`${API_URL}/api/paper/performance/${USER_ID}`)
         ]);
 
         if (configRes.status === 'fulfilled' && configRes.value.ok) {
@@ -1608,17 +1767,24 @@ export default function SentixProFrontend() {
 
     useEffect(() => { loadPaperData(); }, [historyPage]);
 
-    // Auto refresh every 30s
+    // Refresh paper data on SSE paper_trade events (replaces 30s polling)
     useEffect(() => {
-      const interval = setInterval(loadPaperData, 30000);
-      return () => clearInterval(interval);
-    }, [historyPage]);
+      window.__sentixRefreshPaper = loadPaperData;
+      // Fallback: only poll if SSE is disconnected
+      const interval = setInterval(() => {
+        if (!sseConnected) loadPaperData();
+      }, 30000);
+      return () => {
+        clearInterval(interval);
+        delete window.__sentixRefreshPaper;
+      };
+    }, [historyPage, sseConnected]);
 
     const handleSaveConfig = async () => {
       if (!configForm) return;
       setSavingConfig(true);
       try {
-        const res = await fetch(`${API_URL}/api/paper/config/${USER_ID}`, {
+        const res = await authFetch(`${API_URL}/api/paper/config/${USER_ID}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -1647,7 +1813,7 @@ export default function SentixProFrontend() {
     const handleCloseTrade = async (tradeId) => {
       setClosingTrade(tradeId);
       try {
-        const res = await fetch(`${API_URL}/api/paper/close/${tradeId}`, {
+        const res = await authFetch(`${API_URL}/api/paper/close/${tradeId}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ userId: USER_ID })
@@ -1662,7 +1828,7 @@ export default function SentixProFrontend() {
 
     const handleReset = async () => {
       try {
-        const res = await fetch(`${API_URL}/api/paper/reset/${USER_ID}`, { method: 'POST' });
+        const res = await authFetch(`${API_URL}/api/paper/reset/${USER_ID}`, { method: 'POST' });
         if (res.ok) {
           setConfirmReset(false);
           await loadPaperData();
@@ -1675,7 +1841,7 @@ export default function SentixProFrontend() {
     const handleToggleEnabled = async () => {
       const newVal = !paperConfig?.is_enabled;
       try {
-        const res = await fetch(`${API_URL}/api/paper/config/${USER_ID}`, {
+        const res = await authFetch(`${API_URL}/api/paper/config/${USER_ID}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ is_enabled: newVal })
@@ -2496,6 +2662,174 @@ export default function SentixProFrontend() {
     );
   }
 
+  // ─── AUTH SCREEN ──────────────────────────────────────────────────────────
+  // Show login screen when Supabase is configured but user is not authenticated
+  if (authLoading) {
+    return (
+      <div style={{ fontFamily: "'Inter', sans-serif", background: bg, minHeight: "100vh", color: text, display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <div style={{ textAlign: "center", color: muted }}>Loading...</div>
+      </div>
+    );
+  }
+
+  if (supabase && !session) {
+    return (
+      <div style={{
+        fontFamily: "'Inter', sans-serif",
+        background: bg,
+        minHeight: "100vh",
+        color: text,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center"
+      }}>
+        <div style={{
+          background: bg2,
+          border: `1px solid ${border}`,
+          borderRadius: 16,
+          padding: "40px 36px",
+          width: 380,
+          maxWidth: "90vw"
+        }}>
+          {/* Logo */}
+          <div style={{ textAlign: "center", marginBottom: 28 }}>
+            <div style={{
+              width: 56, height: 56,
+              border: `2px solid ${purple}`,
+              borderRadius: 14,
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+              fontSize: 24,
+              color: purple,
+              fontWeight: 700,
+              boxShadow: `0 0 30px rgba(168,85,247,0.3)`,
+              marginBottom: 12
+            }}>◈</div>
+            <div style={{ fontSize: 26, fontWeight: 800 }}>
+              SENTIX <span style={{ fontSize: 14, color: purple }}>PRO</span>
+            </div>
+            <div style={{ fontSize: 11, color: muted, marginTop: 4, letterSpacing: "0.08em" }}>
+              REAL-TIME TRADING SYSTEM
+            </div>
+          </div>
+
+          {/* OAuth Buttons */}
+          <button
+            onClick={() => handleOAuthLogin('google')}
+            style={{
+              width: "100%",
+              padding: "12px 16px",
+              background: "rgba(255,255,255,0.06)",
+              border: `1px solid ${border}`,
+              borderRadius: 10,
+              color: text,
+              fontSize: 13,
+              fontWeight: 600,
+              cursor: "pointer",
+              marginBottom: 12
+            }}
+          >
+            Continue with Google
+          </button>
+
+          <div style={{ display: "flex", alignItems: "center", gap: 12, margin: "16px 0" }}>
+            <div style={{ flex: 1, height: 1, background: border }} />
+            <span style={{ fontSize: 10, color: muted, textTransform: "uppercase", letterSpacing: "0.1em" }}>or</span>
+            <div style={{ flex: 1, height: 1, background: border }} />
+          </div>
+
+          {/* Email / Password Form */}
+          <form onSubmit={authMode === 'login' ? handleLogin : handleRegister}>
+            <input
+              type="email"
+              placeholder="Email"
+              value={authEmail}
+              onChange={(e) => setAuthEmail(e.target.value)}
+              required
+              style={{
+                width: "100%",
+                padding: "11px 14px",
+                background: bg3,
+                border: `1px solid ${border}`,
+                borderRadius: 8,
+                color: text,
+                fontSize: 13,
+                marginBottom: 10,
+                outline: "none"
+              }}
+            />
+            <input
+              type="password"
+              placeholder="Password"
+              value={authPassword}
+              onChange={(e) => setAuthPassword(e.target.value)}
+              required
+              minLength={6}
+              style={{
+                width: "100%",
+                padding: "11px 14px",
+                background: bg3,
+                border: `1px solid ${border}`,
+                borderRadius: 8,
+                color: text,
+                fontSize: 13,
+                marginBottom: 16,
+                outline: "none"
+              }}
+            />
+            <button
+              type="submit"
+              style={{
+                width: "100%",
+                padding: "12px 16px",
+                background: purple,
+                border: "none",
+                borderRadius: 10,
+                color: "#fff",
+                fontSize: 14,
+                fontWeight: 700,
+                cursor: "pointer"
+              }}
+            >
+              {authMode === 'login' ? 'Sign In' : 'Create Account'}
+            </button>
+          </form>
+
+          {authError && (
+            <div style={{
+              marginTop: 12,
+              padding: "10px 14px",
+              background: authError.includes('Check your email') ? "rgba(0,212,170,0.1)" : "rgba(239,68,68,0.1)",
+              border: `1px solid ${authError.includes('Check your email') ? green : red}`,
+              borderRadius: 8,
+              fontSize: 12,
+              color: authError.includes('Check your email') ? green : red
+            }}>
+              {authError}
+            </div>
+          )}
+
+          <div style={{ textAlign: "center", marginTop: 16 }}>
+            <button
+              onClick={() => { setAuthMode(authMode === 'login' ? 'register' : 'login'); setAuthError(null); }}
+              style={{
+                background: "none",
+                border: "none",
+                color: purple,
+                fontSize: 12,
+                cursor: "pointer",
+                textDecoration: "underline"
+              }}
+            >
+              {authMode === 'login' ? "Don't have an account? Register" : 'Already have an account? Sign In'}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   // ─── MAIN RENDER ───────────────────────────────────────────────────────────
   return (
     <div style={{
@@ -2566,6 +2900,25 @@ export default function SentixProFrontend() {
               background: green,
               boxShadow: `0 0 8px ${green}`
             }} />
+            {/* User / Logout */}
+            {session?.user && (
+              <button
+                onClick={handleLogout}
+                style={{
+                  background: "rgba(255,255,255,0.06)",
+                  border: `1px solid ${border}`,
+                  borderRadius: 8,
+                  padding: "6px 14px",
+                  color: muted,
+                  fontSize: 11,
+                  cursor: "pointer",
+                  fontFamily: "monospace"
+                }}
+                title={session.user.email}
+              >
+                {session.user.email?.split('@')[0]} · Logout
+              </button>
+            )}
           </div>
         </div>
 
