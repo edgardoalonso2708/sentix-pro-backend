@@ -8,6 +8,7 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
 const crypto = require('crypto');
 const { MSG } = require('./shared/ipc');
 const { LRUCache } = require('./shared/lruCache');
@@ -98,6 +99,12 @@ const allowedOrigins = [
 
 // Vercel preview/production domains (*.vercel.app)
 const VERCEL_ORIGIN_RE = /^https:\/\/[\w-]+\.vercel\.app$/;
+
+// Security headers (CSP, HSTS, X-Frame-Options, X-Content-Type-Options, etc.)
+app.use(helmet({
+  contentSecurityPolicy: false,   // Disabled — frontend is served from a different origin
+  crossOriginEmbedderPolicy: false // Allow cross-origin API requests
+}));
 
 app.use(cors({
   origin: (origin, callback) => {
