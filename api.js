@@ -2027,6 +2027,7 @@ app.post('/api/backtest/run', async (req, res) => {
           monte_carlo: mcForClient,
           significance: result.significance || null,
           kelly_sizing: result.kellySizing || null,
+          benchmark: result.benchmark || null,
           completed_at: new Date().toISOString(), created_at: backtestStore.get(recordId)?.created_at
         };
 
@@ -2048,6 +2049,7 @@ app.post('/api/backtest/run', async (req, res) => {
               monte_carlo: mcForClient,
               significance: result.significance || null,
               kelly_sizing: result.kellySizing || null,
+              benchmark: result.benchmark || null,
               completed_at: new Date().toISOString()
             }).eq('id', recordId);
             if (updateErr) logger.error(`Backtest DB update FAILED [${updateErr.code}]: ${updateErr.message} | hint: ${updateErr.hint || 'none'} | details: ${updateErr.details || 'none'}`);
