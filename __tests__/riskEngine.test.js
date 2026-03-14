@@ -84,6 +84,7 @@ function createMockSb(opts = {}) {
     const chain = {
       select: jest.fn().mockReturnThis(),
       eq: jest.fn().mockReturnThis(),
+      neq: jest.fn().mockReturnThis(),
       in: jest.fn().mockReturnThis(),
       order: jest.fn().mockReturnThis(),
       limit: jest.fn().mockReturnThis(),
@@ -94,6 +95,23 @@ function createMockSb(opts = {}) {
       then: (resolve) => Promise.resolve({ data, error }).then(resolve)
     };
     return chain;
+  }
+
+  // Orders table needs special handling: select returns array, insert returns object
+  function makeOrdersChain(selectData = [], insertData = { id: 'sys-order' }) {
+    const selectChain = makeChain(selectData, null);
+    const insertChain = makeChain(insertData, null);
+    return {
+      select: jest.fn().mockReturnValue(selectChain),
+      insert: jest.fn().mockReturnValue(insertChain),
+      update: jest.fn().mockReturnValue(makeChain(null, null)),
+      eq: jest.fn().mockReturnThis(),
+      neq: jest.fn().mockReturnThis(),
+      in: jest.fn().mockReturnThis(),
+      order: jest.fn().mockReturnThis(),
+      limit: jest.fn().mockReturnThis(),
+      then: (resolve) => Promise.resolve({ data: selectData, error: null }).then(resolve)
+    };
   }
 
   return {
@@ -108,7 +126,7 @@ function createMockSb(opts = {}) {
         return makeChain(opts.tradesData || [], null);
       }
       if (table === 'orders') {
-        return makeChain(opts.ordersData || { id: 'sys-order' }, null);
+        return makeOrdersChain(opts.ordersData || [], opts.ordersInsertData || { id: 'sys-order' });
       }
       if (table === 'execution_log') {
         return makeChain(null, null);
@@ -299,16 +317,12 @@ describe('activateKillSwitch', () => {
   });
 
   test('cancels pending orders', async () => {
-    mockGetOrders.mockResolvedValue({
-      orders: [
-        { id: 'o1', status: 'PENDING' },
-        { id: 'o2', status: 'VALIDATED' },
-        { id: 'o3', status: 'FILLED' } // Should not be cancelled
-      ],
-      total: 3
+    const sb = createMockSb({
+      ordersData: [
+        { id: 'o1', user_id: 'user1' },
+        { id: 'o2', user_id: 'user2' }
+      ]
     });
-
-    const sb = createMockSb();
     const result = await activateKillSwitch(sb, 'user1', 'Test');
 
     expect(result.cancelledOrders).toBe(2);

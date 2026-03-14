@@ -18,7 +18,10 @@ const {
   scoreBtcDominance,
   scoreDxyMacro,
   scoreOrderBook,
-  applyGovernor
+  applyGovernor,
+  updateBTCSignal,
+  getLatestBTCSignal,
+  getBTCCorrelationPenalty
 } = require('../technicalAnalysis');
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1793,5 +1796,116 @@ describe('applyGovernor', () => {
     expect(bullishGov.governorInfo.effectiveMult).toBeCloseTo(bearishGov.governorInfo.effectiveMult, 3);
     // Adjusted scores should be symmetric (opposite signs, same magnitude)
     expect(Math.abs(bullishGov.adjustedScore)).toBeCloseTo(Math.abs(bearishGov.adjustedScore), 1);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// BTC Cross-Asset Correlation Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('BTC Cross-Asset Correlation', () => {
+
+  afterEach(() => {
+    // Reset BTC signal cache between tests
+    updateBTCSignal(null, 0);
+  });
+
+  describe('updateBTCSignal / getLatestBTCSignal', () => {
+    test('stores and retrieves BTC signal', () => {
+      updateBTCSignal('SELL', 35);
+      const signal = getLatestBTCSignal();
+      expect(signal.direction).toBe('SELL');
+      expect(signal.strength).toBe(35);
+      expect(signal.timestamp).toBeGreaterThan(0);
+    });
+
+    test('returns copy, not reference', () => {
+      updateBTCSignal('BUY', 20);
+      const s1 = getLatestBTCSignal();
+      const s2 = getLatestBTCSignal();
+      expect(s1).not.toBe(s2);
+      expect(s1).toEqual(s2);
+    });
+  });
+
+  describe('getBTCCorrelationPenalty', () => {
+    test('returns 0 for BTCUSDT (no self-penalty)', () => {
+      updateBTCSignal('SELL', 40);
+      expect(getBTCCorrelationPenalty('BTCUSDT', 'BUY')).toBe(0);
+    });
+
+    test('returns 0 when no BTC signal cached', () => {
+      // Default state: direction is null
+      expect(getBTCCorrelationPenalty('ETHUSDT', 'BUY')).toBe(0);
+    });
+
+    test('penalizes high-corr alt BUY when BTC is SELL', () => {
+      updateBTCSignal('SELL', 40);
+      const penalty = getBTCCorrelationPenalty('ETHUSDT', 'BUY');
+      expect(penalty).toBeLessThan(0);
+      expect(penalty).toBeGreaterThanOrEqual(-12);
+      expect(penalty).toBeLessThanOrEqual(-8);
+    });
+
+    test('penalizes medium-corr alt BUY when BTC is SELL (smaller penalty)', () => {
+      updateBTCSignal('SELL', 40);
+      const penalty = getBTCCorrelationPenalty('XRPUSDT', 'BUY');
+      expect(penalty).toBeLessThan(0);
+      expect(penalty).toBeGreaterThanOrEqual(-6);
+      expect(penalty).toBeLessThanOrEqual(-4);
+    });
+
+    test('gives bonus to high-corr alt BUY when BTC is BUY', () => {
+      updateBTCSignal('BUY', 40);
+      const bonus = getBTCCorrelationPenalty('SOLUSDT', 'BUY');
+      expect(bonus).toBeGreaterThan(0);
+      expect(bonus).toBeGreaterThanOrEqual(3);
+      expect(bonus).toBeLessThanOrEqual(5);
+    });
+
+    test('gives smaller bonus to medium-corr alt BUY when BTC is BUY', () => {
+      updateBTCSignal('BUY', 40);
+      const bonus = getBTCCorrelationPenalty('XRPUSDT', 'BUY');
+      expect(bonus).toBeGreaterThan(0);
+      expect(bonus).toBeGreaterThanOrEqual(2);
+      expect(bonus).toBeLessThanOrEqual(3);
+    });
+
+    test('returns 0 for SELL signals (no adjustment)', () => {
+      updateBTCSignal('SELL', 40);
+      expect(getBTCCorrelationPenalty('ETHUSDT', 'SELL')).toBe(0);
+    });
+
+    test('returns 0 for HOLD direction in BTC signal', () => {
+      updateBTCSignal('HOLD', 10);
+      expect(getBTCCorrelationPenalty('ETHUSDT', 'BUY')).toBe(0);
+    });
+
+    test('penalty scales with BTC signal strength', () => {
+      // Weak BTC signal
+      updateBTCSignal('SELL', 10);
+      const weakPenalty = getBTCCorrelationPenalty('ETHUSDT', 'BUY');
+
+      // Strong BTC signal
+      updateBTCSignal('SELL', 40);
+      const strongPenalty = getBTCCorrelationPenalty('ETHUSDT', 'BUY');
+
+      expect(Math.abs(strongPenalty)).toBeGreaterThanOrEqual(Math.abs(weakPenalty));
+    });
+
+    test('case-insensitive asset matching', () => {
+      updateBTCSignal('SELL', 40);
+      expect(getBTCCorrelationPenalty('ethusdt', 'BUY')).toBeLessThan(0);
+      expect(getBTCCorrelationPenalty('Ethusdt', 'BUY')).toBeLessThan(0);
+    });
+
+    test('all high-corr alts are recognized', () => {
+      updateBTCSignal('SELL', 40);
+      const highCorrAlts = ['ETHUSDT', 'SOLUSDT', 'AVAXUSDT', 'NEARUSDT', 'DOTUSDT', 'MATICUSDT', 'LINKUSDT', 'ADAUSDT'];
+      for (const alt of highCorrAlts) {
+        const penalty = getBTCCorrelationPenalty(alt, 'BUY');
+        expect(penalty).toBeLessThanOrEqual(-8);
+      }
+    });
   });
 });

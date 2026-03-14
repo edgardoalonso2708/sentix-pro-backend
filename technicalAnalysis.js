@@ -25,6 +25,68 @@ const historicalCache = new Map();
 const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 const MAX_CACHE_ENTRIES = 100;
 
+// ─── BTC CROSS-ASSET CORRELATION ──────────────────────────────────────────
+// Cache the latest BTC signal to penalize altcoin BUY signals when BTC is bearish
+let latestBTCSignal = { direction: null, strength: 0, timestamp: null };
+
+const HIGH_CORR_ALTS = new Set([
+  'ETHUSDT', 'SOLUSDT', 'AVAXUSDT', 'NEARUSDT',
+  'DOTUSDT', 'MATICUSDT', 'LINKUSDT', 'ADAUSDT'
+]);
+
+function updateBTCSignal(direction, strength) {
+  latestBTCSignal.direction = direction;   // 'BUY' | 'SELL' | 'HOLD'
+  latestBTCSignal.strength = strength;     // raw score magnitude
+  latestBTCSignal.timestamp = Date.now();
+}
+
+function getLatestBTCSignal() {
+  return { ...latestBTCSignal };
+}
+
+/**
+ * Returns a score adjustment based on BTC's current signal vs the altcoin's signal.
+ * - BTC SELL + alt BUY → penalty (high-corr alts get -8 to -12, others -4 to -6)
+ * - BTC BUY  + alt BUY → small bonus (+3 to +5 for high-corr, +2 to +3 for others)
+ * - Otherwise → 0
+ */
+function getBTCCorrelationPenalty(asset, signalDirection) {
+  const assetUpper = (asset || '').toUpperCase();
+
+  // No penalty for BTC itself
+  if (assetUpper === 'BTCUSDT') return 0;
+
+  // No penalty if we have no cached BTC signal
+  if (!latestBTCSignal.direction || !latestBTCSignal.timestamp) return 0;
+
+  // Ignore stale BTC signals (older than 4 hours)
+  const FOUR_HOURS = 4 * 60 * 60 * 1000;
+  if (Date.now() - latestBTCSignal.timestamp > FOUR_HOURS) return 0;
+
+  const isHighCorr = HIGH_CORR_ALTS.has(assetUpper);
+  const btcStrengthFactor = Math.min(1, Math.abs(latestBTCSignal.strength) / 40);
+
+  // BTC is SELL and alt wants to BUY → penalize
+  if (latestBTCSignal.direction === 'SELL' && signalDirection === 'BUY') {
+    if (isHighCorr) {
+      // -8 base, scaled up to -12 by BTC signal strength
+      return -Math.round(8 + 4 * btcStrengthFactor);
+    }
+    // Medium/low correlation: -4 base, scaled up to -6
+    return -Math.round(4 + 2 * btcStrengthFactor);
+  }
+
+  // BTC is BUY and alt is also BUY → small confirmation bonus
+  if (latestBTCSignal.direction === 'BUY' && signalDirection === 'BUY') {
+    if (isHighCorr) {
+      return Math.round(3 + 2 * btcStrengthFactor);   // +3 to +5
+    }
+    return Math.round(2 + 1 * btcStrengthFactor);      // +2 to +3
+  }
+
+  return 0;
+}
+
 // LRU eviction: remove oldest entries when cache exceeds MAX_CACHE_ENTRIES
 function cacheSet(key, value) {
   historicalCache.set(key, value);
@@ -1960,6 +2022,20 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
       }
     }
 
+    // ─── 19. BTC CROSS-ASSET CORRELATION ADJUSTMENT ─────────────────
+    // When BTC gives a SELL signal, penalize BUY signals on correlated altcoins.
+    // This prevents buying alts into a BTC-led downturn. Conversely, BTC BUY
+    // confirmation gives a small bonus to aligned alt BUY signals.
+    const prelimAction = score >= cfg.buyThreshold ? 'BUY'
+      : (score <= cfg.sellThreshold ? 'SELL' : 'HOLD');
+    const btcCorrAdj = getBTCCorrelationPenalty(asset, prelimAction);
+    if (btcCorrAdj !== 0) {
+      score += btcCorrAdj;
+      signals.push(btcCorrAdj < 0
+        ? `BTC correlation penalty (${btcCorrAdj}): BTC bearish headwind`
+        : `BTC correlation bonus (+${btcCorrAdj}): BTC bullish tailwind`);
+    }
+
     // ─── SIGNAL AGREEMENT ANALYSIS ──────────────────────────────────
     // Count how many factors agree vs disagree
     const bullishFactors = [
@@ -2563,5 +2639,8 @@ module.exports = {
   scoreDxyMacro,
   scoreOrderBook,
   generateSignalWithRealData,
-  generateMultiTimeframeSignal
+  generateMultiTimeframeSignal,
+  updateBTCSignal,
+  getLatestBTCSignal,
+  getBTCCorrelationPenalty
 };

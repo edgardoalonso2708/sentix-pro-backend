@@ -734,6 +734,86 @@ function simulateTradeExecution(trade, candles, startIndex) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// BUY & HOLD BENCHMARK
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Calculate Buy & Hold benchmark metrics from candle data
+ * @param {Array} candles - 1h candles used in the backtest
+ * @param {number} initialCapital - Starting capital
+ * @returns {Object} B&H metrics: equityCurve, totalReturn, maxDrawdown, annualizedReturn, sharpeRatio
+ */
+function calculateBuyAndHoldMetrics(candles, initialCapital) {
+  if (!candles || candles.length < 2) {
+    return { equityCurve: [], totalReturn: 0, maxDrawdown: 0, annualizedReturn: 0, sharpeRatio: 0 };
+  }
+
+  const startPrice = candles[0].close;
+  const endPrice = candles[candles.length - 1].close;
+
+  // Build equity curve — each point = capital * (price / startPrice)
+  const equityCurve = candles.map(c => ({
+    timestamp: c.timestamp,
+    equity: Math.round((initialCapital * (c.close / startPrice)) * 100) / 100
+  }));
+
+  // Total return %
+  const totalReturn = Math.round(((endPrice - startPrice) / startPrice) * 10000) / 100;
+
+  // Max drawdown from equity curve
+  let peak = 0;
+  let maxDrawdown = 0;
+  for (const point of equityCurve) {
+    if (point.equity > peak) peak = point.equity;
+    const ddPct = peak > 0 ? ((peak - point.equity) / peak) * 100 : 0;
+    if (ddPct > maxDrawdown) maxDrawdown = ddPct;
+  }
+  maxDrawdown = Math.round(maxDrawdown * 100) / 100;
+
+  // Annualized return — based on actual time span
+  const totalMs = candles[candles.length - 1].timestamp - candles[0].timestamp;
+  const totalDays = totalMs / (24 * 60 * 60 * 1000);
+  const annualizedReturn = totalDays > 0
+    ? Math.round(((endPrice / startPrice) ** (365 / totalDays) - 1) * 10000) / 100
+    : 0;
+
+  // Sharpe ratio from daily returns (same methodology as strategy Sharpe)
+  let sharpeRatio = 0;
+  const dayMs = 24 * 60 * 60 * 1000;
+  const dailyEquity = [];
+  let lastDay = -1;
+  for (const point of equityCurve) {
+    const dayNum = Math.floor(point.timestamp / dayMs);
+    if (dayNum !== lastDay) {
+      dailyEquity.push(point.equity);
+      lastDay = dayNum;
+    } else {
+      dailyEquity[dailyEquity.length - 1] = point.equity;
+    }
+  }
+
+  if (dailyEquity.length >= 2) {
+    const dailyReturns = [];
+    for (let i = 1; i < dailyEquity.length; i++) {
+      if (dailyEquity[i - 1] > 0) {
+        dailyReturns.push((dailyEquity[i] - dailyEquity[i - 1]) / dailyEquity[i - 1]);
+      }
+    }
+
+    if (dailyReturns.length >= 2) {
+      const riskFreeDaily = Math.pow(1.045, 1 / 365) - 1;
+      const excessReturns = dailyReturns.map(r => r - riskFreeDaily);
+      const avgExcess = excessReturns.reduce((s, r) => s + r, 0) / excessReturns.length;
+      const variance = excessReturns.reduce((s, r) => s + Math.pow(r - avgExcess, 2), 0) / (excessReturns.length - 1);
+      const stdDev = Math.sqrt(variance);
+      sharpeRatio = stdDev > 0 ? Math.round((avgExcess / stdDev) * Math.sqrt(365) * 100) / 100 : 0;
+    }
+  }
+
+  return { equityCurve, totalReturn, maxDrawdown, annualizedReturn, sharpeRatio };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 // BACKTEST METRICS
 // ═══════════════════════════════════════════════════════════════════════════════
 
@@ -1282,6 +1362,24 @@ async function runBacktest(options, onProgress = null) {
   // ─── 6. Calculate metrics ────────────────────────────────────────────
   const metrics = calculateBacktestMetrics(completedTrades, equityCurve, capital, days);
 
+  // ─── 6b. Buy & Hold benchmark ──────────────────────────────────────
+  const backtestCandles1h = candles1h.slice(firstStepIndex);
+  const buyAndHold = calculateBuyAndHoldMetrics(backtestCandles1h, capital);
+  const benchmark = {
+    buyAndHold: {
+      totalReturn: buyAndHold.totalReturn,
+      maxDrawdown: buyAndHold.maxDrawdown,
+      annualizedReturn: buyAndHold.annualizedReturn,
+      sharpeRatio: buyAndHold.sharpeRatio,
+      equityCurve: buyAndHold.equityCurve
+    },
+    comparison: {
+      returnDiff: Math.round((metrics.totalPnlPercent - buyAndHold.totalReturn) * 100) / 100,
+      drawdownDiff: Math.round((metrics.maxDrawdownPercent - buyAndHold.maxDrawdown) * 100) / 100,
+      sharpeDiff: Math.round((metrics.sharpeRatio - buyAndHold.sharpeRatio) * 100) / 100
+    }
+  };
+
   // Monte Carlo bootstrap resampling (1000 paths)
   const monteCarlo = runMonteCarloSimulation(completedTrades, capital, {
     simulations: 1000,
@@ -1358,6 +1456,7 @@ async function runBacktest(options, onProgress = null) {
   return {
     config: { asset, days, stepInterval, capital, riskPerTrade, maxOpenPositions, minConfluence, minRR, allowedStrength, cooldownBars, strategyConfig },
     metrics,
+    benchmark,
     monteCarlo,
     significance,
     kellySizing: kellySizingSummary,
@@ -1402,6 +1501,7 @@ module.exports = {
   runBacktest,
   simulateTradeExecution,
   calculateBacktestMetrics,
+  calculateBuyAndHoldMetrics,
   SLIPPAGE,
   COMMISSION,
   TOTAL_COST,

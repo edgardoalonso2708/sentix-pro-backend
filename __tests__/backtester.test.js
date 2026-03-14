@@ -3,7 +3,7 @@
 // Tests for simulateTradeExecution and calculateBacktestMetrics (pure functions)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-const { simulateTradeExecution, calculateBacktestMetrics, SLIPPAGE, COMMISSION, TOTAL_COST, INTERVAL_MS } = require('../backtester');
+const { simulateTradeExecution, calculateBacktestMetrics, calculateBuyAndHoldMetrics, SLIPPAGE, COMMISSION, TOTAL_COST, INTERVAL_MS } = require('../backtester');
 
 // ─── HELPERS ────────────────────────────────────────────────────────────────
 
@@ -458,5 +458,83 @@ describe('Constants', () => {
     expect(INTERVAL_MS['1h']).toBe(60 * 60 * 1000);
     expect(INTERVAL_MS['4h']).toBe(4 * 60 * 60 * 1000);
     expect(INTERVAL_MS['1d']).toBe(24 * 60 * 60 * 1000);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// calculateBuyAndHoldMetrics Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('calculateBuyAndHoldMetrics', () => {
+
+  test('returns zeros for empty/null candles', () => {
+    expect(calculateBuyAndHoldMetrics([], 10000)).toEqual({
+      equityCurve: [], totalReturn: 0, maxDrawdown: 0, annualizedReturn: 0, sharpeRatio: 0
+    });
+    expect(calculateBuyAndHoldMetrics(null, 10000)).toEqual({
+      equityCurve: [], totalReturn: 0, maxDrawdown: 0, annualizedReturn: 0, sharpeRatio: 0
+    });
+  });
+
+  test('returns zeros for single candle', () => {
+    const result = calculateBuyAndHoldMetrics([makeCandle(1000, 100, 105, 95, 100)], 10000);
+    expect(result.totalReturn).toBe(0);
+  });
+
+  test('calculates positive return for uptrend', () => {
+    const dayMs = 24 * 60 * 60 * 1000;
+    const candles = [
+      makeCandle(1000 * dayMs, 100, 105, 95, 100),    // start at 100
+      makeCandle(1001 * dayMs, 105, 110, 100, 110),
+      makeCandle(1002 * dayMs, 110, 120, 108, 120),    // end at 120
+    ];
+
+    const result = calculateBuyAndHoldMetrics(candles, 10000);
+
+    expect(result.totalReturn).toBe(20);  // (120-100)/100 * 100 = 20%
+    expect(result.equityCurve).toHaveLength(3);
+    expect(result.equityCurve[0].equity).toBe(10000);
+    expect(result.equityCurve[2].equity).toBe(12000);
+  });
+
+  test('calculates negative return for downtrend', () => {
+    const dayMs = 24 * 60 * 60 * 1000;
+    const candles = [
+      makeCandle(1000 * dayMs, 100, 105, 95, 100),
+      makeCandle(1001 * dayMs, 100, 102, 88, 90),
+      makeCandle(1002 * dayMs, 90, 95, 78, 80),
+    ];
+
+    const result = calculateBuyAndHoldMetrics(candles, 10000);
+
+    expect(result.totalReturn).toBe(-20);  // (80-100)/100 * 100 = -20%
+    expect(result.equityCurve[2].equity).toBe(8000);
+  });
+
+  test('calculates max drawdown correctly', () => {
+    const dayMs = 24 * 60 * 60 * 1000;
+    const candles = [
+      makeCandle(1000 * dayMs, 100, 105, 95, 100),     // equity 10000
+      makeCandle(1001 * dayMs, 100, 120, 100, 120),     // equity 12000 (peak)
+      makeCandle(1002 * dayMs, 120, 120, 90, 90),       // equity 9000 (drawdown from 12000 = 25%)
+      makeCandle(1003 * dayMs, 90, 110, 90, 110),       // equity 11000 (recovery)
+    ];
+
+    const result = calculateBuyAndHoldMetrics(candles, 10000);
+
+    expect(result.maxDrawdown).toBe(25); // 25% drawdown from peak
+  });
+
+  test('equity curve scales with initial capital', () => {
+    const dayMs = 24 * 60 * 60 * 1000;
+    const candles = [
+      makeCandle(1000 * dayMs, 50000, 51000, 49000, 50000),
+      makeCandle(1001 * dayMs, 50000, 55000, 49000, 55000),
+    ];
+
+    const result = calculateBuyAndHoldMetrics(candles, 5000);
+
+    expect(result.equityCurve[0].equity).toBe(5000);
+    expect(result.equityCurve[1].equity).toBe(5500); // 10% gain on 5000
   });
 });
