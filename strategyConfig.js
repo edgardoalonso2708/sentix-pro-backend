@@ -63,6 +63,10 @@ const DEFAULT_STRATEGY_CONFIG = {
   fibScore: 6,
   fibGoldenRatioBonus: 2,
 
+  // ─── OBV (On-Balance Volume) ──────────────────────────────────
+  obvScore: 5,              // OBV trend confirmation score
+  obvLookback: 20,          // Lookback period for OBV calculation
+
   // ─── Market Structure ─────────────────────────────────────────
   marketStructureLookback: 60,
   marketStructureScore: 12,

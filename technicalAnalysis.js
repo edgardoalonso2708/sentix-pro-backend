@@ -753,6 +753,50 @@ function analyzeVolumeProfile(candles, lookback = 14) {
 }
 
 /**
+ * Calculate On-Balance Volume (OBV) trend.
+ * Returns direction ('bullish', 'bearish', 'neutral') and strength (0-1).
+ */
+function calculateOBVTrend(candles, lookback = 20) {
+  if (candles.length < lookback + 5) return { direction: 'neutral', strength: 0 };
+
+  const recent = candles.slice(-lookback);
+  let obv = 0;
+  const obvSeries = [0];
+
+  for (let i = 1; i < recent.length; i++) {
+    if (recent[i].close > recent[i - 1].close) obv += recent[i].volume;
+    else if (recent[i].close < recent[i - 1].close) obv -= recent[i].volume;
+    obvSeries.push(obv);
+  }
+
+  // OBV trend: compare first half avg vs second half avg
+  const mid = Math.floor(obvSeries.length / 2);
+  const firstHalf = obvSeries.slice(0, mid);
+  const secondHalf = obvSeries.slice(mid);
+  const avgFirst = firstHalf.reduce((a, b) => a + b, 0) / firstHalf.length;
+  const avgSecond = secondHalf.reduce((a, b) => a + b, 0) / secondHalf.length;
+
+  // Price direction for divergence detection
+  const priceStart = recent[0].close;
+  const priceEnd = recent[recent.length - 1].close;
+  const priceUp = priceEnd > priceStart;
+  const obvUp = avgSecond > avgFirst;
+
+  // Strength: normalized delta
+  const totalVol = recent.reduce((s, c) => s + c.volume, 0);
+  const strength = totalVol > 0 ? Math.min(1, Math.abs(avgSecond - avgFirst) / (totalVol * 0.1)) : 0;
+
+  // Check for OBV-price divergence
+  const diverging = (priceUp && !obvUp) || (!priceUp && obvUp);
+
+  let direction = 'neutral';
+  if (obvUp && strength > 0.2) direction = 'bullish';
+  else if (!obvUp && strength > 0.2) direction = 'bearish';
+
+  return { direction, strength, diverging };
+}
+
+/**
  * Detect Bollinger Band squeeze (low volatility → imminent breakout)
  */
 function detectBBSqueeze(prices, period = 20) {
@@ -1611,6 +1655,7 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
     const emaTrend = detectEMATrend(prices);
     const divergence = detectRSIDivergence(prices, rsiSeries, cfg.divergenceLookback);
     const volumeProfile = analyzeVolumeProfile(ohlcvData, cfg.volumeLookback);
+    const obvTrend = calculateOBVTrend(ohlcvData, cfg.obvLookback || 20);
     const bbSqueeze = detectBBSqueeze(prices, cfg.bbPeriod);
     const atr = calculateATR(ohlcvData, cfg.atrPeriod);
     const atrPercent = currentPrice > 0 ? (atr / currentPrice) * 100 : 0;
@@ -1722,24 +1767,34 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
       confidence += 2;
     }
 
+    // Track RSI direction for MACD redundancy discount
+    const rsiBullish = rsi < cfg.rsiOversold || (rsi < cfg.rsiPullbackZone && emaTrend.trend.includes('up'));
+    const rsiBearish = rsi > cfg.rsiOverbought || (rsi > cfg.rsiPullbackZoneHigh && emaTrend.trend.includes('down'));
+
     // ─── 4. MACD ANALYSIS (with histogram momentum) ─────────────────
-    // Weight: up to ±15 score, up to 10 confidence
+    // Weight: up to ±15 score (reduced to ±10 when RSI already confirms same direction)
+    // Rationale: RSI and MACD are both momentum indicators — when they agree,
+    // the second confirmation adds less information than independent factors
     if (macd.histogram > 0 && macd.macd > macd.signal) {
+      const rsiAlreadyBullish = rsiBullish;
+      const redundancyMult = rsiAlreadyBullish ? 0.67 : 1.0; // ~10 instead of 15
       const macdScore = macd.histogramTrend === 'growing' ? cfg.macdStrongScore : cfg.macdWeakScore;
-      score += macdScore * adxMultiplier;
+      score += Math.round(macdScore * adxMultiplier * redundancyMult);
       confidence += macd.histogramTrend === 'growing' ? 10 : 6;
       signals.push(macd.histogramTrend === 'growing'
-        ? 'MACD bullish crossover (accelerating)'
-        : 'MACD bullish (decelerating)');
+        ? `MACD bullish crossover (accelerating)${rsiAlreadyBullish ? ' [weight reduced — RSI confirms]' : ''}`
+        : `MACD bullish (decelerating)${rsiAlreadyBullish ? ' [weight reduced — RSI confirms]' : ''}`);
     } else if (macd.histogram < 0 && macd.macd < macd.signal) {
       // FIX: 'shrinking' = histogram becoming more negative = bearish ACCELERATING = strong score
       //      'growing'   = histogram becoming less negative  = bearish WEAKENING   = weak score
+      const rsiAlreadyBearish = rsiBearish;
+      const redundancyMult = rsiAlreadyBearish ? 0.67 : 1.0;
       const macdScore = macd.histogramTrend === 'shrinking' ? -cfg.macdStrongScore : -cfg.macdWeakScore;
-      score += macdScore * adxMultiplier;
+      score += Math.round(macdScore * adxMultiplier * redundancyMult);
       confidence += macd.histogramTrend === 'shrinking' ? 10 : 6;
       signals.push(macd.histogramTrend === 'shrinking'
-        ? 'MACD bearish crossover (accelerating)'
-        : 'MACD bearish (weakening)');
+        ? `MACD bearish crossover (accelerating)${rsiAlreadyBearish ? ' [weight reduced — RSI confirms]' : ''}`
+        : `MACD bearish (weakening)${rsiAlreadyBearish ? ' [weight reduced — RSI confirms]' : ''}`);
     } else if (macd.histogram > 0) {
       score += 4;
       confidence += 3;
@@ -1809,6 +1864,21 @@ async function generateSignalWithRealData(asset, currentPrice, change24h, volume
     } else if (volumeProfile.ratio < 0.5) {
       confidence -= 5;
       signals.push('Low volume - weak conviction');
+    }
+
+    // ─── 7b. OBV TREND (On-Balance Volume scoring) ──────────────────
+    // Weight: up to ±5 score, up to 5 confidence
+    if (obvTrend.direction === 'bullish' && score > 0) {
+      score += cfg.obvScore * adxMultiplier;
+      confidence += 5;
+      signals.push('OBV confirms bullish momentum');
+    } else if (obvTrend.direction === 'bearish' && score < 0) {
+      score += -(cfg.obvScore) * adxMultiplier;
+      confidence += 5;
+      signals.push('OBV confirms bearish momentum');
+    } else if (obvTrend.diverging) {
+      confidence -= 6;
+      signals.push('OBV diverges from price — volume not supporting move');
     }
 
     // ─── 8. SUPPORT/RESISTANCE (Multi-Level) ──────────────────────

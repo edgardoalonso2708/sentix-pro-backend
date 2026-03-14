@@ -96,10 +96,25 @@ function enrichSignalWithTTL(signal, config = {}, nowMs = Date.now()) {
   else if (ageMs >= agingMs) freshness = 'stale';
   else if (ageMs >= freshMs) freshness = 'aging';
 
+  // Confidence decay: -5% per minute after signal is no longer "fresh"
+  let confidenceDecay = 0;
+  if (ageMs > freshMs && ageMs < ttlMs) {
+    const minutesPastFresh = (ageMs - freshMs) / 60000;
+    confidenceDecay = Math.round(minutesPastFresh * 5);
+  } else if (ageMs >= ttlMs) {
+    confidenceDecay = 100; // expired — zero out confidence
+  }
+
+  const originalConfidence = signal.confidence || 0;
+  const decayedConfidence = Math.max(0, originalConfidence - confidenceDecay);
+
   return {
     ...signal,
     signalAge: Math.round(ageMinutes),
     freshness,
+    confidence: decayedConfidence,
+    originalConfidence,
+    confidenceDecay,
     expiresAt: new Date(generatedAt + ttlMs).toISOString(),
     ttlMinutes: config.signalTTLMinutes || 15
   };
