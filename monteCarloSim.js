@@ -215,14 +215,19 @@ function runMonteCarloSimulation(trades, initialCapital, options = {}) {
 
   const rng = mulberry32(seed);
   const n = trades.length;
+  const blockSize = options.blockSize || 10; // Block bootstrap: resample in blocks to preserve trade clustering
 
-  // Run M simulations via bootstrap resampling
+  // Run M simulations via block bootstrap resampling
+  // Blocks preserve temporal clustering (e.g., correlated wins/losses in trending markets)
   const pathResults = [];
   for (let sim = 0; sim < simulations; sim++) {
-    // Resample N trades with replacement
     const resampled = [];
-    for (let i = 0; i < n; i++) {
-      resampled.push(trades[Math.floor(rng() * n)]);
+    while (resampled.length < n) {
+      // Pick a random block start index
+      const startIdx = Math.floor(rng() * n);
+      for (let j = 0; j < blockSize && resampled.length < n; j++) {
+        resampled.push(trades[(startIdx + j) % n]); // Wrap around if block exceeds array
+      }
     }
     pathResults.push(computePathMetrics(resampled, initialCapital));
   }

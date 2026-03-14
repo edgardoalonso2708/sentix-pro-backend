@@ -7,12 +7,12 @@
  * Default configuration for Kelly Criterion position sizing.
  */
 const KELLY_DEFAULTS = {
-  enabled: false,
-  fraction: 0.5,              // Half-Kelly (conservative default)
+  enabled: true,              // Enabled by default — conservative quarter-Kelly
+  fraction: 0.25,             // Quarter-Kelly (conservative: reduces variance significantly)
   minTrades: 20,              // Minimum completed trades before Kelly kicks in
   lookbackTrades: 100,        // Use last N trades for win rate / payoff stats
   minRiskPerTrade: 0.005,     // Floor: 0.5% of capital per trade
-  maxRiskPerTrade: 0.05,      // Ceiling: 5% of capital per trade
+  maxRiskPerTrade: 0.02,      // Ceiling: 2% of capital per trade (was 5%, tightened for safety)
 };
 
 /**

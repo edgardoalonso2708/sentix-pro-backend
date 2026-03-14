@@ -420,6 +420,8 @@ function computeOverfitMetrics(results) {
  */
 function extractMetrics(backtestResult) {
   const m = backtestResult.metrics;
+  const bh = backtestResult.benchmark?.buyAndHold;
+  const cmp = backtestResult.benchmark?.comparison;
   return {
     sharpe: m.sharpeRatio,
     sortino: m.sortinoRatio || 0,
@@ -433,7 +435,12 @@ function extractMetrics(backtestResult) {
     maxDrawdownPercent: m.maxDrawdownPercent,
     avgHoldingBars: m.avgHoldingBars,
     maxConsecutiveLosses: m.maxConsecutiveLosses,
-    statisticallySignificant: m.statisticallySignificant
+    statisticallySignificant: m.statisticallySignificant,
+    // B&H benchmark comparison
+    buyAndHoldReturn: bh?.totalReturn ?? null,
+    buyAndHoldSharpe: bh?.sharpeRatio ?? null,
+    informationRatio: cmp?.informationRatio ?? null,
+    excessReturn: cmp?.returnDiff ?? null
   };
 }
 
@@ -449,6 +456,8 @@ function errorMetrics(errorMsg) {
     totalPnl: 0, totalPnlPercent: 0, maxDrawdownPercent: 0,
     avgHoldingBars: 0, maxConsecutiveLosses: 0,
     statisticallySignificant: false,
+    buyAndHoldReturn: null, buyAndHoldSharpe: null,
+    informationRatio: null, excessReturn: null,
     error: errorMsg
   };
 }
@@ -624,6 +633,10 @@ async function runOptimization(options) {
       avgHoldingBars: isMetrics.avgHoldingBars,
       maxConsecutiveLosses: isMetrics.maxConsecutiveLosses,
       statisticallySignificant: isMetrics.statisticallySignificant,
+      buyAndHoldReturn: isMetrics.buyAndHoldReturn,
+      buyAndHoldSharpe: isMetrics.buyAndHoldSharpe,
+      informationRatio: isMetrics.informationRatio,
+      excessReturn: isMetrics.excessReturn,
       ...(isMetrics.error ? { error: isMetrics.error } : {}),
       // Structured fields
       inSample: isMetrics,

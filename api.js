@@ -61,7 +61,7 @@ const {
   getEquityCurve,
   cleanupOldSnapshots
 } = require('./paperTrading');
-const { runBacktest } = require('./backtester');
+const { runBacktest, runPortfolioBacktest } = require('./backtester');
 const { startOptimizationJob, getJobStatus, getAllJobs, PARAM_RANGES } = require('./optimizer');
 const {
   runAutoTune, getAutoTuneHistory, getActiveConfig, saveActiveConfig, isAutoTuneRunning,
@@ -1834,7 +1834,14 @@ app.post('/api/risk/:userId/kill-switch', async (req, res) => {
     if (!isValidUserId(userId)) return res.status(400).json({ error: 'Invalid user ID' });
 
     const reason = req.body?.reason || 'Manual activation';
-    const result = await activateKillSwitch(supabase, userId, reason);
+    const isGlobal = req.body?.global === true;
+
+    // Global kill switch requires admin role
+    if (isGlobal && req.userRole !== 'admin') {
+      return res.status(403).json({ error: 'Global kill switch requires admin role' });
+    }
+
+    const result = await activateKillSwitch(supabase, userId, reason, { global: isGlobal });
 
     if (!result.success) {
       return res.status(500).json({ error: 'Failed to activate kill switch' });
@@ -1846,7 +1853,7 @@ app.post('/api/risk/:userId/kill-switch', async (req, res) => {
     // Audit log
     await logAudit(supabase, {
       userId: req.userId, action: 'kill_switch',
-      resource: 'risk', details: { active: true, reason, ...result },
+      resource: 'risk', details: { active: true, reason, scope: result.scope, ...result },
       ...auditContext(req)
     });
 
@@ -1863,14 +1870,21 @@ app.delete('/api/risk/:userId/kill-switch', async (req, res) => {
     const userId = sanitizeInput(req.params.userId);
     if (!isValidUserId(userId)) return res.status(400).json({ error: 'Invalid user ID' });
 
-    const result = await deactivateKillSwitch(supabase, userId);
+    const isGlobal = req.query?.global === 'true' || req.body?.global === true;
+
+    // Global deactivation requires admin role
+    if (isGlobal && req.userRole !== 'admin') {
+      return res.status(403).json({ error: 'Global kill switch deactivation requires admin role' });
+    }
+
+    const result = await deactivateKillSwitch(supabase, userId, { global: isGlobal });
     if (!result.success) {
       return res.status(500).json({ error: result.error || 'Failed to deactivate kill switch' });
     }
 
-    broadcastSSE('kill_switch', { active: false });
+    broadcastSSE('kill_switch', { active: false, scope: result.scope });
 
-    res.json({ success: true });
+    res.json({ success: true, ...result });
   } catch (err) {
     logger.error('DELETE /api/risk/kill-switch error', { error: err.message });
     res.status(500).json({ error: 'Failed to deactivate kill switch' });
@@ -1940,7 +1954,7 @@ app.post('/api/backtest/run', async (req, res) => {
     if (kellySizing != null) {
       if (typeof kellySizing !== 'object') return res.status(400).json({ error: 'kellySizing must be an object or null' });
       if (kellySizing.kelly) {
-        if (kellySizing.kelly.fraction !== undefined && (kellySizing.kelly.fraction < 0.1 || kellySizing.kelly.fraction > 1.0))
+        if (kellySizing.kelly.fraction !== undefined && (kellySizing.kelly.fraction < 0.05 || kellySizing.kelly.fraction > 1.0))
           return res.status(400).json({ error: 'kellySizing.kelly.fraction must be between 0.1 and 1.0' });
         if (kellySizing.kelly.minTrades !== undefined && (kellySizing.kelly.minTrades < 5 || kellySizing.kelly.minTrades > 200))
           return res.status(400).json({ error: 'kellySizing.kelly.minTrades must be between 5 and 200' });
@@ -2120,6 +2134,73 @@ app.post('/api/backtest/run', async (req, res) => {
 
   } catch (error) {
     logger.error('Backtest launch failed', { error: error.message });
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ─── Portfolio backtest (multi-asset) ─────────────────────────────────────────
+app.post('/api/backtest/portfolio', async (req, res) => {
+  try {
+    if (activeBacktestJobs >= MAX_CONCURRENT_BACKTESTS) {
+      return res.status(429).json({ error: 'Too many concurrent backtests. Try again later.' });
+    }
+
+    const {
+      assets = ['bitcoin', 'ethereum', 'solana'],
+      days = 90,
+      capital = 10000,
+      riskPerTrade = 0.02,
+      maxOpenPositions = 3,
+      stepInterval = '4h',
+      kellySizing = null,
+      strategyConfig = null
+    } = req.body;
+
+    // Validate
+    if (!Array.isArray(assets) || assets.length < 2 || assets.length > 5) {
+      return res.status(400).json({ error: 'assets must be an array of 2-5 asset IDs' });
+    }
+    if (days < 7 || days > 365) return res.status(400).json({ error: 'days must be between 7 and 365' });
+    if (capital < 100 || capital > 10000000) return res.status(400).json({ error: 'capital must be between 100 and 10,000,000' });
+
+    const recordId = `portfolio-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+
+    backtestStore.set(recordId, {
+      id: recordId, type: 'portfolio', assets, days, status: 'running', progress: 0,
+      created_at: new Date().toISOString()
+    });
+
+    res.json({ id: recordId, status: 'running', type: 'portfolio' });
+
+    activeBacktestJobs++;
+    (async () => {
+      try {
+        const result = await runPortfolioBacktest({
+          assets, days, capital, riskPerTrade, maxOpenPositions,
+          stepInterval, kellySizing, strategyConfig,
+          onProgress: (progress) => {
+            const entry = backtestStore.get(recordId);
+            if (entry && progress.total > 0) {
+              entry.progress = Math.round((progress.current / progress.total) * 100);
+            }
+          }
+        });
+
+        backtestStore.set(recordId, {
+          id: recordId, type: 'portfolio', status: 'completed', ...result,
+          completed_at: new Date().toISOString()
+        });
+      } catch (err) {
+        logger.error('Portfolio backtest failed', { error: err.message });
+        backtestStore.set(recordId, {
+          id: recordId, type: 'portfolio', status: 'failed', error_message: err.message
+        });
+      } finally {
+        activeBacktestJobs--;
+      }
+    })();
+  } catch (error) {
+    logger.error('Portfolio backtest launch failed', { error: error.message });
     res.status(500).json({ error: 'Internal server error' });
   }
 });
