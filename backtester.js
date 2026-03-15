@@ -85,9 +85,9 @@ async function fetchHistoricalCandles(asset, interval, days) {
       const lastTimestamp = candles[candles.length - 1].timestamp;
       currentStart = lastTimestamp + intervalMs;
 
-      // Rate limit protection
+      // Rate limit protection (Binance allows 1200 req/min, 300ms is safe)
       if (currentStart < now) {
-        await new Promise(r => setTimeout(r, 700));
+        await new Promise(r => setTimeout(r, 300));
       }
     } catch (err) {
       const msg = err.message || '';
@@ -149,11 +149,11 @@ async function fetchAllTimeframes(asset, days) {
 
   logger.info('Fetching all timeframes', { asset, days: totalDays });
 
-  // Fetch sequentially to respect rate limits
+  // Fetch sequentially to respect rate limits (reduced delays, Binance allows 1200 req/min)
   const candles4h = await fetchHistoricalCandles(asset, '4h', totalDays);
-  await new Promise(r => setTimeout(r, 1000));
+  await new Promise(r => setTimeout(r, 400));
   const candles1h = await fetchHistoricalCandles(asset, '1h', totalDays);
-  await new Promise(r => setTimeout(r, 1000));
+  await new Promise(r => setTimeout(r, 400));
   const candles15m = await fetchHistoricalCandles(asset, '15m', totalDays);
 
   return { '4h': candles4h, '1h': candles1h, '15m': candles15m };

@@ -2006,8 +2006,8 @@ app.post('/api/backtest/run', async (req, res) => {
     // Return immediately
     res.json({ id: recordId, status: 'running' });
 
-    // Execute backtest asynchronously (with 5min timeout)
-    const BACKTEST_TIMEOUT_MS = 5 * 60 * 1000;
+    // Dynamic timeout: base 3min + 1min per 30 days of data (longer periods = more candles to process)
+    const BACKTEST_TIMEOUT_MS = Math.max(5 * 60 * 1000, (3 + Math.ceil(days / 30)) * 60 * 1000);
     activeBacktestJobs++;
     logger.info(`Backtest job started: ${recordId}`, { asset, days, stepInterval, activeBacktestJobs });
     (async () => {
@@ -2172,10 +2172,12 @@ app.post('/api/backtest/portfolio', async (req, res) => {
 
     res.json({ id: recordId, status: 'running', type: 'portfolio' });
 
+    // Dynamic timeout: base 3min + 1min per 30 days + 1min per asset
+    const PORTFOLIO_TIMEOUT_MS = Math.max(5 * 60 * 1000, (3 + Math.ceil(days / 30) + assets.length) * 60 * 1000);
     activeBacktestJobs++;
     (async () => {
       try {
-        const result = await runPortfolioBacktest({
+        const backtestPromise = runPortfolioBacktest({
           assets, days, capital, riskPerTrade, maxOpenPositions,
           stepInterval, kellySizing, strategyConfig,
           onProgress: (progress) => {
@@ -2185,6 +2187,10 @@ app.post('/api/backtest/portfolio', async (req, res) => {
             }
           }
         });
+        const timeoutPromise = new Promise((_, reject) =>
+          setTimeout(() => reject(new Error(`Portfolio backtest timed out after ${PORTFOLIO_TIMEOUT_MS / 60000} minutes`)), PORTFOLIO_TIMEOUT_MS)
+        );
+        const result = await Promise.race([backtestPromise, timeoutPromise]);
 
         backtestStore.set(recordId, {
           id: recordId, type: 'portfolio', status: 'completed', ...result,
